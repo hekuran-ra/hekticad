@@ -1,0 +1,1487 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>MiniCAD</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --bg-panel: #1d2026;
+    --bg-panel-2: #23262d;
+    --bg-cmd: #0e0f12;
+    --border: #0a0b0d;
+    --fg: #e6e9ef;
+    --fg-dim: #7a808c;
+    --fg-dimmer: #5a6069;
+    --accent: #ffb347;
+    --accent-2: #ff9124;
+    --grid: #232730;
+    --axis-x: #e15757;
+    --axis-y: #5fc766;
+    --sel: #4ea2ff;
+    --preview: #ffb347;
+    --snap: #5eff9e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
+    font: 12.5px/1.3 -apple-system, system-ui, "Segoe UI", sans-serif; overflow: hidden;
+    user-select: none; -webkit-user-select: none; }
+  #app {
+    display: grid;
+    grid-template-rows: 36px 1fr 30px 28px;
+    grid-template-columns: 52px 1fr 240px;
+    height: 100%;
+  }
+  header {
+    grid-column: 1 / 4;
+    background: linear-gradient(180deg, #252a32 0%, #1d2026 100%);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 14px; gap: 10px;
+  }
+  header h1 { font-size: 13px; margin: 0; letter-spacing: 2.5px; color: var(--accent); font-weight: 700; }
+  header .spacer { flex: 1 }
+  header .hint { color: var(--fg-dimmer); font-size: 11px; }
+  .hdr-btn {
+    background: transparent; border: 1px solid transparent;
+    color: var(--fg); padding: 4px 10px; border-radius: 4px; font-size: 12px;
+    cursor: pointer;
+  }
+  .hdr-btn:hover { background: rgba(255,255,255,0.07); }
+  .hdr-btn.danger:hover { background: rgba(225,87,87,0.15); color: #ff8a8a; }
+  #tools {
+    background: var(--bg-panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center;
+    padding: 6px 0; gap: 2px; overflow-y: auto;
+  }
+  .tool-group { display: flex; flex-direction: column; align-items: center; gap: 1px; width: 100%; }
+  .tool-sep { width: 28px; height: 1px; background: var(--border); margin: 4px 0; }
+  .tool-btn {
+    width: 40px; height: 40px; border: 1px solid transparent; border-radius: 5px;
+    background: transparent; color: var(--fg); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    position: relative; transition: all 0.1s;
+  }
+  .tool-btn svg { width: 22px; height: 22px; stroke: currentColor; fill: none;
+    stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .tool-btn:hover { background: rgba(255,255,255,0.07); }
+  .tool-btn.active { background: rgba(255,179,71,0.15); color: var(--accent); border-color: rgba(255,179,71,0.4); }
+  .tool-btn[data-action="delete"]:hover { color: #ff8a8a; }
+  .tool-btn::after {
+    content: attr(data-label) " · " attr(data-key);
+    position: absolute; left: 52px; top: 50%; transform: translateY(-50%);
+    background: #000d; color: #fff; padding: 4px 8px; border-radius: 3px;
+    white-space: nowrap; font-size: 11px; border: 1px solid #ffffff22;
+    opacity: 0; pointer-events: none; transition: opacity 0.12s; z-index: 10;
+  }
+  .tool-btn:hover::after { opacity: 1; }
+  #canvaswrap { position: relative; overflow: hidden; background: var(--bg); }
+  canvas { position: absolute; inset: 0; display: block; }
+  #sidebar {
+    background: var(--bg-panel); border-left: 1px solid var(--border);
+    padding: 10px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto;
+  }
+  .panel h2 {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--fg-dim); margin: 0 0 8px; font-weight: 600;
+    padding-bottom: 4px; border-bottom: 1px solid var(--border);
+  }
+  .layer-row {
+    display: flex; align-items: center; gap: 8px; padding: 5px 6px;
+    border-radius: 3px; cursor: pointer;
+  }
+  .layer-row:hover { background: rgba(255,255,255,0.04); }
+  .layer-row.active { background: rgba(255,179,71,0.12); }
+  .swatch { width: 14px; height: 14px; border-radius: 3px;
+    border: 1px solid rgba(0,0,0,0.5); flex-shrink: 0; }
+  .layer-name { flex: 1; font-size: 12px; }
+  .layer-vis { opacity: 0.5; font-size: 12px; padding: 0 4px; cursor: pointer; }
+  .layer-vis:hover { opacity: 1; }
+  .snap-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 12px; cursor: pointer; }
+  .snap-row input { margin: 0; }
+  .mini-btn {
+    background: var(--bg-panel-2); border: 1px solid var(--border);
+    color: var(--fg); padding: 4px 9px; border-radius: 3px;
+    cursor: pointer; font-size: 11.5px;
+  }
+  .mini-btn:hover { background: #2f333c; }
+  #cmdline {
+    grid-column: 1 / 4;
+    background: var(--bg-cmd); border-top: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 12px; gap: 10px;
+    font-family: ui-monospace, Menlo, monospace;
+  }
+  #cmd-prompt { color: var(--accent); font-weight: 600; font-size: 12px; }
+  #cmd-input {
+    flex: 1; background: transparent; border: none; color: var(--fg);
+    font: inherit; outline: none; font-size: 13px;
+  }
+  #statusbar {
+    grid-column: 1 / 4;
+    background: var(--bg-panel); border-top: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 12px; gap: 20px;
+    color: var(--fg-dim); font-size: 11px;
+    font-family: ui-monospace, Menlo, monospace;
+  }
+  #statusbar span b { color: var(--fg); font-weight: 500; }
+  #st-tip { flex: 1; color: var(--accent); }
+  #toast {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: #000d; color: #fff; padding: 7px 14px; border-radius: 4px;
+    pointer-events: none; font-size: 12px; opacity: 0; transition: opacity 0.15s;
+    border: 1px solid #ffffff22;
+  }
+  #toast.show { opacity: 1; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #3a3f48; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>MINICAD</h1>
+    <span class="hint">Pan: Leertaste + Ziehen · Zoom: Mausrad · Esc: Abbrechen</span>
+    <span class="spacer"></span>
+    <button class="hdr-btn" id="btn-save">Speichern</button>
+    <button class="hdr-btn" id="btn-load">Öffnen</button>
+    <button class="hdr-btn" id="btn-export">Export SVG</button>
+    <button class="hdr-btn danger" id="btn-clear">Alles löschen</button>
+  </header>
+  <div id="tools"></div>
+  <div id="canvaswrap">
+    <canvas id="cv"></canvas>
+    <div id="toast"></div>
+  </div>
+  <aside id="sidebar">
+    <div class="panel">
+      <h2>Layer</h2>
+      <div id="layers"></div>
+      <button class="mini-btn" id="btn-addlayer" style="margin-top:8px">+ Neuer Layer</button>
+    </div>
+    <div class="panel">
+      <h2>Snap</h2>
+      <label class="snap-row"><input type="checkbox" id="snap-end" checked> Endpunkt</label>
+      <label class="snap-row"><input type="checkbox" id="snap-mid" checked> Mittelpunkt</label>
+      <label class="snap-row"><input type="checkbox" id="snap-int" checked> Schnittpunkt</label>
+      <label class="snap-row"><input type="checkbox" id="snap-center" checked> Zentrum</label>
+      <label class="snap-row"><input type="checkbox" id="snap-axis" checked> Achsen (X/Y/Ursprung)</label>
+      <label class="snap-row"><input type="checkbox" id="snap-grid"> Raster</label>
+      <label class="snap-row" style="margin-top:6px">Raster:
+        <input type="number" id="grid-size" value="10" style="width:56px; background:var(--bg-cmd); color:var(--fg); border:1px solid var(--border); padding:2px 5px; border-radius:3px; margin-left:auto">
+      </label>
+    </div>
+    <div class="panel">
+      <h2>Info</h2>
+      <div id="stats" style="color:var(--fg-dim);font-size:11px"></div>
+    </div>
+    <div class="panel">
+      <h2>Eingabe-Cheatsheet</h2>
+      <div style="font-size:11px; color:var(--fg-dim); line-height:1.7">
+        <b style="color:var(--fg)">Linie:</b> Klick, Zahl = Winkel 0-90° (zur nächsten Achse), dann Länge<br>
+        <b style="color:var(--fg)">Rechteck:</b> Klick, Zahl = vertikal, Zahl = horizontal<br>
+        <b style="color:var(--fg)">Kreis:</b> Klick Zentrum, Zahl = Radius<br>
+        <b style="color:var(--fg)">Parallel:</b> Linie/Achse/Kante wählen, Abstand. Snap-Punkt = Hilfslinie durch Punkt<br>
+        <b style="color:var(--fg)">Offset:</b> Objekt wählen, Abstand, Seite<br>
+        <b style="color:var(--fg)">Move/Copy:</b> Objekt(e) wählen, Enter, Basispunkt, Ziel<br>
+        <b style="color:var(--fg)">Drehen:</b> Objekte, Enter, Zentrum, Winkel<br>
+        <b style="color:var(--fg)">Spiegeln:</b> Objekte, Enter, 2 Achs-Punkte
+      </div>
+    </div>
+  </aside>
+  <div id="cmdline">
+    <span id="cmd-prompt">Kommando:</span>
+    <input id="cmd-input" autocomplete="off" spellcheck="false" placeholder="Zahl + Enter">
+  </div>
+  <div id="statusbar">
+    <span id="st-pos">X: <b>0.00</b>  Y: <b>0.00</b></span>
+    <span id="st-zoom">Zoom <b>100%</b></span>
+    <span id="st-tool">Werkzeug: <b>Auswahl</b></span>
+    <span id="st-sel">Auswahl: <b>0</b></span>
+    <span id="st-tip"></span>
+  </div>
+</div>
+<script>
+//================================================================
+// MiniCAD — 2D-Zeichnungs-Prototyp
+//================================================================
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const cmd = document.getElementById('cmd-input');
+const cmdPrompt = document.getElementById('cmd-prompt');
+const stPos = document.getElementById('st-pos');
+const stZoom = document.getElementById('st-zoom');
+const stTool = document.getElementById('st-tool');
+const stSel = document.getElementById('st-sel');
+const stTip = document.getElementById('st-tip');
+const stats = document.getElementById('stats');
+const layersEl = document.getElementById('layers');
+const toastEl = document.getElementById('toast');
+
+const DEFAULT_LAYERS = [
+  { name: '0',         color: '#ffffff', visible: true },
+  { name: 'Kontur',    color: '#e06767', visible: true },
+  { name: 'Hilfslinie',color: '#8891a0', visible: true, style: 'dash' },
+  { name: 'Bemaßung',  color: '#67c1ff', visible: true },
+];
+
+let state = {
+  view: { x: 0, y: 0, scale: 4 },
+  entities: [],
+  layers: JSON.parse(JSON.stringify(DEFAULT_LAYERS)),
+  activeLayer: 1,
+  tool: 'select',
+  selection: new Set(),
+  mouseWorld: { x: 0, y: 0 },
+  mouseScreen: { x: 0, y: 0 },
+  nextId: 1,
+};
+
+let toolCtx = null;
+let pan = null;
+let spacePan = false;
+let snapSettings = { end: true, mid: true, int: true, center: true, axis: true, grid: false, gridSize: 10 };
+let lastSnap = null;
+
+//=== Math ===
+const uid = () => state.nextId++;
+function toast(m) { toastEl.textContent = m; toastEl.classList.add('show');
+  clearTimeout(toast._t); toast._t = setTimeout(()=>toastEl.classList.remove('show'), 1500); }
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+function dot(a, b) { return a.x * b.x + a.y * b.y; }
+function sub(a, b) { return { x: a.x - b.x, y: a.y - b.y }; }
+function add(a, b) { return { x: a.x + b.x, y: a.y + b.y }; }
+function scale(v, s) { return { x: v.x * s, y: v.y * s }; }
+function len(v) { return Math.hypot(v.x, v.y); }
+function norm(v) { const L = len(v); return L < 1e-9 ? {x:0,y:0} : { x: v.x / L, y: v.y / L }; }
+function perp(v) { return { x: -v.y, y: v.x }; }
+function css(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+
+function worldToScreen(p) {
+  return { x: p.x * state.view.scale + state.view.x, y: -p.y * state.view.scale + state.view.y };
+}
+function screenToWorld(p) {
+  return { x: (p.x - state.view.x) / state.view.scale, y: -(p.y - state.view.y) / state.view.scale };
+}
+
+//=== Snap ===
+function collectSnapPoints(near) {
+  const pts = [];
+  const tol = 10 / state.view.scale;
+  const visibleLines = [];
+  for (const e of state.entities) {
+    const L = state.layers[e.layer]; if (!L || !L.visible) continue;
+    if (e.type === 'line') {
+      if (snapSettings.end) { pts.push({type:'end',x:e.x1,y:e.y1}); pts.push({type:'end',x:e.x2,y:e.y2}); }
+      if (snapSettings.mid) pts.push({type:'mid',x:(e.x1+e.x2)/2,y:(e.y1+e.y2)/2});
+      visibleLines.push(e);
+    } else if (e.type === 'xline') {
+      visibleLines.push(e);
+    } else if (e.type === 'rect') {
+      const xl=Math.min(e.x1,e.x2), xr=Math.max(e.x1,e.x2);
+      const yb=Math.min(e.y1,e.y2), yt=Math.max(e.y1,e.y2);
+      if (snapSettings.end) {
+        pts.push({type:'end',x:xl,y:yb}); pts.push({type:'end',x:xr,y:yb});
+        pts.push({type:'end',x:xr,y:yt}); pts.push({type:'end',x:xl,y:yt});
+      }
+      if (snapSettings.mid) {
+        pts.push({type:'mid',x:(xl+xr)/2,y:yb}); pts.push({type:'mid',x:xr,y:(yb+yt)/2});
+        pts.push({type:'mid',x:(xl+xr)/2,y:yt}); pts.push({type:'mid',x:xl,y:(yb+yt)/2});
+      }
+      if (snapSettings.center) pts.push({type:'center',x:(xl+xr)/2,y:(yb+yt)/2});
+    } else if (e.type === 'circle') {
+      if (snapSettings.center) pts.push({type:'center',x:e.cx,y:e.cy});
+      if (snapSettings.end) {
+        pts.push({type:'end',x:e.cx+e.r,y:e.cy}); pts.push({type:'end',x:e.cx-e.r,y:e.cy});
+        pts.push({type:'end',x:e.cx,y:e.cy+e.r}); pts.push({type:'end',x:e.cx,y:e.cy-e.r});
+      }
+    } else if (e.type === 'polyline') {
+      if (snapSettings.end) for (const v of e.pts) pts.push({type:'end',x:v.x,y:v.y});
+      if (snapSettings.mid) for (let i=1;i<e.pts.length;i++) {
+        pts.push({type:'mid', x:(e.pts[i-1].x+e.pts[i].x)/2, y:(e.pts[i-1].y+e.pts[i].y)/2});
+      }
+      if (e.closed && e.pts.length >= 2 && snapSettings.mid) {
+        const a = e.pts[e.pts.length-1], b = e.pts[0];
+        pts.push({type:'mid', x:(a.x+b.x)/2, y:(a.y+b.y)/2});
+      }
+    }
+  }
+  // Virtuelle Achsen
+  const axisX = { type: 'xline', x1:0, y1:0, dx:1, dy:0 };
+  const axisY = { type: 'xline', x1:0, y1:0, dx:0, dy:1 };
+  // Schnittpunkte
+  if (snapSettings.int) {
+    for (let i=0;i<visibleLines.length;i++) for (let j=i+1;j<visibleLines.length;j++) {
+      const ip = intersectLines(visibleLines[i], visibleLines[j]);
+      if (ip) pts.push({ type:'int', x:ip.x, y:ip.y });
+    }
+    if (snapSettings.axis) {
+      for (const L of visibleLines) {
+        for (const A of [axisX, axisY]) { const ip = intersectLines(L, A); if (ip) pts.push({ type:'int', x:ip.x, y:ip.y }); }
+      }
+      pts.push({ type:'int', x:0, y:0 });
+    }
+    // Rect-Edges mit Achsen und Linien
+    if (snapSettings.axis) {
+      for (const e of state.entities) {
+        if (e.type !== 'rect') continue;
+        const L = state.layers[e.layer]; if (!L || !L.visible) continue;
+        const xl=Math.min(e.x1,e.x2), xr=Math.max(e.x1,e.x2);
+        const yb=Math.min(e.y1,e.y2), yt=Math.max(e.y1,e.y2);
+        const edges = [
+          {type:'line',x1:xl,y1:yb,x2:xr,y2:yb},{type:'line',x1:xr,y1:yb,x2:xr,y2:yt},
+          {type:'line',x1:xr,y1:yt,x2:xl,y2:yt},{type:'line',x1:xl,y1:yt,x2:xl,y2:yb},
+        ];
+        for (const ed of edges) for (const A of [axisX, axisY]) {
+          const ip = intersectLines(ed, A); if (ip) pts.push({ type:'int', x:ip.x, y:ip.y });
+        }
+      }
+    }
+  }
+  // Achs-Projektion (nahe Cursor zur Achse)
+  if (snapSettings.axis) {
+    const aTol = 8 / state.view.scale;
+    if (Math.abs(near.y) < aTol) pts.push({ type:'axis', x:near.x, y:0 });
+    if (Math.abs(near.x) < aTol) pts.push({ type:'axis', x:0, y:near.y });
+  }
+  // Raster
+  if (snapSettings.grid && snapSettings.gridSize > 0) {
+    const g = snapSettings.gridSize;
+    pts.push({ type:'grid', x: Math.round(near.x/g)*g, y: Math.round(near.y/g)*g });
+  }
+  // Best match with priority
+  const prio = { end: 6, mid: 5, int: 4, center: 3, axis: 2, grid: 1 };
+  let best = null, bestD = tol;
+  for (const p of pts) {
+    const d = dist(p, near);
+    if (d < bestD) { bestD = d; best = p; }
+    else if (best && d < bestD * 1.2 && prio[p.type] > prio[best.type]) { best = p; }
+  }
+  return best;
+}
+
+function intersectLines(a, b) {
+  const p1 = { x: a.x1, y: a.y1 };
+  const p2 = a.type === 'xline' ? { x: a.x1 + a.dx, y: a.y1 + a.dy } : { x: a.x2, y: a.y2 };
+  const p3 = { x: b.x1, y: b.y1 };
+  const p4 = b.type === 'xline' ? { x: b.x1 + b.dx, y: b.y1 + b.dy } : { x: b.x2, y: b.y2 };
+  const den = (p1.x - p2.x) * (p3.y - p4.y) - (p1.y - p2.y) * (p3.x - p4.x);
+  if (Math.abs(den) < 1e-9) return null;
+  const t = ((p1.x - p3.x) * (p3.y - p4.y) - (p1.y - p3.y) * (p3.x - p4.x)) / den;
+  if (a.type === 'line' && (t < -1e-6 || t > 1 + 1e-6)) return null;
+  const u = -((p1.x - p2.x) * (p1.y - p3.y) - (p1.y - p2.y) * (p1.x - p3.x)) / den;
+  if (b.type === 'line' && (u < -1e-6 || u > 1 + 1e-6)) return null;
+  return { x: p1.x + t * (p2.x - p1.x), y: p1.y + t * (p2.y - p1.y) };
+}
+
+//=== HitTest ===
+function hitTest(worldPt, tol) {
+  tol = tol ?? 6 / state.view.scale;
+  for (let i = state.entities.length - 1; i >= 0; i--) {
+    const e = state.entities[i];
+    if (!state.layers[e.layer].visible) continue;
+    if (e.type === 'line' && distPtSeg(worldPt, {x:e.x1,y:e.y1}, {x:e.x2,y:e.y2}) < tol) return e;
+    if (e.type === 'xline' && distPtXLine(worldPt, e) < tol) return e;
+    if (e.type === 'rect' && hitRect(worldPt, e, tol)) return e;
+    if (e.type === 'circle' && Math.abs(dist(worldPt,{x:e.cx,y:e.cy}) - e.r) < tol) return e;
+    if (e.type === 'polyline') {
+      for (let k = 1; k < e.pts.length; k++) {
+        if (distPtSeg(worldPt, e.pts[k-1], e.pts[k]) < tol) return e;
+      }
+      if (e.closed && e.pts.length >= 2 && distPtSeg(worldPt, e.pts[e.pts.length-1], e.pts[0]) < tol) return e;
+    }
+  }
+  return null;
+}
+function distPtSeg(p, a, b) {
+  const ab = sub(b, a); const ap = sub(p, a);
+  const L2 = dot(ab, ab); if (L2 < 1e-12) return len(ap);
+  let t = dot(ap, ab) / L2; t = Math.max(0, Math.min(1, t));
+  return len(sub(ap, scale(ab, t)));
+}
+function distPtXLine(p, e) {
+  const ap = { x: p.x - e.x1, y: p.y - e.y1 };
+  return Math.abs(ap.x * e.dy - ap.y * e.dx);
+}
+function hitRect(p, e, tol) {
+  const xl=Math.min(e.x1,e.x2), xr=Math.max(e.x1,e.x2);
+  const yb=Math.min(e.y1,e.y2), yt=Math.max(e.y1,e.y2);
+  const edges = [
+    [{x:xl,y:yb},{x:xr,y:yb}],[{x:xr,y:yb},{x:xr,y:yt}],
+    [{x:xr,y:yt},{x:xl,y:yt}],[{x:xl,y:yt},{x:xl,y:yb}],
+  ];
+  return edges.some(ed => distPtSeg(p, ed[0], ed[1]) < tol);
+}
+function nearestRectEdge(rect, pt) {
+  const xl=Math.min(rect.x1,rect.x2), xr=Math.max(rect.x1,rect.x2);
+  const yb=Math.min(rect.y1,rect.y2), yt=Math.max(rect.y1,rect.y2);
+  const edges = [
+    { a:{x:xl,y:yb}, b:{x:xr,y:yb} }, { a:{x:xr,y:yb}, b:{x:xr,y:yt} },
+    { a:{x:xr,y:yt}, b:{x:xl,y:yt} }, { a:{x:xl,y:yt}, b:{x:xl,y:yb} },
+  ];
+  let best = null, bestD = Infinity;
+  for (const e of edges) { const d = distPtSeg(pt, e.a, e.b); if (d < bestD) { bestD = d; best = e; } }
+  return best;
+}
+function nearestPolySegment(poly, pt) {
+  let best = null, bestD = Infinity;
+  for (let i = 1; i < poly.pts.length; i++) {
+    const d = distPtSeg(pt, poly.pts[i-1], poly.pts[i]);
+    if (d < bestD) { bestD = d; best = { a: poly.pts[i-1], b: poly.pts[i] }; }
+  }
+  if (poly.closed && poly.pts.length >= 2) {
+    const d = distPtSeg(pt, poly.pts[poly.pts.length-1], poly.pts[0]);
+    if (d < bestD) { bestD = d; best = { a: poly.pts[poly.pts.length-1], b: poly.pts[0] }; }
+  }
+  return best;
+}
+
+//=== Render ===
+function resize() {
+  const r = cv.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.floor(r.width * dpr); cv.height = Math.floor(r.height * dpr);
+  cv.style.width = r.width + 'px'; cv.style.height = r.height + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (state.view.x === 0 && state.view.y === 0) {
+    state.view.x = r.width / 2; state.view.y = r.height / 2;
+  }
+  render();
+}
+function render() {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  ctx.fillStyle = css('--bg'); ctx.fillRect(0, 0, w, h);
+  drawGrid(w, h); drawAxes(w, h);
+  for (const e of state.entities) drawEntity(e, false);
+  if (toolCtx && toolCtx.preview) drawPreview(toolCtx.preview);
+  for (const id of state.selection) {
+    const e = state.entities.find(x => x.id === id);
+    if (e) drawEntity(e, true);
+  }
+  if (lastSnap) drawSnapMarker(lastSnap);
+}
+function drawGrid(w, h) {
+  if (!snapSettings.grid) return;
+  const g = snapSettings.gridSize, s = state.view.scale;
+  if (g * s < 6) return;
+  const tl = screenToWorld({x:0,y:0}), br = screenToWorld({x:w,y:h});
+  ctx.strokeStyle = css('--grid'); ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = Math.floor(tl.x/g)*g; x <= Math.ceil(br.x/g)*g; x += g) {
+    const sp = worldToScreen({x, y:0});
+    ctx.moveTo(sp.x+0.5, 0); ctx.lineTo(sp.x+0.5, h);
+  }
+  for (let y = Math.floor(br.y/g)*g; y <= Math.ceil(tl.y/g)*g; y += g) {
+    const sp = worldToScreen({x:0, y});
+    ctx.moveTo(0, sp.y+0.5); ctx.lineTo(w, sp.y+0.5);
+  }
+  ctx.stroke();
+}
+function drawAxes(w, h) {
+  const o = worldToScreen({x:0, y:0});
+  ctx.strokeStyle = css('--axis-x') + '70'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, o.y+0.5); ctx.lineTo(w, o.y+0.5); ctx.stroke();
+  ctx.strokeStyle = css('--axis-y') + '70';
+  ctx.beginPath(); ctx.moveTo(o.x+0.5, 0); ctx.lineTo(o.x+0.5, h); ctx.stroke();
+  ctx.fillStyle = css('--fg'); ctx.beginPath(); ctx.arc(o.x, o.y, 3, 0, Math.PI*2); ctx.fill();
+}
+function drawEntity(e, selected) {
+  const L = state.layers[e.layer]; if (!L || !L.visible) return;
+  ctx.strokeStyle = selected ? css('--sel') : L.color;
+  ctx.lineWidth = selected ? 2 : 1.3;
+  ctx.setLineDash(L.style === 'dash' ? [6, 4] : []);
+  if (e.type === 'line') drawLineSeg(e.x1, e.y1, e.x2, e.y2);
+  else if (e.type === 'xline') drawXLine(e);
+  else if (e.type === 'rect') drawRect(e);
+  else if (e.type === 'circle') drawCircle(e);
+  else if (e.type === 'polyline') drawPolyline(e);
+  ctx.setLineDash([]);
+}
+function drawLineSeg(x1,y1,x2,y2){ const a=worldToScreen({x:x1,y:y1}), b=worldToScreen({x:x2,y:y2});
+  ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); }
+function drawXLine(e){ const T=100000; drawLineSeg(e.x1-e.dx*T, e.y1-e.dy*T, e.x1+e.dx*T, e.y1+e.dy*T); }
+function drawRect(e){ const a=worldToScreen({x:e.x1,y:e.y1}), b=worldToScreen({x:e.x2,y:e.y2});
+  ctx.beginPath(); ctx.rect(a.x,a.y, b.x-a.x, b.y-a.y); ctx.stroke(); }
+function drawCircle(e){ const c=worldToScreen({x:e.cx,y:e.cy});
+  ctx.beginPath(); ctx.arc(c.x, c.y, e.r*state.view.scale, 0, Math.PI*2); ctx.stroke(); }
+function drawPolyline(e) {
+  if (!e.pts || e.pts.length < 2) return;
+  ctx.beginPath();
+  const first = worldToScreen(e.pts[0]); ctx.moveTo(first.x, first.y);
+  for (let i = 1; i < e.pts.length; i++) { const p = worldToScreen(e.pts[i]); ctx.lineTo(p.x, p.y); }
+  if (e.closed) ctx.closePath();
+  ctx.stroke();
+}
+function drawPreview(p) {
+  if (!p) return;
+  ctx.save();
+  ctx.strokeStyle = css('--preview'); ctx.lineWidth = 1.2; ctx.setLineDash([4, 4]);
+  if (p.type === 'group') {
+    for (const ent of p.entities) {
+      if (ent.type === 'line') drawLineSeg(ent.x1, ent.y1, ent.x2, ent.y2);
+      else if (ent.type === 'xline') drawXLine(ent);
+      else if (ent.type === 'rect') drawRect(ent);
+      else if (ent.type === 'circle') drawCircle(ent);
+      else if (ent.type === 'polyline') drawPolyline(ent);
+    }
+  } else if (p.type === 'line') drawLineSeg(p.x1, p.y1, p.x2, p.y2);
+  else if (p.type === 'xline') drawXLine(p);
+  else if (p.type === 'rect') drawRect(p);
+  else if (p.type === 'circle') drawCircle(p);
+  else if (p.type === 'polyline') drawPolyline(p);
+  ctx.restore();
+}
+function drawSnapMarker(s) {
+  const sp = worldToScreen(s);
+  ctx.save();
+  ctx.strokeStyle = css('--snap'); ctx.lineWidth = 1.5; ctx.beginPath();
+  if (s.type === 'end') ctx.rect(sp.x-5, sp.y-5, 10, 10);
+  else if (s.type === 'mid') { ctx.moveTo(sp.x-6, sp.y+5); ctx.lineTo(sp.x, sp.y-6); ctx.lineTo(sp.x+6, sp.y+5); ctx.closePath(); }
+  else if (s.type === 'int') { ctx.moveTo(sp.x-5, sp.y-5); ctx.lineTo(sp.x+5, sp.y+5);
+    ctx.moveTo(sp.x+5, sp.y-5); ctx.lineTo(sp.x-5, sp.y+5); }
+  else if (s.type === 'center') ctx.arc(sp.x, sp.y, 6, 0, Math.PI*2);
+  else if (s.type === 'axis') { ctx.moveTo(sp.x-7, sp.y); ctx.lineTo(sp.x+7, sp.y);
+    ctx.moveTo(sp.x, sp.y-7); ctx.lineTo(sp.x, sp.y+7); }
+  else if (s.type === 'grid') ctx.rect(sp.x-3, sp.y-3, 6, 6);
+  ctx.stroke();
+  ctx.restore();
+}
+
+//=== Tools (mit SVG-Icons) ===
+const TOOLS = [
+  { id:'select', label:'Auswahl', key:'S', group:'pointer',
+    icon:'<path d="M5 3 L5 19 L10 14.5 L12.5 20.5 L14.5 19.5 L12 14 L18 14 Z"/>' },
+  { id:'line', label:'Linie', key:'L', group:'draw',
+    icon:'<line x1="4" y1="20" x2="20" y2="4"/><circle cx="4" cy="20" r="1.5" fill="currentColor"/><circle cx="20" cy="4" r="1.5" fill="currentColor"/>' },
+  { id:'polyline', label:'Polylinie', key:'Y', group:'draw',
+    icon:'<polyline points="3,19 8,11 13,16 18,6 21,10"/>' },
+  { id:'rect', label:'Rechteck', key:'R', group:'draw',
+    icon:'<rect x="4" y="7" width="16" height="11"/>' },
+  { id:'circle', label:'Kreis', key:'C', group:'draw',
+    icon:'<circle cx="12" cy="12" r="8"/>' },
+  { id:'xline', label:'Parallel-Hilfslinie', key:'P', group:'guide',
+    icon:'<line x1="3" y1="8" x2="21" y2="8" stroke-dasharray="2 2"/><line x1="3" y1="16" x2="21" y2="16" stroke-dasharray="2 2"/>' },
+  { id:'offset', label:'Offset', key:'O', group:'modify',
+    icon:'<rect x="4" y="4" width="16" height="16"/><rect x="8" y="8" width="8" height="8" stroke-dasharray="2 2"/>' },
+  { id:'move', label:'Verschieben', key:'M', group:'modify',
+    icon:'<rect x="3" y="3" width="7" height="7" stroke-dasharray="2 2"/><rect x="14" y="14" width="7" height="7"/><line x1="10" y1="10" x2="14" y2="14"/>' },
+  { id:'copy', label:'Kopieren', key:'K', group:'modify',
+    icon:'<rect x="3" y="3" width="11" height="11"/><rect x="10" y="10" width="11" height="11"/>' },
+  { id:'rotate', label:'Drehen', key:'T', group:'modify',
+    icon:'<path d="M5 12 a 7 7 0 1 0 3 -6"/><polyline points="8,4 8,7 11,7"/>' },
+  { id:'mirror', label:'Spiegeln', key:'I', group:'modify',
+    icon:'<line x1="12" y1="3" x2="12" y2="21" stroke-dasharray="2 2"/><polygon points="5,9 9,12 5,15"/><polygon points="19,9 15,12 19,15"/>' },
+  { id:'delete', label:'Auswahl löschen', key:'Del', group:'modify', action:'delete',
+    icon:'<polyline points="5,6 5,20 19,20 19,6"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="10" y1="4" x2="14" y2="4"/><line x1="10" y1="10" x2="10" y2="16"/><line x1="14" y1="10" x2="14" y2="16"/>' },
+];
+
+function renderToolsPanel() {
+  const panel = document.getElementById('tools');
+  panel.innerHTML = '';
+  const groups = {};
+  for (const t of TOOLS) { (groups[t.group] = groups[t.group] || []).push(t); }
+  const order = ['pointer', 'draw', 'guide', 'modify'];
+  order.forEach((g, idx) => {
+    if (!groups[g]) return;
+    if (idx > 0) { const sep = document.createElement('div'); sep.className = 'tool-sep'; panel.appendChild(sep); }
+    const grp = document.createElement('div'); grp.className = 'tool-group';
+    for (const t of groups[g]) {
+      const b = document.createElement('button');
+      b.className = 'tool-btn';
+      b.dataset.tool = t.id;
+      b.dataset.label = t.label;
+      b.dataset.key = t.key;
+      if (t.action) b.dataset.action = t.action;
+      b.innerHTML = `<svg viewBox="0 0 24 24">${t.icon}</svg>`;
+      b.onclick = () => {
+        if (t.action === 'delete') { deleteSelection(); return; }
+        setTool(t.id);
+      };
+      grp.appendChild(b);
+    }
+    panel.appendChild(grp);
+  });
+}
+
+function setTool(id) {
+  state.tool = id;
+  toolCtx = null;
+  document.querySelectorAll('.tool-btn').forEach(b => b.classList.toggle('active', b.dataset.tool === id));
+  const t = TOOLS.find(x => x.id === id);
+  stTool.innerHTML = `Werkzeug: <b>${t ? t.label : id}</b>`;
+  if (id === 'select') { state.selection.clear(); updateSelStatus(); setPrompt('Kommando'); }
+  else if (id === 'line')     { toolCtx = { step: 'p1' }; setPrompt('Erster Punkt'); }
+  else if (id === 'polyline') { toolCtx = { step: 'p1', pts: [] }; setPrompt('Erster Punkt'); }
+  else if (id === 'xline')    { toolCtx = { step: 'ref' }; setPrompt('Referenzlinie/-achse oder Snap-Punkt'); }
+  else if (id === 'rect')     { toolCtx = { step: 'p1' }; setPrompt('Erster Eckpunkt'); }
+  else if (id === 'circle')   { toolCtx = { step: 'p1' }; setPrompt('Mittelpunkt'); }
+  else if (id === 'offset')   { toolCtx = { step: 'pick' }; setPrompt('Objekt wählen'); }
+  else if (id === 'move')     {
+    toolCtx = state.selection.size ? { step: 'base' } : { step: 'pick' };
+    setPrompt(toolCtx.step === 'base' ? 'Basispunkt' : 'Objekte wählen, dann Enter');
+  }
+  else if (id === 'copy')     {
+    toolCtx = state.selection.size ? { step: 'base' } : { step: 'pick' };
+    setPrompt(toolCtx.step === 'base' ? 'Basispunkt' : 'Objekte wählen, dann Enter');
+  }
+  else if (id === 'rotate')   {
+    toolCtx = state.selection.size ? { step: 'center' } : { step: 'pick' };
+    setPrompt(toolCtx.step === 'center' ? 'Drehzentrum' : 'Objekte wählen, dann Enter');
+  }
+  else if (id === 'mirror')   {
+    toolCtx = state.selection.size ? { step: 'axis1' } : { step: 'pick' };
+    setPrompt(toolCtx.step === 'axis1' ? 'Spiegelachse: erster Punkt' : 'Objekte wählen, dann Enter');
+  }
+  render();
+}
+
+function setPrompt(text) {
+  cmdPrompt.textContent = text + ':';
+  stTip.textContent = text;
+  cmd.value = '';
+  cmd.focus();
+}
+
+//=== Geometrie-Helfer ===
+function perpOffset(base, dir, point) {
+  const ap = sub(point, base);
+  const cross = dir.x * ap.y - dir.y * ap.x;
+  return { dist: cross, sign: cross >= 0 ? 1 : -1 };
+}
+function directionAtAngle(basePt, cursor, angleDeg) {
+  const v = sub(cursor, basePt);
+  if (len(v) < 1e-9) {
+    const rad = angleDeg * Math.PI / 180;
+    return { x: Math.cos(rad), y: Math.sin(rad) };
+  }
+  const cards = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+  const n = norm(v);
+  let baseDir = cards[0], bestDot = -Infinity;
+  for (const c of cards) { const d = dot(n, c); if (d > bestDot) { bestDot = d; baseDir = c; } }
+  let perpDir;
+  if (Math.abs(baseDir.x) > 0.5) perpDir = { x:0, y:(v.y >= 0 ? 1 : -1) };
+  else perpDir = { x:(v.x >= 0 ? 1 : -1), y:0 };
+  const rad = angleDeg * Math.PI / 180;
+  return {
+    x: baseDir.x * Math.cos(rad) + perpDir.x * Math.sin(rad),
+    y: baseDir.y * Math.cos(rad) + perpDir.y * Math.sin(rad),
+  };
+}
+function pickReference(worldPt) {
+  const hit = hitTest(worldPt);
+  if (hit) {
+    if (hit.type === 'line') {
+      const dir = norm({ x: hit.x2 - hit.x1, y: hit.y2 - hit.y1 });
+      return { entity: hit, dir, base: { x: hit.x1, y: hit.y1 } };
+    }
+    if (hit.type === 'xline') return { entity: hit, dir: { x: hit.dx, y: hit.dy }, base: { x: hit.x1, y: hit.y1 } };
+    if (hit.type === 'rect') {
+      const edge = nearestRectEdge(hit, worldPt);
+      if (edge) return { entity: hit, dir: norm(sub(edge.b, edge.a)), base: edge.a };
+    }
+    if (hit.type === 'polyline') {
+      const seg = nearestPolySegment(hit, worldPt);
+      if (seg) return { entity: hit, dir: norm(sub(seg.b, seg.a)), base: seg.a };
+    }
+  }
+  const tol = 8 / state.view.scale;
+  const dX = Math.abs(worldPt.y), dY = Math.abs(worldPt.x);
+  if (dX < tol && dX <= dY) return { entity: { _axis: 'x' }, dir: { x: 1, y: 0 }, base: { x: 0, y: 0 } };
+  if (dY < tol) return { entity: { _axis: 'y' }, dir: { x: 0, y: 1 }, base: { x: 0, y: 0 } };
+  return null;
+}
+function makeParallelXLine(tc, distance, sign) {
+  const n = perp(tc.dir);
+  const base = add(tc.base, scale(n, distance * sign));
+  let layer = state.layers.findIndex(L => L.name.toLowerCase().includes('hilfslin'));
+  if (layer < 0) layer = state.activeLayer;
+  addEntity({ type: 'xline', x1: base.x, y1: base.y, dx: tc.dir.x, dy: tc.dir.y, layer });
+}
+function makeXLineThrough(pt, dir) {
+  let layer = state.layers.findIndex(L => L.name.toLowerCase().includes('hilfslin'));
+  if (layer < 0) layer = state.activeLayer;
+  addEntity({ type: 'xline', x1: pt.x, y1: pt.y, dx: dir.x, dy: dir.y, layer });
+}
+
+//=== Transforms ===
+function transformEntity(e, fn, opts) {
+  const pureTranslation = opts?.pureTranslation ?? false;
+  if (e.type === 'line') {
+    const a = fn({x:e.x1,y:e.y1}), b = fn({x:e.x2,y:e.y2});
+    return [{ type:'line', x1:a.x, y1:a.y, x2:b.x, y2:b.y, layer:e.layer }];
+  }
+  if (e.type === 'xline') {
+    const base = fn({x:e.x1, y:e.y1});
+    const tip = fn({x:e.x1+e.dx, y:e.y1+e.dy});
+    const d = norm(sub(tip, base));
+    return [{ type:'xline', x1:base.x, y1:base.y, dx:d.x, dy:d.y, layer:e.layer }];
+  }
+  if (e.type === 'rect') {
+    if (pureTranslation) {
+      const a = fn({x:e.x1,y:e.y1}), b = fn({x:e.x2,y:e.y2});
+      return [{ type:'rect', x1:a.x, y1:a.y, x2:b.x, y2:b.y, layer:e.layer }];
+    }
+    const xl=Math.min(e.x1,e.x2), xr=Math.max(e.x1,e.x2);
+    const yb=Math.min(e.y1,e.y2), yt=Math.max(e.y1,e.y2);
+    const corners = [{x:xl,y:yb},{x:xr,y:yb},{x:xr,y:yt},{x:xl,y:yt}];
+    return [{ type:'polyline', pts: corners.map(fn), closed:true, layer:e.layer }];
+  }
+  if (e.type === 'circle') {
+    const c = fn({x:e.cx, y:e.cy});
+    return [{ type:'circle', cx:c.x, cy:c.y, r:e.r, layer:e.layer }];
+  }
+  if (e.type === 'polyline') {
+    return [{ type:'polyline', pts:e.pts.map(fn), closed:!!e.closed, layer:e.layer }];
+  }
+  return [{...e}];
+}
+function transformSelection(fn, { copy = false, pureTranslation = false } = {}) {
+  const ids = [...state.selection];
+  const newIds = [];
+  for (const id of ids) {
+    const e = state.entities.find(x => x.id === id); if (!e) continue;
+    const transformed = transformEntity(e, fn, { pureTranslation });
+    if (copy) {
+      for (const t of transformed) { t.id = uid(); state.entities.push(t); newIds.push(t.id); }
+    } else {
+      const idx = state.entities.indexOf(e);
+      state.entities.splice(idx, 1);
+      for (const t of transformed) { t.id = uid(); state.entities.push(t); newIds.push(t.id); }
+    }
+  }
+  if (!copy) {
+    state.selection.clear();
+    for (const id of newIds) state.selection.add(id);
+  }
+  updateStats(); updateSelStatus();
+}
+
+//=== Offset ===
+function offsetDistance(e, pt) {
+  if (e.type === 'line') {
+    const a = {x:e.x1,y:e.y1}, b = {x:e.x2,y:e.y2};
+    const dir = norm(sub(b,a)); const n = perp(dir);
+    const rel = sub(pt, a); const sd = dot(rel, n);
+    return { dist: Math.abs(sd), sign: sd >= 0 ? 1 : -1 };
+  }
+  if (e.type === 'xline') {
+    const n = perp({x:e.dx,y:e.dy});
+    const rel = sub(pt, {x:e.x1,y:e.y1}); const sd = dot(rel, n);
+    return { dist: Math.abs(sd), sign: sd >= 0 ? 1 : -1 };
+  }
+  if (e.type === 'rect') {
+    const xl=Math.min(e.x1,e.x2), xr=Math.max(e.x1,e.x2);
+    const yb=Math.min(e.y1,e.y2), yt=Math.max(e.y1,e.y2);
+    const inside = pt.x > xl && pt.x < xr && pt.y > yb && pt.y < yt;
+    const d = inside ? Math.min(pt.x-xl, xr-pt.x, pt.y-yb, yt-pt.y)
+                     : Math.min(
+                         distPtSeg(pt, {x:xl,y:yb}, {x:xr,y:yb}),
+                         distPtSeg(pt, {x:xr,y:yb}, {x:xr,y:yt}),
+                         distPtSeg(pt, {x:xr,y:yt}, {x:xl,y:yt}),
+                         distPtSeg(pt, {x:xl,y:yt}, {x:xl,y:yb}));
+    return { dist: d, sign: inside ? -1 : 1 };
+  }
+  if (e.type === 'circle') {
+    const d = dist(pt, {x:e.cx,y:e.cy});
+    return { dist: Math.abs(d - e.r), sign: d > e.r ? 1 : -1 };
+  }
+  return null;
+}
+function offsetSide(e, pt) { const i = offsetDistance(e, pt); return i ? i.sign : 1; }
+function makeOffsetPreview(e, d, sign) {
+  if (e.type === 'line') {
+    const a = {x:e.x1,y:e.y1}, b = {x:e.x2,y:e.y2};
+    const dir = norm(sub(b,a)); const n = perp(dir);
+    const off = scale(n, d * sign);
+    return { type:'line', x1:a.x+off.x, y1:a.y+off.y, x2:b.x+off.x, y2:b.y+off.y };
+  }
+  if (e.type === 'xline') {
+    const n = perp({x:e.dx,y:e.dy}); const off = scale(n, d * sign);
+    return { type:'xline', x1:e.x1+off.x, y1:e.y1+off.y, dx:e.dx, dy:e.dy };
+  }
+  if (e.type === 'rect') {
+    const xl=Math.min(e.x1,e.x2), xr=Math.max(e.x1,e.x2);
+    const yb=Math.min(e.y1,e.y2), yt=Math.max(e.y1,e.y2);
+    const dd = d * sign;
+    return { type:'rect', x1:xl-dd, y1:yb-dd, x2:xr+dd, y2:yt+dd };
+  }
+  if (e.type === 'circle') {
+    const nr = e.r + d * sign;
+    return { type:'circle', cx:e.cx, cy:e.cy, r: Math.max(0.001, nr) };
+  }
+  return null;
+}
+function createOffset(e, d, sign) {
+  const prev = makeOffsetPreview(e, d, sign);
+  if (!prev) return;
+  prev.layer = e.layer;
+  addEntity(prev);
+}
+
+//=== Click-Handler ===
+function handleClick(worldPt) {
+  const snap = lastSnap;
+  const p = snap ? { x: snap.x, y: snap.y } : worldPt;
+  if (state.tool === 'select') {
+    const hit = hitTest(worldPt);
+    if (!window.event?.shiftKey) state.selection.clear();
+    if (hit) state.selection.add(hit.id);
+    updateSelStatus(); render(); return;
+  }
+  if (state.tool === 'line')    { handleLineClick(p); return; }
+  if (state.tool === 'polyline'){ handlePolylineClick(p); return; }
+  if (state.tool === 'rect')    { handleRectClick(p); return; }
+  if (state.tool === 'circle')  { handleCircleClick(p); return; }
+  if (state.tool === 'xline')   { handleXLineClick(p, worldPt, snap); return; }
+  if (state.tool === 'offset')  { handleOffsetClick(p, worldPt); return; }
+  if (state.tool === 'move')    { handleMoveCopyClick(p, worldPt, false); return; }
+  if (state.tool === 'copy')    { handleMoveCopyClick(p, worldPt, true); return; }
+  if (state.tool === 'rotate')  { handleRotateClick(p, worldPt); return; }
+  if (state.tool === 'mirror')  { handleMirrorClick(p, worldPt); return; }
+}
+
+function handleLineClick(p) {
+  if (!toolCtx || toolCtx.step === 'p1') {
+    toolCtx = { step: 'p2', p1: p, lockedDir: null, angleDeg: null };
+    setPrompt('Zahl = Winkel 0-90° (dann Länge) oder Endpunkt klicken');
+  } else {
+    let endPt = p;
+    if (toolCtx.lockedDir) {
+      const ap = sub(p, toolCtx.p1);
+      const length = dot(ap, toolCtx.lockedDir);
+      if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
+      endPt = add(toolCtx.p1, scale(toolCtx.lockedDir, length));
+    }
+    addEntity({ type: 'line', x1: toolCtx.p1.x, y1: toolCtx.p1.y, x2: endPt.x, y2: endPt.y, layer: state.activeLayer });
+    toolCtx = { step: 'p2', p1: endPt, lockedDir: null, angleDeg: null };
+    setPrompt('Nächster Punkt (Esc beendet)');
+  }
+  render();
+}
+
+function handlePolylineClick(p) {
+  if (!toolCtx.pts) toolCtx.pts = [];
+  toolCtx.pts.push(p);
+  toolCtx.lockedDir = null; toolCtx.angleDeg = null;
+  setPrompt(toolCtx.pts.length === 1 ? 'Nächster Punkt' : 'Nächster Punkt (Enter beendet)');
+  render();
+}
+function finishPolyline(closed) {
+  if (toolCtx && toolCtx.pts && toolCtx.pts.length >= 2) {
+    addEntity({ type: 'polyline', pts: [...toolCtx.pts], closed: !!closed, layer: state.activeLayer });
+  }
+  toolCtx = { step: 'p1', pts: [] };
+  setPrompt('Erster Punkt');
+  render();
+}
+
+function handleRectClick(p) {
+  if (!toolCtx || toolCtx.step === 'p1') {
+    toolCtx = { step: 'dims', p1: p, vertical: null, horizontal: null };
+    setPrompt('Vertikale Länge eingeben');
+  } else if (toolCtx.step === 'dims') {
+    let x1=toolCtx.p1.x, y1=toolCtx.p1.y, x2=p.x, y2=p.y;
+    if (toolCtx.vertical !== null)   y2 = y1 + (Math.sign(p.y - y1) || 1) * toolCtx.vertical;
+    if (toolCtx.horizontal !== null) x2 = x1 + (Math.sign(p.x - x1) || 1) * toolCtx.horizontal;
+    if (Math.abs(x2-x1) < 1e-6 || Math.abs(y2-y1) < 1e-6) { toast('Rechteck zu klein'); return; }
+    addEntity({ type:'rect', x1, y1, x2, y2, layer: state.activeLayer });
+    toolCtx = { step: 'p1' }; setPrompt('Erster Eckpunkt');
+  }
+  render();
+}
+
+function handleCircleClick(p) {
+  if (!toolCtx || toolCtx.step === 'p1') {
+    toolCtx = { step: 'r', cx: p.x, cy: p.y };
+    setPrompt('Radius eingeben oder Punkt klicken');
+  } else {
+    const r = dist(p, { x: toolCtx.cx, y: toolCtx.cy });
+    if (r < 1e-6) return;
+    addEntity({ type: 'circle', cx: toolCtx.cx, cy: toolCtx.cy, r, layer: state.activeLayer });
+    toolCtx = { step: 'p1' }; setPrompt('Mittelpunkt');
+  }
+  render();
+}
+
+function handleXLineClick(p, worldPt, snap) {
+  if (!toolCtx || toolCtx.step === 'ref') {
+    if (snap && (snap.type === 'end' || snap.type === 'mid' || snap.type === 'int' || snap.type === 'center' || snap.type === 'axis')) {
+      toolCtx = { step: 'angle-pt', p1: p };
+      setPrompt('Winkel 0-90° eingeben oder Richtung klicken');
+      render(); return;
+    }
+    const ref = pickReference(worldPt);
+    if (!ref) { toast('Linie, Achse, Rechteck-Kante oder Polylinien-Segment wählen'); return; }
+    toolCtx = { step: 'dist', ref: ref.entity, dir: ref.dir, base: ref.base };
+    setPrompt('Abstand eingeben oder Seite klicken');
+  } else if (toolCtx.step === 'angle-pt') {
+    const v = sub(p, toolCtx.p1);
+    if (len(v) < 1e-9) { toast('Andere Richtung klicken oder Winkel eingeben'); return; }
+    makeXLineThrough(toolCtx.p1, norm(v));
+    toolCtx = { step: 'ref' }; setPrompt('Referenzlinie wählen');
+  } else if (toolCtx.step === 'dist') {
+    const off = perpOffset(toolCtx.base, toolCtx.dir, p);
+    if (Math.abs(off.dist) < 1e-6) return;
+    makeParallelXLine(toolCtx, Math.abs(off.dist), off.sign);
+    toolCtx = { step: 'ref' }; setPrompt('Referenzlinie wählen');
+  }
+  render();
+}
+
+function handleOffsetClick(p, worldPt) {
+  if (!toolCtx || toolCtx.step === 'pick') {
+    const hit = hitTest(worldPt);
+    if (!hit) { toast('Objekt wählen'); return; }
+    toolCtx = { step: 'side', entity: hit, distance: null };
+    state.selection.clear(); state.selection.add(hit.id); updateSelStatus();
+    setPrompt('Abstand eingeben oder Seite klicken');
+    render(); return;
+  }
+  if (toolCtx.step === 'side') {
+    const info = offsetDistance(toolCtx.entity, p);
+    if (!info) return;
+    const d = toolCtx.distance !== null ? toolCtx.distance : info.dist;
+    if (d < 1e-6) return;
+    createOffset(toolCtx.entity, d, info.sign);
+    toolCtx = { step: 'pick' };
+    state.selection.clear(); updateSelStatus();
+    setPrompt('Objekt wählen'); render();
+  }
+}
+
+function handleMoveCopyClick(p, worldPt, isCopy) {
+  if (toolCtx.step === 'pick') {
+    const hit = hitTest(worldPt);
+    if (hit) state.selection.add(hit.id);
+    updateSelStatus(); render(); return;
+  }
+  if (toolCtx.step === 'base') {
+    toolCtx.basePt = p; toolCtx.step = 'target';
+    setPrompt(isCopy ? 'Zielpunkt (mehrfach möglich)' : 'Zielpunkt');
+    render(); return;
+  }
+  if (toolCtx.step === 'target') {
+    const delta = sub(p, toolCtx.basePt);
+    transformSelection((pt) => add(pt, delta), { copy: isCopy, pureTranslation: true });
+    if (isCopy) { setPrompt('Zielpunkt (Esc beendet)'); }
+    else { setTool('select'); return; }
+    render(); return;
+  }
+}
+
+function handleRotateClick(p, worldPt) {
+  if (toolCtx.step === 'pick') {
+    const hit = hitTest(worldPt); if (hit) state.selection.add(hit.id);
+    updateSelStatus(); render(); return;
+  }
+  if (toolCtx.step === 'center') {
+    toolCtx.centerPt = p; toolCtx.step = 'angle';
+    setPrompt('Winkel (°) eingeben oder Referenzpunkt klicken');
+    render(); return;
+  }
+  if (toolCtx.step === 'angle') {
+    const v = sub(p, toolCtx.centerPt);
+    if (len(v) < 1e-6) return;
+    const ang = Math.atan2(v.y, v.x);
+    applyRotate(toolCtx.centerPt, ang);
+    setTool('select'); return;
+  }
+}
+function applyRotate(center, rad) {
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+  transformSelection(pt => {
+    const dx = pt.x - center.x, dy = pt.y - center.y;
+    return { x: center.x + dx*cos - dy*sin, y: center.y + dx*sin + dy*cos };
+  }, { pureTranslation: false });
+}
+
+function handleMirrorClick(p, worldPt) {
+  if (toolCtx.step === 'pick') {
+    const hit = hitTest(worldPt); if (hit) state.selection.add(hit.id);
+    updateSelStatus(); render(); return;
+  }
+  if (toolCtx.step === 'axis1') {
+    toolCtx.a1 = p; toolCtx.step = 'axis2';
+    setPrompt('Spiegelachse: zweiter Punkt'); render(); return;
+  }
+  if (toolCtx.step === 'axis2') {
+    const a = toolCtx.a1, b = p;
+    const d = norm(sub(b, a));
+    if (len(d) < 1e-9) return;
+    const n = perp(d);
+    transformSelection(pt => {
+      const rel = sub(pt, a);
+      return add(a, add(scale(d, dot(rel, d)), scale(n, -dot(rel, n))));
+    }, { pureTranslation: false });
+    setTool('select'); return;
+  }
+}
+
+//=== Preview ===
+function updatePreview() {
+  if (!toolCtx) return;
+  const p = lastSnap ? { x: lastSnap.x, y: lastSnap.y } : state.mouseWorld;
+  toolCtx.preview = null;
+  if (state.tool === 'line' && toolCtx.step === 'p2') {
+    let endPt = p;
+    if (toolCtx.lockedDir) {
+      const ap = sub(p, toolCtx.p1);
+      const length = Math.max(0, dot(ap, toolCtx.lockedDir));
+      endPt = add(toolCtx.p1, scale(toolCtx.lockedDir, length));
+    }
+    toolCtx.preview = { type:'line', x1:toolCtx.p1.x, y1:toolCtx.p1.y, x2:endPt.x, y2:endPt.y };
+    const L = dist(toolCtx.p1, endPt);
+    const aAng = Math.atan2(endPt.y-toolCtx.p1.y, endPt.x-toolCtx.p1.x)*180/Math.PI;
+    stTip.textContent = `L ${L.toFixed(2)} · ${aAng.toFixed(1)}°${toolCtx.lockedDir ? ' (Lock '+toolCtx.angleDeg+'°)' : ''}`;
+  } else if (state.tool === 'polyline' && toolCtx.pts && toolCtx.pts.length > 0) {
+    const last = toolCtx.pts[toolCtx.pts.length - 1];
+    let endPt = p;
+    if (toolCtx.lockedDir) {
+      const ap = sub(p, last);
+      const length = Math.max(0, dot(ap, toolCtx.lockedDir));
+      endPt = add(last, scale(toolCtx.lockedDir, length));
+    }
+    toolCtx.preview = { type:'polyline', pts: [...toolCtx.pts, endPt] };
+    const L = dist(last, endPt);
+    stTip.textContent = `Polyline · Seg ${toolCtx.pts.length} · L ${L.toFixed(2)}${toolCtx.lockedDir ? ' (Lock '+toolCtx.angleDeg+'°)' : ''}`;
+  } else if (state.tool === 'rect' && toolCtx.step === 'dims') {
+    const tc = toolCtx;
+    let y2 = p.y, x2 = p.x;
+    if (tc.vertical !== null)   y2 = tc.p1.y + (Math.sign(p.y - tc.p1.y) || 1) * tc.vertical;
+    if (tc.horizontal !== null) x2 = tc.p1.x + (Math.sign(p.x - tc.p1.x) || 1) * tc.horizontal;
+    tc.preview = { type:'rect', x1:tc.p1.x, y1:tc.p1.y, x2, y2 };
+    const w = Math.abs(x2 - tc.p1.x), h = Math.abs(y2 - tc.p1.y);
+    const locked = [];
+    if (tc.vertical !== null) locked.push('V='+tc.vertical);
+    if (tc.horizontal !== null) locked.push('H='+tc.horizontal);
+    stTip.textContent = `Rect · B ${w.toFixed(2)} · H ${h.toFixed(2)}` + (locked.length ? ' · '+locked.join(' ') : '');
+  } else if (state.tool === 'circle' && toolCtx.step === 'r') {
+    const r = dist(p, { x: toolCtx.cx, y: toolCtx.cy });
+    toolCtx.preview = { type:'circle', cx:toolCtx.cx, cy:toolCtx.cy, r };
+    stTip.textContent = `R ${r.toFixed(2)}`;
+  } else if (state.tool === 'xline' && toolCtx.step === 'ref') {
+    if (lastSnap && (lastSnap.type === 'end' || lastSnap.type === 'mid' || lastSnap.type === 'int' || lastSnap.type === 'center' || lastSnap.type === 'axis')) {
+      stTip.textContent = 'Klick: Hilfslinie durch Snap-Punkt';
+    } else stTip.textContent = 'Referenzlinie/-achse/Kante wählen';
+  } else if (state.tool === 'xline' && toolCtx.step === 'angle-pt') {
+    const v = sub(p, toolCtx.p1);
+    const dir = len(v) < 1e-9 ? { x:1, y:0 } : norm(v);
+    toolCtx.preview = { type:'xline', x1:toolCtx.p1.x, y1:toolCtx.p1.y, dx:dir.x, dy:dir.y };
+    const aAng = Math.atan2(dir.y, dir.x)*180/Math.PI;
+    stTip.textContent = `Hilfslinie durch Punkt · ${aAng.toFixed(1)}°`;
+  } else if (state.tool === 'xline' && toolCtx.step === 'dist') {
+    const off = perpOffset(toolCtx.base, toolCtx.dir, p);
+    const n = perp(toolCtx.dir);
+    const base = add(toolCtx.base, scale(n, off.dist));
+    toolCtx.preview = { type:'xline', x1:base.x, y1:base.y, dx:toolCtx.dir.x, dy:toolCtx.dir.y };
+    stTip.textContent = `Abstand ${Math.abs(off.dist).toFixed(2)}`;
+  } else if (state.tool === 'offset' && toolCtx.step === 'side') {
+    const info = offsetDistance(toolCtx.entity, p);
+    if (info) {
+      const d = toolCtx.distance !== null ? toolCtx.distance : info.dist;
+      toolCtx.preview = makeOffsetPreview(toolCtx.entity, d, info.sign);
+      stTip.textContent = `Offset ${d.toFixed(2)}`;
+    }
+  } else if ((state.tool === 'move' || state.tool === 'copy') && toolCtx.step === 'target') {
+    const delta = sub(p, toolCtx.basePt);
+    const prevEntities = [];
+    for (const id of state.selection) {
+      const e = state.entities.find(x => x.id === id); if (!e) continue;
+      prevEntities.push(...transformEntity(e, pt => add(pt, delta), { pureTranslation: true }));
+    }
+    toolCtx.preview = { type:'group', entities: prevEntities };
+    stTip.textContent = `Δ ${delta.x.toFixed(2)}, ${delta.y.toFixed(2)} · Dist ${len(delta).toFixed(2)}`;
+  } else if (state.tool === 'rotate' && toolCtx.step === 'angle') {
+    const v = sub(p, toolCtx.centerPt);
+    const ang = Math.atan2(v.y, v.x);
+    const cos = Math.cos(ang), sin = Math.sin(ang);
+    const fn = pt => {
+      const dx = pt.x - toolCtx.centerPt.x, dy = pt.y - toolCtx.centerPt.y;
+      return { x: toolCtx.centerPt.x + dx*cos - dy*sin, y: toolCtx.centerPt.y + dx*sin + dy*cos };
+    };
+    const prevEntities = [];
+    for (const id of state.selection) {
+      const e = state.entities.find(x => x.id === id); if (!e) continue;
+      prevEntities.push(...transformEntity(e, fn, { pureTranslation: false }));
+    }
+    toolCtx.preview = { type:'group', entities: prevEntities };
+    stTip.textContent = `Winkel ${(ang*180/Math.PI).toFixed(1)}°`;
+  } else if (state.tool === 'mirror' && toolCtx.step === 'axis2') {
+    const a = toolCtx.a1, b = p;
+    const d = norm(sub(b, a));
+    if (len(d) > 1e-9) {
+      const n = perp(d);
+      const fn = pt => {
+        const rel = sub(pt, a);
+        return add(a, add(scale(d, dot(rel, d)), scale(n, -dot(rel, n))));
+      };
+      const prevEntities = [];
+      for (const id of state.selection) {
+        const e = state.entities.find(x => x.id === id); if (!e) continue;
+        prevEntities.push(...transformEntity(e, fn, { pureTranslation: false }));
+      }
+      toolCtx.preview = { type:'group', entities: prevEntities };
+      // auch die Achse zeigen
+      toolCtx.preview.entities.push({ type:'line', x1:a.x, y1:a.y, x2:b.x, y2:b.y, layer: state.activeLayer });
+    }
+  }
+}
+
+//=== Kommandozeile ===
+function handleCommand(txt) {
+  txt = txt.trim(); if (!txt) return;
+  const aliases = { l:'line', y:'polyline', p:'xline', par:'xline', r:'rect', c:'circle',
+                    s:'select', m:'move', k:'copy', t:'rotate', i:'mirror', o:'offset',
+                    linie:'line', rechteck:'rect', kreis:'circle', polyline:'polyline', polylinie:'polyline' };
+  const lc = txt.toLowerCase();
+  if (aliases[lc]) { setTool(aliases[lc]); return; }
+  if (lc === 'delete' || lc === 'del') { deleteSelection(); return; }
+  if (lc === 'zoom' || lc === 'z') { zoomFit(); return; }
+
+  const parseNum = s => { const v = parseFloat(String(s).replace(',', '.')); return Number.isFinite(v) ? v : null; };
+  const m_angleOnly = txt.match(/^<\s*([+-]?\s*[\d.,]+)\s*$/);
+  const m_polar     = txt.match(/^([+-]?\s*[\d.,]+)\s*<\s*([+-]?\s*[\d.,]+)\s*$/);
+  const d_single    = parseNum(txt);
+
+  if (state.tool === 'line' && toolCtx && toolCtx.step === 'p2') {
+    if (m_polar) {
+      const L = parseNum(m_polar[1]), a = parseNum(m_polar[2]);
+      if (L !== null && a !== null) {
+        const rad = a*Math.PI/180;
+        handleClick({ x: toolCtx.p1.x + Math.cos(rad)*L, y: toolCtx.p1.y + Math.sin(rad)*L });
+        return;
+      }
+    }
+    const angleMatch = m_angleOnly ? parseNum(m_angleOnly[1]) : null;
+    if (!toolCtx.lockedDir && (angleMatch !== null || d_single !== null)) {
+      const ang = angleMatch !== null ? angleMatch : d_single;
+      toolCtx.lockedDir = directionAtAngle(toolCtx.p1, state.mouseWorld, ang);
+      toolCtx.angleDeg = ang;
+      setPrompt(`Länge (Winkel ${ang}° gelockt)`); render(); return;
+    }
+    if (toolCtx.lockedDir && d_single !== null) {
+      handleClick(add(toolCtx.p1, scale(toolCtx.lockedDir, d_single))); return;
+    }
+  }
+  if (state.tool === 'polyline' && toolCtx && toolCtx.pts && toolCtx.pts.length > 0) {
+    const last = toolCtx.pts[toolCtx.pts.length - 1];
+    const angleMatch = m_angleOnly ? parseNum(m_angleOnly[1]) : null;
+    if (!toolCtx.lockedDir && (angleMatch !== null || d_single !== null)) {
+      const ang = angleMatch !== null ? angleMatch : d_single;
+      toolCtx.lockedDir = directionAtAngle(last, state.mouseWorld, ang);
+      toolCtx.angleDeg = ang;
+      setPrompt(`Länge (Winkel ${ang}° gelockt)`); render(); return;
+    }
+    if (toolCtx.lockedDir && d_single !== null) {
+      handlePolylineClick(add(last, scale(toolCtx.lockedDir, d_single))); return;
+    }
+  }
+  if (state.tool === 'xline' && toolCtx) {
+    if (toolCtx.step === 'dist' && d_single !== null && d_single > 0) {
+      const off = perpOffset(toolCtx.base, toolCtx.dir, state.mouseWorld);
+      makeParallelXLine(toolCtx, d_single, off.sign);
+      toolCtx = { step: 'ref' }; setPrompt('Referenzlinie wählen'); render(); return;
+    }
+    if (toolCtx.step === 'angle-pt' && d_single !== null) {
+      makeXLineThrough(toolCtx.p1, directionAtAngle(toolCtx.p1, state.mouseWorld, d_single));
+      toolCtx = { step: 'ref' }; setPrompt('Referenzlinie wählen'); render(); return;
+    }
+  }
+  if (state.tool === 'rect' && toolCtx && toolCtx.step === 'dims' && d_single !== null && d_single > 0) {
+    if (toolCtx.vertical === null) {
+      toolCtx.vertical = d_single; setPrompt('Horizontale Länge eingeben');
+      render(); return;
+    }
+    if (toolCtx.horizontal === null) {
+      toolCtx.horizontal = d_single;
+      const cur = state.mouseWorld;
+      const sX = (cur.x - toolCtx.p1.x) >= 0 ? 1 : -1;
+      const sY = (cur.y - toolCtx.p1.y) >= 0 ? 1 : -1;
+      addEntity({ type:'rect', x1:toolCtx.p1.x, y1:toolCtx.p1.y,
+                  x2: toolCtx.p1.x + sX*toolCtx.horizontal, y2: toolCtx.p1.y + sY*toolCtx.vertical,
+                  layer: state.activeLayer });
+      toolCtx = { step: 'p1' }; setPrompt('Erster Eckpunkt'); render(); return;
+    }
+  }
+  if (state.tool === 'circle' && toolCtx && toolCtx.step === 'r' && d_single !== null && d_single > 0) {
+    addEntity({ type:'circle', cx:toolCtx.cx, cy:toolCtx.cy, r:d_single, layer: state.activeLayer });
+    toolCtx = { step: 'p1' }; setPrompt('Mittelpunkt'); render(); return;
+  }
+  if (state.tool === 'offset' && toolCtx && toolCtx.step === 'side' && d_single !== null && d_single > 0) {
+    toolCtx.distance = d_single;
+    setPrompt('Seite klicken'); render(); return;
+  }
+  if (state.tool === 'rotate' && toolCtx && toolCtx.step === 'angle' && d_single !== null) {
+    applyRotate(toolCtx.centerPt, d_single * Math.PI / 180);
+    setTool('select'); return;
+  }
+  if (state.tool === 'move' && toolCtx && toolCtx.step === 'target' && d_single !== null) {
+    // Distanz in Maus-Richtung
+    const dir = norm(sub(state.mouseWorld, toolCtx.basePt));
+    if (len(dir) < 1e-9) { toast('Erst Mausrichtung wählen'); return; }
+    const target = add(toolCtx.basePt, scale(dir, d_single));
+    handleClick(target); return;
+  }
+  if (state.tool === 'copy' && toolCtx && toolCtx.step === 'target' && d_single !== null) {
+    const dir = norm(sub(state.mouseWorld, toolCtx.basePt));
+    if (len(dir) < 1e-9) { toast('Erst Mausrichtung wählen'); return; }
+    const target = add(toolCtx.basePt, scale(dir, d_single));
+    handleClick(target); return;
+  }
+  toast('Eingabe nicht erkannt: ' + txt);
+}
+
+//=== Entity Management ===
+function addEntity(e) { e.id = uid(); state.entities.push(e); updateStats(); }
+function deleteSelection() {
+  if (!state.selection.size) return;
+  state.entities = state.entities.filter(e => !state.selection.has(e.id));
+  state.selection.clear(); updateStats(); updateSelStatus(); render();
+}
+function updateStats() {
+  const n = state.entities.length;
+  stats.textContent = `${n} Objekt${n === 1 ? '' : 'e'}`;
+}
+function updateSelStatus() { stSel.innerHTML = `Auswahl: <b>${state.selection.size}</b>`; }
+function entityBounds(e) {
+  if (e.type === 'line') return [{x:e.x1,y:e.y1},{x:e.x2,y:e.y2}];
+  if (e.type === 'xline') return [{x:e.x1,y:e.y1}];
+  if (e.type === 'rect') return [{x:e.x1,y:e.y1},{x:e.x2,y:e.y2}];
+  if (e.type === 'circle') return [{x:e.cx-e.r,y:e.cy-e.r},{x:e.cx+e.r,y:e.cy+e.r}];
+  if (e.type === 'polyline') return e.pts;
+  return [];
+}
+function zoomFit() {
+  if (!state.entities.length) {
+    const r = cv.parentElement.getBoundingClientRect();
+    state.view.x = r.width / 2; state.view.y = r.height / 2; state.view.scale = 4;
+    stZoom.innerHTML = `Zoom <b>100%</b>`; render(); return;
+  }
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const e of state.entities) for (const p of entityBounds(e)) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+  }
+  if (!Number.isFinite(minX)) return;
+  const r = cv.parentElement.getBoundingClientRect(); const pad = 40;
+  const sx = (r.width - pad*2) / Math.max(1, maxX - minX);
+  const sy = (r.height - pad*2) / Math.max(1, maxY - minY);
+  state.view.scale = Math.min(sx, sy);
+  state.view.x = pad - minX * state.view.scale;
+  state.view.y = pad + maxY * state.view.scale;
+  stZoom.innerHTML = `Zoom <b>${(state.view.scale * 25).toFixed(0)}%</b>`;
+  render();
+}
+
+//=== Layer Panel ===
+function renderLayers() {
+  layersEl.innerHTML = '';
+  state.layers.forEach((L, i) => {
+    const row = document.createElement('div');
+    row.className = 'layer-row' + (i === state.activeLayer ? ' active' : '');
+    row.onclick = () => { state.activeLayer = i; renderLayers(); };
+    const sw = document.createElement('div');
+    sw.className = 'swatch'; sw.style.background = L.color;
+    sw.onclick = (ev) => {
+      ev.stopPropagation();
+      const inp = document.createElement('input');
+      inp.type = 'color'; inp.value = rgbToHex(L.color);
+      inp.oninput = () => { L.color = inp.value; renderLayers(); render(); };
+      inp.click();
+    };
+    const name = document.createElement('div');
+    name.className = 'layer-name'; name.textContent = L.name;
+    name.ondblclick = (ev) => {
+      ev.stopPropagation();
+      const nm = prompt('Layer umbenennen:', L.name);
+      if (nm) { L.name = nm; renderLayers(); }
+    };
+    const vis = document.createElement('div');
+    vis.className = 'layer-vis'; vis.textContent = L.visible ? '👁' : '—';
+    vis.onclick = (ev) => { ev.stopPropagation(); L.visible = !L.visible; renderLayers(); render(); };
+    row.append(sw, name, vis);
+    layersEl.appendChild(row);
+  });
+}
+function rgbToHex(c) {
+  if (c.startsWith('#')) return c;
+  const m = c.match(/\d+/g); if (!m) return '#ffffff';
+  return '#' + m.slice(0, 3).map(x => (+x).toString(16).padStart(2, '0')).join('');
+}
+
+//=== Events ===
+cv.addEventListener('mousemove', (e) => {
+  const r = cv.getBoundingClientRect();
+  state.mouseScreen = { x: e.clientX - r.left, y: e.clientY - r.top };
+  state.mouseWorld = screenToWorld(state.mouseScreen);
+  stPos.innerHTML = `X: <b>${state.mouseWorld.x.toFixed(2)}</b>  Y: <b>${state.mouseWorld.y.toFixed(2)}</b>`;
+  if (pan) {
+    state.view.x += (e.clientX - pan.lastX);
+    state.view.y += (e.clientY - pan.lastY);
+    pan.lastX = e.clientX; pan.lastY = e.clientY;
+    lastSnap = null;
+  } else {
+    lastSnap = collectSnapPoints(state.mouseWorld);
+  }
+  updatePreview(); render();
+});
+cv.addEventListener('mousedown', (e) => {
+  if (e.button === 1 || (e.button === 0 && (e.shiftKey && state.tool !== 'select' || spacePan))) {
+    pan = { lastX: e.clientX, lastY: e.clientY };
+    cv.style.cursor = 'grabbing'; return;
+  }
+  if (e.button === 2) { e.preventDefault(); cancelTool(); return; }
+  if (e.button === 0) {
+    const world = lastSnap ? { x: lastSnap.x, y: lastSnap.y } : state.mouseWorld;
+    handleClick(world);
+  }
+});
+cv.addEventListener('mouseup', () => { pan = null; cv.style.cursor = ''; });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const factor = Math.exp(-e.deltaY * 0.0015);
+  const r = cv.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const before = screenToWorld({ x: mx, y: my });
+  state.view.scale *= factor;
+  state.view.scale = Math.max(0.01, Math.min(2000, state.view.scale));
+  const after = screenToWorld({ x: mx, y: my });
+  state.view.x += (after.x - before.x) * state.view.scale;
+  state.view.y -= (after.y - before.y) * state.view.scale;
+  stZoom.innerHTML = `Zoom <b>${(state.view.scale * 25).toFixed(0)}%</b>`;
+  render();
+}, { passive: false });
+
+window.addEventListener('keydown', (e) => {
+  if (e.target === cmd) {
+    if (e.key === 'Enter') {
+      if (cmd.value === '') {
+        if (state.tool === 'polyline' && toolCtx?.pts?.length >= 2) { finishPolyline(false); e.preventDefault(); return; }
+        if (['move','copy'].includes(state.tool) && toolCtx?.step === 'pick') {
+          if (!state.selection.size) { toast('Erst Objekte wählen'); e.preventDefault(); return; }
+          toolCtx = { step: 'base' }; setPrompt('Basispunkt'); render(); e.preventDefault(); return;
+        }
+        if (state.tool === 'rotate' && toolCtx?.step === 'pick') {
+          if (!state.selection.size) { toast('Erst Objekte wählen'); e.preventDefault(); return; }
+          toolCtx = { step: 'center' }; setPrompt('Drehzentrum'); render(); e.preventDefault(); return;
+        }
+        if (state.tool === 'mirror' && toolCtx?.step === 'pick') {
+          if (!state.selection.size) { toast('Erst Objekte wählen'); e.preventDefault(); return; }
+          toolCtx = { step: 'axis1' }; setPrompt('Spiegelachse: erster Punkt'); render(); e.preventDefault(); return;
+        }
+        if (state.tool === 'offset' && toolCtx?.step === 'side' && toolCtx.distance !== null) {
+          // reuse distance, stay
+        }
+      }
+      handleCommand(cmd.value); cmd.value = ''; e.preventDefault(); return;
+    }
+    if (e.key === 'Escape') { cancelTool(); cmd.value = ''; e.preventDefault(); return; }
+    return;
+  }
+  if (/^[0-9\.,\-]$/.test(e.key)) { cmd.focus(); return; }
+  if (e.key === ' ') { spacePan = true; cv.style.cursor = 'grab'; e.preventDefault(); return; }
+  if (e.key === 'Escape') { cancelTool(); return; }
+  if (e.key === 'Delete' || e.key === 'Backspace') { deleteSelection(); e.preventDefault(); return; }
+  const shortcut = TOOLS.find(t => t.key.toLowerCase() === e.key.toLowerCase() && !t.action);
+  if (shortcut) { setTool(shortcut.id); return; }
+});
+window.addEventListener('keyup', (e) => {
+  if (e.key === ' ') { spacePan = false; cv.style.cursor = ''; }
+});
+
+function cancelTool() {
+  if (state.tool === 'polyline' && toolCtx?.pts?.length >= 2) { finishPolyline(false); return; }
+  toolCtx = null;
+  setTool('select');
+}
+
+//=== Snap Settings UI ===
+['end','mid','int','center','axis','grid'].forEach(k => {
+  const el = document.getElementById('snap-' + k);
+  if (el) el.onchange = () => { snapSettings[k] = el.checked; render(); };
+});
+document.getElementById('grid-size').oninput = (e) => {
+  snapSettings.gridSize = Math.max(0.1, parseFloat(e.target.value) || 10); render();
+};
+document.getElementById('btn-addlayer').onclick = () => {
+  const name = prompt('Layer-Name:', 'Layer ' + (state.layers.length + 1));
+  if (!name) return;
+  state.layers.push({ name, color: '#cccccc', visible: true });
+  renderLayers();
+};
+
+//=== Save/Load/Export ===
+document.getElementById('btn-save').onclick = () => {
+  const data = JSON.stringify({ entities: state.entities, layers: state.layers, nextId: state.nextId }, null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'zeichnung.minicad.json'; a.click();
+};
+document.getElementById('btn-load').onclick = () => {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = '.json';
+  inp.onchange = () => {
+    const f = inp.files[0]; if (!f) return;
+    f.text().then(t => {
+      try {
+        const data = JSON.parse(t);
+        state.entities = data.entities || [];
+        if (data.layers) state.layers = data.layers;
+        state.nextId = data.nextId || 1;
+        renderLayers(); updateStats(); render();
+        toast('Geladen');
+      } catch (err) { toast('Fehler beim Laden'); }
+    });
+  };
+  inp.click();
+};
+document.getElementById('btn-export').onclick = () => {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const e of state.entities) for (const p of entityBounds(e)) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+  }
+  if (!Number.isFinite(minX)) { toast('Nichts zu exportieren'); return; }
+  const pad = 10;
+  const w = maxX - minX + pad * 2, h = maxY - minY + pad * 2;
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${minX - pad} ${-(maxY + pad)} ${w} ${h}">\n`;
+  for (const e of state.entities) {
+    if (!state.layers[e.layer].visible) continue;
+    const color = state.layers[e.layer].color;
+    const dash = state.layers[e.layer].style === 'dash' ? ' stroke-dasharray="3 2"' : '';
+    if (e.type === 'line') svg += `<line x1="${e.x1}" y1="${-e.y1}" x2="${e.x2}" y2="${-e.y2}" stroke="${color}" stroke-width="0.3"${dash}/>\n`;
+    else if (e.type === 'xline') {
+      const T = 10000;
+      svg += `<line x1="${e.x1 - e.dx * T}" y1="${-(e.y1 - e.dy * T)}" x2="${e.x1 + e.dx * T}" y2="${-(e.y1 + e.dy * T)}" stroke="${color}" stroke-width="0.3"${dash}/>\n`;
+    } else if (e.type === 'rect') {
+      const xl = Math.min(e.x1, e.x2), xr = Math.max(e.x1, e.x2);
+      const yb = Math.min(e.y1, e.y2), yt = Math.max(e.y1, e.y2);
+      svg += `<rect x="${xl}" y="${-yt}" width="${xr - xl}" height="${yt - yb}" stroke="${color}" fill="none" stroke-width="0.3"${dash}/>\n`;
+    } else if (e.type === 'circle') {
+      svg += `<circle cx="${e.cx}" cy="${-e.cy}" r="${e.r}" stroke="${color}" fill="none" stroke-width="0.3"${dash}/>\n`;
+    } else if (e.type === 'polyline') {
+      const pts = e.pts.map(p => `${p.x},${-p.y}`).join(' ');
+      const tag = e.closed ? 'polygon' : 'polyline';
+      svg += `<${tag} points="${pts}" stroke="${color}" fill="none" stroke-width="0.3"${dash}/>\n`;
+    }
+  }
+  svg += '</svg>';
+  const blob = new Blob([svg], { type: 'image/svg+xml' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'zeichnung.svg'; a.click();
+};
+document.getElementById('btn-clear').onclick = () => {
+  if (!confirm('Alle Objekte löschen?')) return;
+  state.entities = []; state.selection.clear(); updateStats(); updateSelStatus(); render();
+};
+
+//=== Start ===
+window.addEventListener('resize', resize);
+renderToolsPanel();
+renderLayers();
+updateStats();
+updateSelStatus();
+setTool('select');
+resize();
+</script>
+</body>
+</html>
