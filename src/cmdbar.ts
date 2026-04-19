@@ -15,15 +15,15 @@ import { state, runtime } from './state';
 import { dom } from './dom';
 import { add, directionAtAngle, dot, len, norm, perp, perpOffset, scale, sub } from './math';
 import {
-  addEntity, applyChamfer, applyFillet, applyRotate, applyScale, finishPolyline, finishSpline,
-  getPolygonSides, handleClick, handlePolylineClick, makeParallelXLine,
-  makeXLineThrough, setChamferDist, setFilletRadius, setPolygonSides,
-  setTextHeight, cancelTool,
+  addEntity, applyChamfer, applyGroupOffsetAt, applyRotate, applyScale,
+  finishPolyline, finishSpline, getFilletRadius, getPolygonSides, handleClick,
+  handlePolylineClick, makeParallelXLine, makeXLineThrough, setChamferDist,
+  setFilletRadius, setPolygonSides, setTextHeight, cancelTool,
 } from './tools';
 import { createParameter, evalExpr, findParamByName, parseExprInput } from './params';
 import { evaluateTimeline, newFeatureId } from './features';
 import { pushUndo } from './undo';
-import { render } from './render';
+import { requestRender as render } from './render';
 import { toast, updateSelStatus, updateStats } from './ui';
 
 const numE = (v: number): Expr => ({ kind: 'num', value: v });
@@ -43,6 +43,12 @@ export type CmdField = {
   meaningHint?: string;
   /** If true (default), commit is blocked when this field is empty. */
   required?: boolean;
+  /**
+   * Initial value rendered into the input. Used e.g. for the line/polyline
+   * angle field once the direction is locked — the user sees the locked value
+   * persist instead of an empty "°" placeholder.
+   */
+  value?: string;
 };
 
 export type CmdValue = { expr: Expr; value: number; text?: string };
@@ -56,6 +62,14 @@ export type CmdSchema = {
    * filled. `values` has `undefined` for empty fields, meaning "use mouse".
    */
   commit: (values: CmdValues) => void;
+  /**
+   * If true, pressing Enter on ANY field commits immediately instead of
+   * advancing focus to the next empty field. Used by line/polyline where
+   * typing just an angle and hitting Enter must lock the direction right
+   * away — the old advance-then-commit behaviour made users press Enter
+   * twice to lock.
+   */
+  commitOnEnter?: boolean;
 };
 
 // ============================================================================
@@ -64,6 +78,12 @@ export type CmdSchema = {
 
 let currentSchema: CmdSchema | null = null;
 let fieldValues: CmdValues = {};
+/**
+ * When set, the next rebuild focuses this field instead of the first one.
+ * Used after a "partial commit" (e.g. line-angle lock) so focus jumps to the
+ * next field the user expects to fill, not back to the field they just left.
+ */
+let pendingFocusField: string | null = null;
 
 /**
  * Re-evaluate the current (tool, step) and rebuild the input row.
@@ -91,8 +111,16 @@ export function rebuildCmdBar(promptFallback: string): void {
     inp.dataset.fieldKind = f.kind;
     if (f.placeholder) inp.placeholder = f.placeholder;
     if (f.meaningHint) inp.dataset.meaningHint = f.meaningHint;
+    if (f.value) inp.value = f.value;
     wrap.append(lbl, inp);
     dom.cmdFields.appendChild(wrap);
+  }
+  if (pendingFocusField) {
+    const el = dom.cmdFields.querySelector<HTMLInputElement>(
+      `.cmd-field-input[data-field-name="${pendingFocusField}"]`,
+    );
+    pendingFocusField = null;
+    if (el) { el.focus(); el.select(); return; }
   }
   focusFirstField();
 }
@@ -194,8 +222,10 @@ dom.cmdFields.addEventListener('keydown', (e) => {
     const inputs = allInputs();
     const idx = inputs.indexOf(target);
     const isLast = idx === inputs.length - 1;
-    // Advance to the next empty field unless we're on the last one.
-    if (!isLast) {
+    // Advance to the next empty field unless we're on the last one — OR unless
+    // the schema wants commit-on-Enter (line/polyline: angle-only Enter must
+    // lock immediately, not bounce focus to the length field).
+    if (!isLast && !currentSchema.commitOnEnter) {
       for (let i = idx + 1; i < inputs.length; i++) {
         if (!inputs[i].value) { inputs[i].focus(); return; }
       }
@@ -246,25 +276,31 @@ function parseValueInput(raw: string, meaningHint?: string): CmdValue | null {
 
 function schemaFor(tool: ToolId, tc: ToolCtx | null): CmdSchema | null {
   if (tool === 'line' && tc && tc.step === 'p2' && tc.p1) {
-    const lockNote = tc.lockedDir ? ` (${tc.angleDeg}° gelockt)` : '';
+    const locked = tc.lockedDir != null;
+    const lockNote = locked ? ` (${tc.angleDeg}° gelockt)` : '';
+    const angleVal = locked && tc.angleDeg != null ? String(tc.angleDeg) : undefined;
     return {
       prompt: 'Winkel + Länge' + lockNote,
       fields: [
-        { name: 'angle',  label: 'Winkel', kind: 'angle', placeholder: '°',    required: false },
+        { name: 'angle',  label: 'Winkel', kind: 'angle', placeholder: '°',    required: false, value: angleVal },
         { name: 'length', label: 'Länge',  kind: 'expr',  meaningHint: 'Länge', required: false },
       ],
       commit: (v) => commitLine(tc, v),
+      commitOnEnter: true,
     };
   }
   if (tool === 'polyline' && tc && tc.pts && tc.pts.length > 0) {
-    const lockNote = tc.lockedDir ? ` (${tc.angleDeg}° gelockt)` : '';
+    const locked = tc.lockedDir != null;
+    const lockNote = locked ? ` (${tc.angleDeg}° gelockt)` : '';
+    const angleVal = locked && tc.angleDeg != null ? String(tc.angleDeg) : undefined;
     return {
       prompt: 'Winkel + Länge' + lockNote,
       fields: [
-        { name: 'angle',  label: 'Winkel', kind: 'angle', placeholder: '°',  required: false },
+        { name: 'angle',  label: 'Winkel', kind: 'angle', placeholder: '°',  required: false, value: angleVal },
         { name: 'length', label: 'Länge',  kind: 'expr',                      required: false },
       ],
       commit: (v) => commitPolyline(tc, v),
+      commitOnEnter: true,
     };
   }
   if (tool === 'rect' && tc && tc.step === 'dims' && tc.p1) {
@@ -386,8 +422,11 @@ function schemaFor(tool: ToolId, tc: ToolCtx | null): CmdSchema | null {
   }
   if (tool === 'fillet' && tc) {
     return {
-      prompt: tc.entity1 && tc.entity2 ? 'Radius (Enter committed)' : 'Radius (Default)',
-      fields: [{ name: 'radius', label: 'Radius', kind: 'expr' }],
+      prompt: 'Radius (sticky — gilt bis neu eingegeben)',
+      fields: [{
+        name: 'radius', label: 'Radius', kind: 'expr',
+        value: String(getFilletRadius()),
+      }],
       commit: (v) => commitFilletRadius(tc, v),
     };
   }
@@ -460,6 +499,17 @@ export function handleBareEnter(): boolean {
     render();
     return true;
   }
+  if (state.tool === 'offset' && tc?.step === 'pick') {
+    if (!state.selection.size) { toast('Erst Objekte wählen'); return true; }
+    // Snapshot the selection into the tool ctx so subsequent clicks don't
+    // affect which entities get offset — the 'side' step only cares about
+    // which side of these entities the cursor sits on.
+    const ents = state.entities.filter(e => state.selection.has(e.id));
+    runtime.toolCtx = { step: 'side', entities: ents, distance: null };
+    setPromptRef('Abstand eingeben oder Seite klicken');
+    render();
+    return true;
+  }
   return false;
 }
 
@@ -477,20 +527,31 @@ function commitLine(tc: ToolCtx, v: CmdValues): void {
   const angle = v.angle?.value;
   const length = v.length?.value;
 
-  if (angle !== undefined && length !== undefined && length > 0) {
-    const dir = directionAtAngle(tc.p1, state.mouseWorld, angle);
-    handleClick(add(tc.p1, scale(dir, length)));
-    return;
+  // User typed a different angle than the current lock → re-lock with the new
+  // angle. Persisted angle value in the field means "angle already equals
+  // tc.angleDeg" on commit; only a *changed* value triggers re-lock.
+  if (angle !== undefined && tc.lockedDir && tc.angleDeg !== angle) {
+    tc.lockedDir = directionAtAngle(tc.p1, state.mouseWorld, angle);
+    tc.angleDeg = angle;
   }
+
+  // First-time lock: no length yet → set lock, jump to length field.
   if (angle !== undefined && !tc.lockedDir) {
     tc.lockedDir = directionAtAngle(tc.p1, state.mouseWorld, angle);
     tc.angleDeg = angle;
-    setPromptRef(`Länge (Winkel ${angle}° gelockt)`);
-    render();
-    return;
+    if (length === undefined || length <= 0) {
+      pendingFocusField = 'length';
+      setPromptRef(`Länge (Winkel ${angle}° gelockt)`);
+      render();
+      return;
+    }
   }
+
+  // Commit the line: use the lock if it exists, otherwise the typed angle,
+  // otherwise the mouse direction.
   if (length !== undefined && length > 0) {
-    const dir = tc.lockedDir ?? norm(sub(state.mouseWorld, tc.p1));
+    const dir = tc.lockedDir
+      ?? (angle !== undefined ? directionAtAngle(tc.p1, state.mouseWorld, angle) : norm(sub(state.mouseWorld, tc.p1)));
     if (len(dir) < 1e-9) { toast('Erst Mausrichtung wählen'); return; }
     handleClick(add(tc.p1, scale(dir, length)));
     return;
@@ -508,20 +569,28 @@ function commitPolyline(tc: ToolCtx, v: CmdValues): void {
     if (tc.pts.length >= 2) finishPolyline(false);
     return;
   }
-  if (angle !== undefined && length !== undefined && length > 0) {
-    const dir = directionAtAngle(last, state.mouseWorld, angle);
-    handlePolylineClick(add(last, scale(dir, length)));
-    return;
+
+  // Re-lock if the user changed the angle value.
+  if (angle !== undefined && tc.lockedDir && tc.angleDeg !== angle) {
+    tc.lockedDir = directionAtAngle(last, state.mouseWorld, angle);
+    tc.angleDeg = angle;
   }
+
+  // First-time lock: no length yet → set lock, jump to length field.
   if (angle !== undefined && !tc.lockedDir) {
     tc.lockedDir = directionAtAngle(last, state.mouseWorld, angle);
     tc.angleDeg = angle;
-    setPromptRef(`Länge (Winkel ${angle}° gelockt)`);
-    render();
-    return;
+    if (length === undefined || length <= 0) {
+      pendingFocusField = 'length';
+      setPromptRef(`Länge (Winkel ${angle}° gelockt)`);
+      render();
+      return;
+    }
   }
+
   if (length !== undefined && length > 0) {
-    const dir = tc.lockedDir ?? norm(sub(state.mouseWorld, last));
+    const dir = tc.lockedDir
+      ?? (angle !== undefined ? directionAtAngle(last, state.mouseWorld, angle) : norm(sub(state.mouseWorld, last)));
     if (len(dir) < 1e-9) { toast('Erst Mausrichtung wählen'); return; }
     handlePolylineClick(add(last, scale(dir, length)));
   }
@@ -627,8 +696,11 @@ function commitOffsetDistance(tc: ToolCtx, v: CmdValues): void {
   const d = v.distance;
   if (!d || d.value <= 0) { toast('Abstand eingeben'); return; }
   tc.distance = d.value;
-  setPromptRef('Seite klicken');
-  render();
+  // Commit immediately using the current mouse position to decide the side.
+  // No need for a second "which side" click — if the cursor is inside the
+  // selected loop, the offset goes inward; outside → outward. Matches how
+  // users actually think about offset ("5 mm nach innen").
+  applyGroupOffsetAt(state.mouseWorld);
 }
 
 function commitTextHeight(v: CmdValues): void {
@@ -638,15 +710,13 @@ function commitTextHeight(v: CmdValues): void {
   toast('Texthöhe = ' + h.value);
 }
 
-function commitFilletRadius(tc: ToolCtx, v: CmdValues): void {
+function commitFilletRadius(_tc: ToolCtx, v: CmdValues): void {
   const r = v.radius;
   if (!r || r.value <= 0) { toast('Radius eingeben'); return; }
-  if (tc.step === 'radius' && tc.entity1 && tc.entity2) {
-    applyFillet(r.value);
-  } else {
-    setFilletRadius(r.value);
-    toast('Radius = ' + r.value);
-  }
+  // Sticky radius: store and reuse until explicitly changed. The fillet
+  // itself is committed by picking the second line.
+  setFilletRadius(r.value);
+  toast('Radius = ' + r.value);
 }
 
 function commitChamferDistance(tc: ToolCtx, v: CmdValues): void {
@@ -694,11 +764,22 @@ function commitRefCircle(tc: ToolCtx, v: CmdValues): void {
   if (tc.cx == null || tc.cy == null) return;
   const r = v.radius;
   if (!r || r.value <= 0) { toast('Radius eingeben'); return; }
-  // Use addEntity + Hilfslinie layer lookup (dynamic, matches handleRefCircleClick).
+  // Build the feature directly so a variable/formula radius stays bound —
+  // addEntity would pass through EntityInit (literal number) and the
+  // variable binding would be lost.
   const hlIdx = state.layers.findIndex(L => L.name.toLowerCase().includes('hilfslin'));
   const layer = hlIdx >= 0 ? hlIdx : state.activeLayer;
   pushUndo();
-  addEntity({ type: 'circle', cx: tc.cx, cy: tc.cy, r: r.value, layer });
+  const feat: Feature = {
+    id: newFeatureId(),
+    kind: 'circle',
+    layer,
+    center: { kind: 'abs', x: numE(tc.cx), y: numE(tc.cy) },
+    radius: r.expr,
+  };
+  state.features.push(feat);
+  evaluateTimeline();
+  updateStats();
   runtime.toolCtx = { step: 'center' };
   setPromptRef('Hilfskreis: Mittelpunkt');
   render();

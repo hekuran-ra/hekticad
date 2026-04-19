@@ -4,7 +4,7 @@ import {
   add, dist, dot, len, norm, orthoSnap, perp, perpOffset, scale, sub,
 } from './math';
 import { angleInSweep, hitTest, nearestPolySegment, nearestRectEdge, pickReference } from './hittest';
-import { render } from './render';
+import { requestRender as render } from './render';
 import { dom } from './dom';
 import {
   setPrompt, setTip, syncDimPicker, toast, updateSelStatus, updateStats,
@@ -124,10 +124,42 @@ export const TOOLS: ToolDef[] = [
   { id: 'fillet', label: 'Abrunden',    key: 'G', group: 'modify',
     icon: '<path d="M4 4 L4 18 L18 18" stroke-dasharray="2 2" opacity="0.35"/><path d="M4 4 L4 11 A 7 7 0 0 0 11 18 L18 18"/>' },
   { id: 'offset', label: 'Versatz',     key: 'U', group: 'modify',
-    icon: '<rect x="4" y="4" width="9" height="9"/><rect x="8" y="8" width="10" height="10" stroke-dasharray="2 1.8"/><path d="M13 13 L16 16 M14.5 16 L16 16 L16 14.5" stroke-linecap="round"/>' },
+    icon: '<rect x="2.5" y="2.5" width="15" height="15"/><rect x="6.5" y="6.5" width="7" height="7"/>' },
   { id: 'delete', label: 'Löschen',     key: 'Del', group: 'modify', action: 'delete',
     icon: '<path d="M3 6 L19 6 M8 6 L8 4 L14 4 L14 6 M5.5 6 L7 18 L15 18 L16.5 6 M9 9 L9.5 16 M11 9 L11 16 M13 9 L12.5 16"/>' },
 ];
+
+/**
+ * Tools that operate on existing geometry — they need at least one selected
+ * entity before they're useful. The rail renders them greyed-out until the
+ * user selects something, and clicking them without a selection surfaces a
+ * short toast instead of activating the tool. Fillet/chamfer/trim/extend are
+ * NOT in this set: they pick their targets via direct clicks (no preselect),
+ * and their workflow would get worse if we forced a selection step first.
+ */
+const TOOLS_REQUIRING_SELECTION: ReadonlySet<string> = new Set([
+  'move', 'copy', 'rotate', 'mirror', 'scale', 'stretch', 'offset', 'delete',
+]);
+
+export function toolRequiresSelection(id: string): boolean {
+  return TOOLS_REQUIRING_SELECTION.has(id);
+}
+
+/**
+ * Toggle the `.disabled` class on every rail button whose tool needs a
+ * selection. Called from `renderToolsPanel` (initial render) and from
+ * `updateSelStatus` (selection changed), so the rail stays in sync without
+ * explicit wiring at every selection mutation site.
+ */
+export function syncToolAvailability(): void {
+  const hasSel = state.selection.size > 0;
+  document.querySelectorAll<HTMLElement>('.tool-btn').forEach(b => {
+    const id = b.dataset.tool;
+    if (!id) return;
+    const gated = TOOLS_REQUIRING_SELECTION.has(id);
+    b.classList.toggle('disabled', gated && !hasSel);
+  });
+}
 
 // ---------------- Tool-rail: drag-reorder + localStorage persist ----------------
 //
@@ -220,6 +252,14 @@ export function renderToolsPanel(): void {
     b.innerHTML = `<svg viewBox="0 0 22 22">${t.icon}</svg>`;
     b.draggable = true;
     b.onclick = () => {
+      // Selection-gated tools: if no selection, refuse to activate and toast
+      // the user. Keeps the rail's greyed-out affordance honest — the button
+      // still receives the click (no pointer-events:none) so we can surface
+      // the message rather than silently dropping it.
+      if (TOOLS_REQUIRING_SELECTION.has(String(t.id)) && state.selection.size === 0) {
+        toast('Erst Objekte wählen');
+        return;
+      }
       if (t.action === 'delete') { deleteSelection(); return; }
       setTool(t.id as ToolId);
     };
@@ -260,6 +300,7 @@ export function renderToolsPanel(): void {
     cols.appendChild(col);
   }
   panel.appendChild(cols);
+  syncToolAvailability();
 }
 
 function wireColumnDrop(col: HTMLElement, colKey: ColKey): void {
@@ -359,7 +400,20 @@ export function setTool(id: ToolId): void {
   else if (id === 'ellipse')    { runtime.toolCtx = { step: 'center' }; setPrompt('Mittelpunkt der Ellipse'); }
   else if (id === 'spline')     { runtime.toolCtx = { step: 'p1', pts: [] }; setPrompt('Erster Punkt der Spline'); }
   else if (id === 'polygon')    { runtime.toolCtx = { step: 'center' }; setPrompt(`Mittelpunkt (n=${lastPolygonSides}, Zahl ändert)`); }
-  else if (id === 'offset')     { runtime.toolCtx = { step: 'pick' }; setPrompt('Objekt wählen'); }
+  else if (id === 'offset') {
+    // Offset works on a group: user selects 1-N entities, then picks a side
+    // (inside / outside the group) with the mouse. Distance is the nearest-
+    // edge distance from the cursor, or an explicit typed value. Mirrors the
+    // move/copy/rotate pattern: existing selection → skip straight to 'side'.
+    if (state.selection.size) {
+      const ents = state.entities.filter(e => state.selection.has(e.id));
+      runtime.toolCtx = { step: 'side', entities: ents, distance: null };
+      setPrompt('Abstand eingeben oder Seite klicken');
+    } else {
+      runtime.toolCtx = { step: 'pick' };
+      setPrompt('Objekte wählen, dann Enter');
+    }
+  }
   else if (id === 'move') {
     runtime.toolCtx = state.selection.size ? { step: 'base' } : { step: 'pick' };
     setPrompt(runtime.toolCtx.step === 'base' ? 'Basispunkt' : 'Objekte wählen, dann Enter');
@@ -642,7 +696,67 @@ function offsetInfo(e: Entity, pt: Pt): { dist: number; sign: 1 | -1 } | null {
     const d = dist(pt, { x: e.cx, y: e.cy });
     return { dist: Math.abs(d - e.r), sign: d > e.r ? 1 : -1 };
   }
+  if (e.type === 'arc') {
+    const d = dist(pt, { x: e.cx, y: e.cy });
+    return { dist: Math.abs(d - e.r), sign: d > e.r ? 1 : -1 };
+  }
+  if (e.type === 'ellipse') {
+    // Approximate: transform click into the ellipse's axis-aligned frame.
+    const c = { x: pt.x - e.cx, y: pt.y - e.cy };
+    const ca = Math.cos(-e.rot), sa = Math.sin(-e.rot);
+    const lx = c.x * ca - c.y * sa;
+    const ly = c.x * sa + c.y * ca;
+    // Normalised "radius" in unit-circle space — <1 inside, >1 outside.
+    const r = Math.hypot(lx / Math.max(1e-9, e.rx), ly / Math.max(1e-9, e.ry));
+    // Distance estimate — good enough to pick a side; the exact offset curve
+    // isn't an ellipse anyway so we approximate by scaling both axes.
+    const approxR = Math.hypot(lx, ly);
+    const ref = Math.hypot(lx * (e.rx / Math.max(1e-9, Math.hypot(lx, ly))),
+                           ly * (e.ry / Math.max(1e-9, Math.hypot(lx, ly))));
+    return { dist: Math.abs(approxR - ref), sign: r > 1 ? 1 : -1 };
+  }
+  if (e.type === 'polyline') {
+    if (!e.pts || e.pts.length < 2) return null;
+    // Nearest edge + signed side of that edge.
+    let bestD = Infinity;
+    let bestEdge = 0;
+    for (let i = 0; i < e.pts.length - 1; i++) {
+      const d = distPtSeg(pt, e.pts[i], e.pts[i + 1]);
+      if (d < bestD) { bestD = d; bestEdge = i; }
+    }
+    if (e.closed) {
+      const d = distPtSeg(pt, e.pts[e.pts.length - 1], e.pts[0]);
+      if (d < bestD) { bestD = d; bestEdge = e.pts.length - 1; }
+    }
+    // Sign: for closed polyline use inside/outside via ray casting; for open,
+    // use left/right of the nearest edge.
+    if (e.closed) {
+      const inside = pointInPolygon(pt, e.pts);
+      return { dist: bestD, sign: inside ? -1 : 1 };
+    }
+    const a = e.pts[bestEdge];
+    const b = e.pts[(bestEdge + 1) % e.pts.length];
+    const dir = norm(sub(b, a));
+    const n = perp(dir);
+    const sd = dot(sub(pt, a), n);
+    return { dist: bestD, sign: sd >= 0 ? 1 : -1 };
+  }
   return null;
+}
+
+function pointInPolygon(p: Pt, pts: Pt[]): boolean {
+  // Standard even-odd ray casting. Treats the polygon as closed regardless of
+  // whether the first/last vertices coincide.
+  let inside = false;
+  const n = pts.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = pts[i].x, yi = pts[i].y;
+    const xj = pts[j].x, yj = pts[j].y;
+    const intersect = ((yi > p.y) !== (yj > p.y)) &&
+      (p.x < ((xj - xi) * (p.y - yi)) / ((yj - yi) || 1e-12) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
 }
 
 function distPtSeg(p: Pt, a: Pt, b: Pt): number {
@@ -678,13 +792,93 @@ export function makeOffsetPreview(e: Entity, d: number, sign: 1 | -1): EntitySha
     const nr = e.r + d * sign;
     return { type: 'circle', cx: e.cx, cy: e.cy, r: Math.max(0.001, nr) };
   }
+  if (e.type === 'arc') {
+    const nr = e.r + d * sign;
+    if (nr < 0.001) return null;
+    return { type: 'arc', cx: e.cx, cy: e.cy, r: nr, a1: e.a1, a2: e.a2 };
+  }
+  if (e.type === 'ellipse') {
+    // Approximation: grow both semi-axes by d·sign. Not a geometric parallel
+    // curve (which would not be an ellipse), but visually intuitive and what
+    // most CAD users expect.
+    const nrx = e.rx + d * sign;
+    const nry = e.ry + d * sign;
+    if (nrx < 0.001 || nry < 0.001) return null;
+    return { type: 'ellipse', cx: e.cx, cy: e.cy, rx: nrx, ry: nry, rot: e.rot };
+  }
+  if (e.type === 'polyline') {
+    const off = offsetPolyline(e.pts, d * sign, !!e.closed);
+    if (!off || off.length < 2) return null;
+    return { type: 'polyline', pts: off, closed: !!e.closed };
+  }
   return null;
 }
 
-function createOffset(e: Entity, d: number, sign: 1 | -1): void {
-  const prev = makeOffsetPreview(e, d, sign);
-  if (!prev) return;
-  addEntity({ ...prev, layer: e.layer } as EntityInit);
+/**
+ * Offset each edge of a polyline by `signedDist` along its left-hand normal,
+ * then reconstruct vertices by intersecting adjacent offset edges. For closed
+ * polylines the first/last edges wrap. Collinear neighbours just get the
+ * perpendicularly-translated endpoint.
+ */
+function offsetPolyline(pts: Pt[], signedDist: number, closed: boolean): Pt[] | null {
+  const n = pts.length;
+  if (n < 2) return null;
+
+  // Per-edge offset line defined by a point and a direction.
+  const segCount = closed ? n : n - 1;
+  const edges: { a: Pt; dir: Pt }[] = [];
+  for (let i = 0; i < segCount; i++) {
+    const p0 = pts[i], p1 = pts[(i + 1) % n];
+    const dir = norm(sub(p1, p0));
+    if (len(dir) < 1e-9) return null;
+    const nrm = perp(dir);
+    const shift = scale(nrm, signedDist);
+    edges.push({ a: add(p0, shift), dir });
+  }
+
+  const out: Pt[] = new Array(n);
+
+  // For each vertex, intersect the two edges that meet there.
+  for (let i = 0; i < n; i++) {
+    let prevIdx: number, nextIdx: number;
+    if (closed) {
+      prevIdx = (i - 1 + segCount) % segCount;
+      nextIdx = i % segCount;
+    } else {
+      if (i === 0) {
+        // Start vertex: just translate perpendicularly to the first edge.
+        out[i] = edges[0].a;
+        continue;
+      }
+      if (i === n - 1) {
+        // End vertex: translate perpendicularly to the last edge.
+        const last = edges[segCount - 1];
+        out[i] = add(last.a, scale(last.dir, len(sub(pts[n - 1], pts[n - 2]))));
+        continue;
+      }
+      prevIdx = i - 1;
+      nextIdx = i;
+    }
+    const e1 = edges[prevIdx], e2 = edges[nextIdx];
+    const x = intersectLines(e1.a, e1.dir, e2.a, e2.dir);
+    if (x) {
+      out[i] = x;
+    } else {
+      // Parallel/collinear — fall back to the offset endpoint of the prev edge.
+      const segLen = len(sub(pts[i], pts[(i - 1 + n) % n]));
+      out[i] = add(e1.a, scale(e1.dir, segLen));
+    }
+  }
+  return out;
+}
+
+/** Intersect two infinite lines given as (point, direction). Returns null if parallel. */
+function intersectLines(a: Pt, da: Pt, b: Pt, db: Pt): Pt | null {
+  const det = da.x * db.y - da.y * db.x;
+  if (Math.abs(det) < 1e-9) return null;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const t = (dx * db.y - dy * db.x) / det;
+  return { x: a.x + da.x * t, y: a.y + da.y * t };
 }
 
 function hilfslinieLayer(): number {
@@ -895,11 +1089,40 @@ function handleRectClick(p: Pt): void {
       toast('Rechteck zu klein');
       return;
     }
-    addEntity({ type: 'rect', x1, y1, x2, y2, layer: state.activeLayer });
+    commitRectAsLines(x1, y1, x2, y2);
     runtime.toolCtx = { step: 'p1' };
     setPrompt('Erster Eckpunkt');
   }
   render();
+}
+
+/**
+ * Rectangle tool commits as 4 independent LINE features (not a `rect`
+ * entity). This makes the rectangle immediately editable edge-by-edge —
+ * select a single side and offset it, trim, extend, delete, etc. — which
+ * matches how draftspeople think of "ein Rechteck aus 4 Linien". All four
+ * lines land under a single undo step.
+ */
+function commitRectAsLines(x1: number, y1: number, x2: number, y2: number): void {
+  const corners: Pt[] = [
+    { x: x1, y: y1 },
+    { x: x2, y: y1 },
+    { x: x2, y: y2 },
+    { x: x1, y: y2 },
+  ];
+  pushUndo();
+  for (let i = 0; i < 4; i++) {
+    const a = corners[i], b = corners[(i + 1) % 4];
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'line',
+      layer: state.activeLayer,
+      p1: { kind: 'abs', x: numE(a.x), y: numE(a.y) },
+      p2: { kind: 'abs', x: numE(b.x), y: numE(b.y) },
+    });
+  }
+  evaluateTimeline();
+  updateStats();
 }
 
 function handleCircleClick(p: Pt): void {
@@ -1338,30 +1561,185 @@ function handleXLineClick(p: Pt, worldPt: Pt): void {
 
 function handleOffsetClick(p: Pt, worldPt: Pt): void {
   const tc = runtime.toolCtx;
-  if (!tc || tc.step === 'pick') {
+  if (!tc) return;
+
+  // Pick step: add/remove entities from the selection set (same UX as
+  // move/copy). Enter (handleBareEnter) advances to 'side'.
+  if (tc.step === 'pick') {
     const hit = hitTest(worldPt);
-    if (!hit) { toast('Objekt wählen'); return; }
-    runtime.toolCtx = { step: 'side', entity: hit, distance: null };
-    state.selection.clear();
-    state.selection.add(hit.id);
-    updateSelStatus();
-    setPrompt('Abstand eingeben oder Seite klicken');
-    updatePreview();
-    render();
+    if (hit) {
+      if (state.selection.has(hit.id)) state.selection.delete(hit.id);
+      else state.selection.add(hit.id);
+      updateSelStatus();
+      render();
+    }
     return;
   }
-  if (tc.step === 'side' && tc.entity) {
-    const info = offsetInfo(tc.entity, p);
-    if (!info) return;
-    const d = tc.distance != null ? tc.distance : info.dist;
-    if (d < 1e-6) return;
-    createOffset(tc.entity, d, info.sign);
-    runtime.toolCtx = { step: 'pick' };
-    state.selection.clear();
-    updateSelStatus();
-    setPrompt('Objekt wählen');
-    render();
+
+  // Side step: cursor position decides inside/outside for each selected
+  // entity independently (each entity's own sign via offsetInfo), while the
+  // distance is the typed value or — falling back — the distance to the
+  // entity currently nearest the cursor. Clicking commits one offset per
+  // selected entity, all under a single undo.
+  if (tc.step === 'side' && tc.entities && tc.entities.length > 0) {
+    applyGroupOffsetAt(p);
   }
+}
+
+/**
+ * Commit the group offset using `p` as the "which side" cursor position.
+ * Called both from the mouse-click handler and from the cmdbar (Enter after
+ * typing a distance — no click needed, we just reuse the current mouse
+ * position to decide inside vs outside).
+ */
+export function applyGroupOffsetAt(p: Pt): void {
+  const tc = runtime.toolCtx;
+  if (!tc || tc.step !== 'side' || !tc.entities || tc.entities.length === 0) return;
+  const shapes = computeGroupOffsetShapes(tc.entities, p, tc.distance);
+  if (!shapes || shapes.length === 0) return;
+  pushUndo();
+  for (const { shape, layer } of shapes) {
+    state.features.push(
+      featureFromEntityInit({ ...shape, layer } as EntityInit),
+    );
+  }
+  evaluateTimeline();
+  updateStats();
+  // Keep selection + entities so the user can immediately apply another
+  // offset on the same source without re-selecting. Reset distance so the
+  // next Enter recomputes from the cursor unless a new value is typed.
+  if (runtime.toolCtx) {
+    runtime.toolCtx.distance = null;
+    runtime.toolCtx.step = 'side';
+  }
+  setPrompt('Abstand eingeben oder Seite klicken');
+  render();
+}
+
+/**
+ * For a group offset, the "reference distance" is the perpendicular distance
+ * from the cursor to whichever selected entity is currently nearest. That
+ * matches user intuition: dragging the cursor toward the selection shrinks
+ * the offset, pulling away from it grows the offset, regardless of how many
+ * entities are selected.
+ */
+function nearestOffsetInfo(ents: Entity[], p: Pt): { dist: number; sign: 1 | -1 } | null {
+  let best: { dist: number; sign: 1 | -1 } | null = null;
+  for (const e of ents) {
+    const info = offsetInfo(e, p);
+    if (!info) continue;
+    if (!best || info.dist < best.dist) best = info;
+  }
+  return best;
+}
+
+/**
+ * Core of the group offset: produces the offset EntityShapes that should
+ * become previews (and, on commit, features). Handles two regimes:
+ *
+ *   1. All selected entities are lines that chain into a closed polygon
+ *      (typical case: the four lines of a rectangle). We then offset the
+ *      polygon as a whole and re-split it back into line shapes. This is the
+ *      only way to get a clean parallel rectangle — independent per-line
+ *      offsets would use each line's own cursor-side sign, which for an
+ *      enclosing cursor makes opposite edges shift in opposite directions
+ *      and the rectangle falls apart.
+ *
+ *   2. Otherwise, fall back to independent per-entity offset with the
+ *      per-entity cursor-side sign from `offsetInfo`. Correct for open
+ *      shapes, arcs/circles, mixed selections, etc.
+ */
+function computeGroupOffsetShapes(
+  ents: Entity[], p: Pt, typedDist: number | null | undefined,
+): Array<{ shape: EntityShape; layer: number }> | null {
+  const nearest = nearestOffsetInfo(ents, p);
+  if (!nearest) return null;
+  const d = typedDist != null ? typedDist : nearest.dist;
+  if (d < 1e-6) return null;
+
+  // Try to chain selected lines into a closed polygon.
+  const chain = chainLinesToPolygon(ents);
+  if (chain) {
+    const layer = (ents[0] as Entity).layer;
+    const inside = pointInPolygon(p, chain);
+    const orient = signedArea(chain) >= 0 ? 1 : -1;
+    // `inside ? orient : -orient` — see offsetPolyline header for why this
+    // sign convention consistently moves each edge inward vs outward
+    // regardless of polygon orientation (CCW/CW).
+    const sign = (inside ? orient : -orient) as 1 | -1;
+    const off = offsetPolyline(chain, d * sign, true);
+    if (off && off.length === chain.length) {
+      return off.map((a, i) => {
+        const b = off[(i + 1) % off.length];
+        return {
+          shape: { type: 'line', x1: a.x, y1: a.y, x2: b.x, y2: b.y } as EntityShape,
+          layer,
+        };
+      });
+    }
+    // Offset collapsed (e.g. inward offset larger than half-width) — bail out.
+    return null;
+  }
+
+  // Fallback: independent per-entity offset.
+  const out: Array<{ shape: EntityShape; layer: number }> = [];
+  for (const e of ents) {
+    const info = offsetInfo(e, p);
+    if (!info) continue;
+    const shape = makeOffsetPreview(e, d, info.sign);
+    if (shape) out.push({ shape, layer: e.layer });
+  }
+  return out;
+}
+
+/**
+ * If every selected entity is a line and the lines form a single closed
+ * loop (each endpoint shared with exactly one neighbour, chain returns to
+ * start), return the ordered polygon vertices. Returns `null` for any other
+ * configuration (open chain, disjoint islands, non-line entities, < 3 lines).
+ */
+function chainLinesToPolygon(ents: Entity[]): Pt[] | null {
+  if (ents.length < 3) return null;
+  const lines = ents.filter((e): e is Extract<Entity, { type: 'line' }> => e.type === 'line');
+  if (lines.length !== ents.length) return null;
+
+  const EPS = 1e-6;
+  const eq = (a: Pt, b: Pt) => Math.abs(a.x - b.x) < EPS && Math.abs(a.y - b.y) < EPS;
+
+  const used = new Set<number>();
+  used.add(0);
+  const polygon: Pt[] = [
+    { x: lines[0].x1, y: lines[0].y1 },
+    { x: lines[0].x2, y: lines[0].y2 },
+  ];
+
+  while (used.size < lines.length) {
+    const tail = polygon[polygon.length - 1];
+    let found = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (used.has(i)) continue;
+      const L = lines[i];
+      const a = { x: L.x1, y: L.y1 };
+      const b = { x: L.x2, y: L.y2 };
+      if (eq(a, tail))      { polygon.push(b); used.add(i); found = true; break; }
+      else if (eq(b, tail)) { polygon.push(a); used.add(i); found = true; break; }
+    }
+    if (!found) return null;
+  }
+
+  // Closed loop: last vertex must meet first.
+  if (!eq(polygon[polygon.length - 1], polygon[0])) return null;
+  polygon.pop();
+  return polygon;
+}
+
+function signedArea(pts: Pt[]): number {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], q = pts[(i + 1) % pts.length];
+    a += p.x * q.y - q.x * p.y;
+  }
+  return a / 2;
 }
 
 function handleMoveCopyClick(p: Pt, worldPt: Pt, isCopy: boolean): void {
@@ -1389,10 +1767,10 @@ function handleMoveCopyClick(p: Pt, worldPt: Pt, isCopy: boolean): void {
     if (isCopy) {
       setPrompt('Zielpunkt (Rechtsklick beendet)');
     } else {
-      state.selection.clear();
-      updateSelStatus();
-      runtime.toolCtx = { step: 'pick' };
-      setPrompt('Objekte wählen, dann Enter');
+      // Keep the now-moved entities selected so the user can chain another
+      // move (or any other modifier) on them without having to re-select.
+      runtime.toolCtx = { step: 'base' };
+      setPrompt('Basispunkt');
     }
     render();
   }
@@ -1421,10 +1799,11 @@ function handleRotateClick(p: Pt, worldPt: Pt): void {
     if (len(v) < 1e-6) return;
     const ang = Math.atan2(v.y, v.x);
     applyRotate(tc.centerPt, ang);
-    state.selection.clear();
-    updateSelStatus();
-    runtime.toolCtx = { step: 'pick' };
-    setPrompt('Objekte wählen, dann Enter');
+    // Selection is preserved by transformSelection — reset to the "pick a
+    // rotation centre" step so the user can rotate again (or switch to a
+    // different modifier) without re-selecting.
+    runtime.toolCtx = { step: 'center' };
+    setPrompt('Drehzentrum');
     render();
   }
 }
@@ -1478,10 +1857,10 @@ function handleScaleClick(p: Pt, worldPt: Pt): void {
     if (newLen < 1e-6) { toast('Punkt zu nah am Basispunkt'); return; }
     const k = newLen / tc.refLen;
     applyScale(tc.basePt, k);
-    state.selection.clear();
-    updateSelStatus();
-    runtime.toolCtx = { step: 'pick' };
-    setPrompt('Objekte wählen, dann Enter');
+    // Selection stays (transformSelection re-added the scaled entity ids),
+    // reset to the first interactive step so the user can scale again.
+    runtime.toolCtx = { step: 'base' };
+    setPrompt('Basispunkt');
     render();
   }
 }
@@ -1521,10 +1900,10 @@ function handleMirrorClick(p: Pt, worldPt: Pt): void {
       const rel = sub(pt, a);
       return add(a, add(scale(d, dot(rel, d)), scale(n, -dot(rel, n))));
     }, { pureTranslation: false });
-    state.selection.clear();
-    updateSelStatus();
-    runtime.toolCtx = { step: 'pick' };
-    setPrompt('Objekte wählen, dann Enter');
+    // Selection kept — reset to "pick axis start" so the user can mirror
+    // again (common: mirror across one axis, then across a second).
+    runtime.toolCtx = { step: 'axis1' };
+    setPrompt('Spiegelachse: erster Punkt');
     render();
   }
 }
@@ -1541,8 +1920,12 @@ export function updatePreview(): void {
   if (state.tool === 'line' && tc.step === 'p2' && tc.p1) {
     let endPt: Pt;
     if (tc.lockedDir) {
+      // Signed projection so the lock-line extends in BOTH directions along
+      // the locked axis — AutoCAD-style polar lock. Clamping to ≥0 would pin
+      // the preview to one side of the start point, which is what the old
+      // code did and felt broken.
       const ap = sub(p, tc.p1);
-      const length = Math.max(0, dot(ap, tc.lockedDir));
+      const length = dot(ap, tc.lockedDir);
       endPt = add(tc.p1, scale(tc.lockedDir, length));
     } else {
       endPt = maybeOrtho(tc.p1, p);
@@ -1556,8 +1939,9 @@ export function updatePreview(): void {
     const last = tc.pts[tc.pts.length - 1];
     let endPt: Pt;
     if (tc.lockedDir) {
+      // Signed projection — see note in the line branch above.
       const ap = sub(p, last);
-      const length = Math.max(0, dot(ap, tc.lockedDir));
+      const length = dot(ap, tc.lockedDir);
       endPt = add(last, scale(tc.lockedDir, length));
     } else {
       endPt = maybeOrtho(last, p);
@@ -1718,14 +2102,18 @@ export function updatePreview(): void {
     const base = add(tc.base, scale(n, off.dist));
     tc.preview = { type: 'xline', x1: base.x, y1: base.y, dx: tc.dir.x, dy: tc.dir.y };
     setTip(`Abstand ${Math.abs(off.dist).toFixed(2)}`);
-  } else if (state.tool === 'offset' && tc.step === 'side' && tc.entity) {
-    const info = offsetInfo(tc.entity, p);
-    if (info) {
-      const d = tc.distance != null ? tc.distance : info.dist;
-      const preview = makeOffsetPreview(tc.entity, d, info.sign);
-      if (preview) tc.preview = preview;
-      setTip(`Offset ${d.toFixed(2)}`);
+  } else if (state.tool === 'offset' && tc.step === 'side' && tc.entities && tc.entities.length > 0) {
+    // Delegate to the shared group-offset helper so preview and commit stay
+    // in perfect lock-step — especially important for the chained-polygon
+    // case where the preview's line endpoints must land on the same
+    // intersections the commit produces.
+    const shapes = computeGroupOffsetShapes(tc.entities, p, tc.distance);
+    const nearest = nearestOffsetInfo(tc.entities, p);
+    const d = tc.distance != null ? tc.distance : (nearest?.dist ?? 0);
+    if (shapes && shapes.length > 0) {
+      tc.preview = { type: 'group', entities: shapes.map(s => s.shape) };
     }
+    setTip(`Versatz ${d.toFixed(2)} · ${tc.entities.length} Objekt(e)`);
   } else if ((state.tool === 'move' || state.tool === 'copy') && tc.step === 'target' && tc.basePt) {
     const target = maybeOrtho(tc.basePt, p);
     const delta = sub(target, tc.basePt);
@@ -1758,12 +2146,28 @@ export function updatePreview(): void {
     }
     tc.preview = { type: 'group', entities: previews };
     setTip(`Winkel ${(ang * 180 / Math.PI).toFixed(1)}°`);
-  } else if (state.tool === 'fillet' && tc.step === 'radius'
-             && tc.entity1 && tc.entity2 && tc.click1 && tc.click2
-             && tc.entity1.type === 'line' && tc.entity2.type === 'line') {
-    const r = radiusFromPoint(tc.entity1, tc.entity2, p);
-    if (r > 1e-4) {
-      const result = computeFillet(tc.entity1, tc.click1, tc.entity2, tc.click2, r);
+  } else if (state.tool === 'fillet' && tc.step === 'pick2'
+             && tc.entity1 && tc.click1
+             && tc.entity1.type === 'line') {
+    // Live-preview using the sticky radius against the hovered partner line.
+    // Use raw hitTest (no side effects) — rects only preview once they're
+    // exploded on click, same as entity1.
+    const hit = hitTest(p);
+    const hover = hit && hit.type === 'line' ? hit : null;
+    if (hover && hover.id !== tc.entity1.id) {
+      const r = lastFilletRadius;
+      // If there's already a fillet between these two lines, preview as if
+      // we'd re-extended them to the original corner.
+      let prevL1 = tc.entity1, prevL2 = hover;
+      const existing = findExistingFilletBetween(tc.entity1, hover);
+      if (existing) {
+        const P = lineIntersectionInfinite(tc.entity1, hover);
+        if (P) {
+          prevL1 = extendLineEndTo(tc.entity1, existing.l1TrimEnd, P);
+          prevL2 = extendLineEndTo(hover, existing.l2TrimEnd, P);
+        }
+      }
+      const result = computeFillet(prevL1, tc.click1, prevL2, p, r);
       if (!('error' in result)) {
         tc.preview = {
           type: 'group',
@@ -1835,6 +2239,7 @@ export function updatePreview(): void {
 let lastFilletRadius = 10;
 
 export function setFilletRadius(r: number): void { lastFilletRadius = r; }
+export function getFilletRadius(): number { return lastFilletRadius; }
 
 function lineIntersectionInfinite(a: { x1: number; y1: number; x2: number; y2: number }, b: { x1: number; y1: number; x2: number; y2: number }): Pt | null {
   const den = (a.x1 - a.x2) * (b.y1 - b.y2) - (a.y1 - a.y2) * (b.x1 - b.x2);
@@ -1870,8 +2275,17 @@ function computeFillet(l1: LineEntity, click1: Pt, l2: LineEntity, click2: Pt, r
   const half = angle / 2;
   const t = r / Math.tan(half);
   const cDist = r / Math.sin(half);
-  if (t > dist(P, kept1) - 1e-6) return { error: 'Radius zu groß für Linie 1' };
-  if (t > dist(P, kept2) - 1e-6) return { error: 'Radius zu groß für Linie 2' };
+  // Constraint: t ≤ dist(P, keptN) → r ≤ tan(half) * dist(P, keptN).
+  // Report the binding limit so the user knows what value would still fit.
+  const maxR1 = Math.tan(half) * dist(P, kept1);
+  const maxR2 = Math.tan(half) * dist(P, kept2);
+  const rMax = Math.min(maxR1, maxR2);
+  if (t > dist(P, kept1) - 1e-6) {
+    return { error: `Radius zu groß für Linie 1 (max ${rMax.toFixed(2)})` };
+  }
+  if (t > dist(P, kept2) - 1e-6) {
+    return { error: `Radius zu groß für Linie 2 (max ${rMax.toFixed(2)})` };
+  }
 
   const T1 = add(P, scale(u1, t));
   const T2 = add(P, scale(u2, t));
@@ -1949,6 +2363,50 @@ function radiusFromPoint(l1: LineEntity, l2: LineEntity, pt: Pt): number {
   return Math.min(d1, d2);
 }
 
+/**
+ * Detect whether l1 and l2 are already joined by an existing fillet arc —
+ * i.e. some arc whose endpoints coincide with one endpoint of l1 and one
+ * endpoint of l2. If so, return the arc plus which ends of l1/l2 are the
+ * "trimmed" ends (those touching the arc). Used to let the user re-fillet
+ * a corner with a new radius without stacking a second arc on top.
+ */
+function findExistingFilletBetween(l1: LineEntity, l2: LineEntity): {
+  arcFeatureId: string;
+  l1TrimEnd: 1 | 2;
+  l2TrimEnd: 1 | 2;
+} | null {
+  const EPS = 1e-3;
+  const endMatch = (pt: Pt, l: LineEntity): 1 | 2 | null => {
+    if (Math.hypot(pt.x - l.x1, pt.y - l.y1) < EPS) return 1;
+    if (Math.hypot(pt.x - l.x2, pt.y - l.y2) < EPS) return 2;
+    return null;
+  };
+  for (const ent of state.entities) {
+    if (ent.type !== 'arc') continue;
+    const p1 = { x: ent.cx + ent.r * Math.cos(ent.a1), y: ent.cy + ent.r * Math.sin(ent.a1) };
+    const p2 = { x: ent.cx + ent.r * Math.cos(ent.a2), y: ent.cy + ent.r * Math.sin(ent.a2) };
+    let e1 = endMatch(p1, l1);
+    let e2 = endMatch(p2, l2);
+    if (!e1 || !e2) { e1 = endMatch(p2, l1); e2 = endMatch(p1, l2); }
+    if (!e1 || !e2) continue;
+    const f = featureForEntity(ent.id);
+    if (!f) continue;
+    return { arcFeatureId: f.id, l1TrimEnd: e1, l2TrimEnd: e2 };
+  }
+  return null;
+}
+
+/**
+ * Return a copy of `l` whose `end` (1 or 2) is moved to point `p`. Used to
+ * "undo" a previous fillet trim by snapping the trimmed endpoint back to the
+ * original line-line intersection before re-computing with a new radius.
+ */
+function extendLineEndTo(l: LineEntity, end: 1 | 2, p: Pt): LineEntity {
+  return end === 1
+    ? { ...l, x1: p.x, y1: p.y }
+    : { ...l, x2: p.x, y2: p.y };
+}
+
 function handleFilletClick(worldPt: Pt): void {
   const tc = runtime.toolCtx;
   if (!tc) return;
@@ -1961,7 +2419,7 @@ function handleFilletClick(worldPt: Pt): void {
     state.selection.add(line.id);
     updateSelStatus();
     tc.step = 'pick2';
-    setPrompt('Zweite Linie oder Rechteck-Kante wählen');
+    setPrompt(`Zweite Linie wählen (Radius=${lastFilletRadius})`);
     render();
     return;
   }
@@ -1973,16 +2431,11 @@ function handleFilletClick(worldPt: Pt): void {
     tc.click2 = worldPt;
     state.selection.add(line.id);
     updateSelStatus();
-    tc.step = 'radius';
-    setPrompt(`Radius eingeben oder Punkt klicken (zuletzt ${lastFilletRadius})`);
-    render();
+    // Sticky radius: apply immediately with the last-entered value. The user
+    // can change it any time via the command bar — the next fillet uses the
+    // new value. No "click-to-size" step here.
+    applyFillet(lastFilletRadius);
     return;
-  }
-  if (tc.step === 'radius' && tc.entity1 && tc.entity2
-      && tc.entity1.type === 'line' && tc.entity2.type === 'line') {
-    const r = radiusFromPoint(tc.entity1, tc.entity2, worldPt);
-    if (r < 1e-6) { toast('Klick weiter vom Schnittpunkt entfernt'); return; }
-    applyFillet(r);
   }
 }
 
@@ -1996,7 +2449,22 @@ export function applyFillet(radius: number): void {
     return;
   }
   if (radius <= 0) { toast('Radius muss > 0 sein'); return; }
-  const result = computeFillet(l1, c1, l2, c2, radius);
+
+  // If these two lines already share a fillet arc, remove that arc and
+  // extend both lines back to their infinite intersection before computing
+  // the new fillet. This lets the user change a corner's radius in place
+  // rather than stacking a second arc on top of a previously-filleted edge.
+  const existing = findExistingFilletBetween(l1, l2);
+  let workL1 = l1, workL2 = l2;
+  if (existing) {
+    const P = lineIntersectionInfinite(l1, l2);
+    if (P) {
+      workL1 = extendLineEndTo(l1, existing.l1TrimEnd, P);
+      workL2 = extendLineEndTo(l2, existing.l2TrimEnd, P);
+    }
+  }
+
+  const result = computeFillet(workL1, c1, workL2, c2, radius);
   if ('error' in result) {
     toast(result.error);
     // Reset pick1 so user can try again
@@ -2009,6 +2477,10 @@ export function applyFillet(radius: number): void {
   }
   lastFilletRadius = radius;
   pushUndo();
+  // Drop the old arc first so undo captures the true "before" state.
+  if (existing) {
+    state.features = state.features.filter(f => f.id !== existing.arcFeatureId);
+  }
   // Replace each line's source feature in place (entity id preserved) and
   // append a new arc feature.
   const f1 = featureForEntity(l1.id), f2 = featureForEntity(l2.id);
@@ -2420,7 +2892,7 @@ function entityAABB(e: Entity): Rect | null {
     const xs = [e.p1.x, e.p2.x, e.offset.x], ys = [e.p1.y, e.p2.y, e.offset.y];
     return { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
   }
-  if (e.type === 'polyline') {
+  if (e.type === 'polyline' || e.type === 'spline') {
     if (!e.pts.length) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const p of e.pts) {
@@ -2428,6 +2900,14 @@ function entityAABB(e: Entity): Rect | null {
       if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
     }
     return { minX, minY, maxX, maxY };
+  }
+  if (e.type === 'ellipse') {
+    // Tight AABB of a rotated ellipse: half-extents are
+    //   hx = sqrt((rx·cos)² + (ry·sin)²),  hy = sqrt((rx·sin)² + (ry·cos)²).
+    const c = Math.cos(e.rot), s = Math.sin(e.rot);
+    const hx = Math.sqrt((e.rx * c) ** 2 + (e.ry * s) ** 2);
+    const hy = Math.sqrt((e.rx * s) ** 2 + (e.ry * c) ** 2);
+    return { minX: e.cx - hx, minY: e.cy - hy, maxX: e.cx + hx, maxY: e.cy + hy };
   }
   return null;
 }

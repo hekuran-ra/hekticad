@@ -239,6 +239,7 @@ export type ToolCtx = {
   dir?: Pt;
   base?: Pt;
   entity?: Entity;
+  entities?: Entity[];
   entity1?: Entity;
   entity2?: Entity;
   click1?: Pt;

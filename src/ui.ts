@@ -12,6 +12,8 @@ import {
 } from './features';
 import { pushUndo } from './undo';
 import { bindSetPrompt, rebuildCmdBar } from './cmdbar';
+import { getDraftInfo } from './draftinfo';
+import { syncToolAvailability } from './tools';
 
 let toastTimer: number | null = null;
 
@@ -73,6 +75,9 @@ export function updateSelStatus(): void {
   // Layer rows show a "move selection here" button whose visibility depends
   // on the current selection, so re-render whenever selection changes.
   renderLayers();
+  // Selection-gated tools (move, offset, mirror, …) greyed-out when nothing
+  // is selected — re-sync the rail whenever the selection count changes.
+  syncToolAvailability();
 }
 
 // ----------------- Dimension style picker -----------------
@@ -130,29 +135,28 @@ if (dimPicker) {
   });
 }
 
-export function updatePosStatus(x: number, y: number): void {
-  // Base readout: absolute world coordinates.
-  let html = `X: <b>${x.toFixed(2)}</b>  Y: <b>${y.toFixed(2)}</b>`;
+/**
+ * Status labels the draft-info strings may contain. Each token is shown in
+ * dim, values/numbers shown bold. Keeping this centralized so the regex below
+ * renders every tool's readout (B, H, R, ∠, L, a, b, Δ, Faktor, Ref-L,
+ * Versatz, Abstand) with consistent typography.
+ */
+const DRAFT_LABEL_RE = /(Faktor|Ref-L|Versatz|Abstand|[∠BHRLabΔ])/g;
 
-  // During drafting, append live Δ distance + angle from the current anchor.
-  // This mirrors the AutoCAD/Artios habit of showing dynamic input next to
-  // the cursor, so the user can eyeball length/angle before committing.
-  const tc = runtime.toolCtx;
-  if (tc) {
-    let anchor: { x: number; y: number } | null = null;
-    if (tc.p1) anchor = tc.p1;
-    else if (tc.pts && tc.pts.length > 0) anchor = tc.pts[tc.pts.length - 1];
-    else if (tc.cx != null && tc.cy != null) anchor = { x: tc.cx, y: tc.cy };
-    else if (tc.basePt) anchor = tc.basePt;
-    if (anchor) {
-      const dx = x - anchor.x;
-      const dy = y - anchor.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      // CAD convention: 0° = +X, angles CCW. Canvas y grows downward, so invert.
-      let ang = Math.atan2(-dy, dx) * 180 / Math.PI;
-      if (ang < 0) ang += 360;
-      html += `  <span class="st-dim">Δ</span> <b>${dist.toFixed(2)}</b> <span class="st-dim">∠</span> <b>${ang.toFixed(1)}°</b>`;
-    }
+export function updatePosStatus(x: number, y: number): void {
+  // During drafting (an active tool anchor) show the tool-specific readout
+  // from `getDraftInfo()` — same source as the crosshair label. The bottom
+  // bar mirrors the cmdbar input fields so the info always matches what the
+  // user is about to type (B/H for rect, R for circle, ∠+L for line, etc.).
+  // No tool anchor → classic absolute X/Y.
+  const info = getDraftInfo();
+  let html: string;
+  if (info) {
+    // Wrap known labels in dim spans, numbers stay inline. Comma in "Δ dx, dy"
+    // stays readable as plain text.
+    html = info.replace(DRAFT_LABEL_RE, '<span class="st-dim">$1</span>');
+  } else {
+    html = `X: <b>${x.toFixed(2)}</b>  Y: <b>${y.toFixed(2)}</b>`;
   }
   dom.stPos.innerHTML = html;
 }

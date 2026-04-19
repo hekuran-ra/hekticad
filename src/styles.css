@@ -253,6 +253,20 @@ header {
   --col-accent: var(--accent);
 }
 
+/* Selection-gated tools (move, copy, rotate, mirror, scale, stretch, offset,
+ * delete) greyed-out until something is selected. Click still fires so we can
+ * surface a "select something first" toast rather than silently ignoring.
+ */
+.tool-btn.disabled {
+  opacity: 0.32;
+  cursor: not-allowed;
+  filter: grayscale(0.4);
+}
+.tool-btn.disabled:hover {
+  background: transparent;
+  color: inherit;
+}
+
 /* Drag-reorder */
 .tool-btn { cursor: grab; }
 .tool-btn:active { cursor: grabbing; }

@@ -5,6 +5,7 @@ import type {
 import { state, runtime } from './state';
 import { css, screenToWorld, worldToScreen } from './math';
 import { dom, ctx } from './dom';
+import { getDraftInfo } from './draftinfo';
 
 const { cv } = dom;
 
@@ -43,11 +44,18 @@ export function render(): void {
   ctx.fillStyle = css('--bg');
   ctx.fillRect(0, 0, w, h);
   drawGrid(w, h);
-  for (const e of state.entities) drawEntity(e, false);
+  // Two O(N) passes: unselected first, then selected on top. This replaces an
+  // older O(N·M) variant that called `state.entities.find()` for every selected
+  // id, which quadratically blew up with multi-selection on big drawings.
+  const sel = state.selection;
+  for (const e of state.entities) {
+    if (!sel.has(e.id)) drawEntity(e, false);
+  }
   if (runtime.toolCtx?.preview) drawPreview(runtime.toolCtx.preview);
-  for (const id of state.selection) {
-    const e = state.entities.find(x => x.id === id);
-    if (e) drawEntity(e, true);
+  if (sel.size) {
+    for (const e of state.entities) {
+      if (sel.has(e.id)) drawEntity(e, true);
+    }
   }
   drawCrosshair(w, h);
   if (runtime.lastSnap) drawSnapMarker(runtime.lastSnap);
@@ -110,17 +118,26 @@ function drawCrosshair(w: number, h: number): void {
   ctx.lineTo(sp.x + 0.5, h);
   ctx.stroke();
 
-  // Coordinate label — only when actually placing a point. Keeps the view
-  // uncluttered; the bottom-left readout already shows live X/Y.
+  // Label next to the crosshair. During drafting, show the tool-specific
+  // readout (B/H for rect, R for circle, ∠+L for line/polyline, etc.) so the
+  // label always mirrors the cmdbar input fields. Idle / no tool-specific
+  // info — fall back to world X/Y.
   const world = runtime.lastSnap ?? state.mouseWorld;
-  const label = `${world.x.toFixed(2)},  ${world.y.toFixed(2)}`;
+  const info = getDraftInfo();
+  const label = info ?? `${world.x.toFixed(2)},  ${world.y.toFixed(2)}`;
   ctx.globalAlpha = 0.6;
   ctx.font = '10px "Space Mono", monospace';
   ctx.fillStyle = color;
   const PAD = 10;
   const measuredW = ctx.measureText(label).width;
   const lx = sp.x + PAD + measuredW < w ? sp.x + PAD : sp.x - PAD - measuredW;
-  const ly = sp.y - PAD > 14 ? sp.y - PAD : sp.y + PAD + 10;
+  // When a snap is active the snap-type tag (END, MITTE, ACHS, …) sits at
+  // (+12, -10) from the crosshair. Pushing the draft-info label BELOW the
+  // crosshair keeps both readable instead of rendering them on top of each
+  // other. Idle, keep the classic upper-right placement.
+  const ly = runtime.lastSnap
+    ? sp.y + PAD + 10
+    : sp.y - PAD > 14 ? sp.y - PAD : sp.y + PAD + 10;
   ctx.fillText(label, lx, ly);
 
   ctx.restore();

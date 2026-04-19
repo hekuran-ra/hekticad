@@ -8,6 +8,7 @@
 // ════════════════════════════════════════════════════════════════
 
 import { requestRender } from './render';
+import { invalidateCssCache } from './math';
 
 export type ThemeVar =
   | '--bg' | '--bg-deep' | '--panel' | '--panel-2' | '--panel-3'
@@ -140,6 +141,7 @@ function applyTheme(): void {
   root.classList.toggle('theme-light', state.preset === 'light');
   root.classList.toggle('theme-contrast', state.preset === 'contrast');
   root.classList.toggle('theme-dark', state.preset === 'dark');
+  invalidateCssCache();
   requestRender();
 }
 

@@ -24,8 +24,26 @@ export function screenToWorld(p: Pt): Pt {
   return { x: (p.x - v.x) / v.scale, y: -(p.y - v.y) / v.scale };
 }
 
+/**
+ * Cached CSS custom-property lookups. `getComputedStyle` is not cheap — it can
+ * force a style recalc — and `render()` reads ~10 of these per frame plus
+ * another 2 per selected/hovered entity. We cache the resolved value per name
+ * and invalidate whenever the theme changes (see `invalidateCssCache`, called
+ * from themes.ts `applyTheme`).
+ */
+const _cssCache = new Map<string, string>();
+
 export function css(name: string): string {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const hit = _cssCache.get(name);
+  if (hit !== undefined) return hit;
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  _cssCache.set(name, v);
+  return v;
+}
+
+/** Drop all cached CSS values — call whenever theme variables change. */
+export function invalidateCssCache(): void {
+  _cssCache.clear();
 }
 
 /**

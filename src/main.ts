@@ -8,7 +8,7 @@ import { hitTest } from './hittest';
 import { render, requestRender, resize } from './render';
 import {
   cancelTool, deleteSelection, handleClick,
-  renderToolsPanel, selectByBox, setTool, TOOLS, updatePreview,
+  renderToolsPanel, selectByBox, setTool, TOOLS, toolRequiresSelection, updatePreview,
 } from './tools';
 import { clearAll, exportSvg, loadJson, saveJson } from './io';
 import { zoomFit } from './view';
@@ -232,6 +232,14 @@ window.addEventListener('keydown', (e) => {
   }
   const shortcut = TOOLS.find(t => t.key.toLowerCase() === e.key.toLowerCase() && !t.action);
   if (shortcut) {
+    // Same gating as the rail click handler: selection-required tools refuse
+    // to activate when nothing is selected. Keyboard shortcuts must enforce
+    // the same rule as clicks, otherwise the hotkey bypasses the greyed-out
+    // affordance.
+    if (toolRequiresSelection(String(shortcut.id)) && state.selection.size === 0) {
+      toast('Erst Objekte wählen');
+      return;
+    }
     setTool(shortcut.id as Exclude<typeof shortcut.id, 'delete'>);
     return;
   }
