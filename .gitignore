@@ -7,6 +7,7 @@ dist/
 .env.local
 .vscode/
 .idea/
+.claude/
 
 # Tauri — Rust build artifacts and generated platform schemas/icons.
 # Keep src-tauri/Cargo.lock tracked (deterministic binary builds need it).
