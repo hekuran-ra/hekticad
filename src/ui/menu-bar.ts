@@ -26,7 +26,8 @@ import { showExportDialog } from './export-dialog';
 import { showCompanySettings } from './company-settings';
 import { showDimStyleDialog } from './dim-style-dialog';
 import { showAboutDialog, showShortcutsDialog } from './help-dialogs';
-import { openThemePopover, closeThemePopover } from '../themes';
+import { resetUserDefaultsFlow, saveCurrentAsDefaultFlow } from './user-defaults-dialogs';
+import { closeThemePopover, showThemeDialog } from '../themes';
 import { cancelTool, getPanelsLocked, resetToolOrder, setPanelsLocked, setTool, TOOLS, toolRequiresSelection } from '../tools';
 import { undo, redo } from '../undo';
 import { toast, updateSelStatus } from '../ui';
@@ -174,12 +175,7 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
     // menu-bar data-menu attribute and MenuId enum don't have to change.
     label: 'Einstellungen',
     entries: [
-      { id: 'settings:theme', label: 'Design…', action: () => {
-        // Open the theme popover anchored under the Einstellungen menu
-        // item. Moved here from Ansicht — conceptually a settings thing.
-        const anchor = document.querySelector<HTMLElement>('.menu-item[data-menu="format"]');
-        openThemePopover(anchor);
-      } },
+      { id: 'settings:theme', label: 'Design…', action: () => { void showThemeDialog(); } },
       'separator',
       { id: 'settings:company',   label: 'Firmeneinstellungen…', action: () => { void showCompanySettings(); } },
       { id: 'settings:dim-style', label: 'Bemaßungsstil…',       action: () => { void showDimStyleDialog(); } },
@@ -191,6 +187,15 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
         action: () => setPanelsLocked(!getPanelsLocked()),
         checked: () => getPanelsLocked() },
       { id: 'settings:reset-tools', label: 'Toolgruppen zurücksetzen', action: () => resetToolOrder() },
+      'separator',
+      // Capture the current layout + layers + snap + (optionally) drawing as
+      // the user's personal default. Applied at next startup via
+      // applyUserDefaultsAtStartup(). Separate from the factory baseline so
+      // "zurücksetzen" falls back cleanly.
+      { id: 'settings:save-default',  label: 'Aktuellen Zustand als Standard speichern…',
+        action: () => { void saveCurrentAsDefaultFlow(); } },
+      { id: 'settings:reset-default', label: 'Eigenen Standard zurücksetzen',
+        action: () => { void resetUserDefaultsFlow(); } },
     ],
   },
   hilfe: {

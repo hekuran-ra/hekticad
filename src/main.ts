@@ -27,6 +27,8 @@ import {
   replaceFeatureFromInit,
 } from './features';
 import { createParameter, findParamByName, parseExprInput } from './params';
+import { ensureParametricModeOn } from './parametric-mode';
+import { applyUserDefaultsAtStartup } from './user-defaults';
 import { pushUndo, redo, undo } from './undo';
 import {
   renderLayers, renderParameters, toast, updatePosStatus, updateSelStatus,
@@ -947,6 +949,10 @@ btnAddParam.onclick = async () => {
     placeholder: 'z.B. Länge',
   }) ?? '';
   createParameter(trimmed, val, meaning.trim() || undefined);
+  // Creating a variable implies the user wants parametric behaviour — if they
+  // hadn't already enabled it, turn it on now (with a toast so the mode
+  // change is visible).
+  ensureParametricModeOn();
   updateStats();
 };
 
@@ -972,6 +978,11 @@ window.addEventListener('keydown', (ev) => {
 }, true);
 
 // ----------------- Boot -----------------
+
+// If the user previously blessed a layout/layers/drawing as their personal
+// default, apply it now — BEFORE any render so the first paint reflects it.
+// No-op when no snapshot exists; the baked factory defaults apply as before.
+applyUserDefaultsAtStartup();
 
 ensureAxisFeatures();
 evaluateTimeline();

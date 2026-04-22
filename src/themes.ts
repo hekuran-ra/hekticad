@@ -9,6 +9,7 @@
 
 import { requestRender } from './render';
 import { invalidateCssCache } from './math';
+import { openModal } from './modal';
 
 export type ThemeVar =
   | '--bg' | '--bg-deep' | '--panel' | '--panel-2' | '--panel-3'
@@ -158,16 +159,22 @@ function normalizeHex(value: string): string {
   return /^#[0-9a-f]{6}$/i.test(v) ? v : '#000000';
 }
 
-function buildPopoverBody(pop: HTMLElement): void {
-  pop.innerHTML = '';
-
-  const presetsRow = document.createElement('div');
-  presetsRow.className = 'theme-presets';
+/**
+ * Populate `host` with the theme controls (preset tiles + custom colors +
+ * reset-all). `rebuild` is called when a preset change or reset-all needs the
+ * whole thing re-rendered from scratch (so the "on" highlight and swatch
+ * values reflect the new state). Shared between the legacy popover and the
+ * modern modal.
+ */
+function populateThemeControls(host: HTMLElement, rebuild: () => void): void {
   const presetsLabel = document.createElement('div');
   presetsLabel.className = 'theme-section-label';
   presetsLabel.textContent = 'Preset';
-  pop.appendChild(presetsLabel);
-  pop.appendChild(presetsRow);
+  host.appendChild(presetsLabel);
+
+  const presetsRow = document.createElement('div');
+  presetsRow.className = 'theme-presets';
+  host.appendChild(presetsRow);
 
   (Object.keys(PRESETS) as ThemePresetId[]).forEach(id => {
     const p = PRESETS[id];
@@ -188,7 +195,7 @@ function buildPopoverBody(pop: HTMLElement): void {
       state.preset = id;
       persist(state);
       applyTheme();
-      buildPopoverBody(pop);
+      rebuild();
     };
     presetsRow.appendChild(btn);
   });
@@ -196,7 +203,7 @@ function buildPopoverBody(pop: HTMLElement): void {
   const colorsLabel = document.createElement('div');
   colorsLabel.className = 'theme-section-label';
   colorsLabel.textContent = 'Eigene Farben';
-  pop.appendChild(colorsLabel);
+  host.appendChild(colorsLabel);
 
   const grid = document.createElement('div');
   grid.className = 'theme-color-grid';
@@ -232,7 +239,7 @@ function buildPopoverBody(pop: HTMLElement): void {
     row.appendChild(reset);
     grid.appendChild(row);
   });
-  pop.appendChild(grid);
+  host.appendChild(grid);
 
   const actions = document.createElement('div');
   actions.className = 'theme-actions';
@@ -243,10 +250,61 @@ function buildPopoverBody(pop: HTMLElement): void {
     state.overrides = {};
     persist(state);
     applyTheme();
-    buildPopoverBody(pop);
+    rebuild();
   };
   actions.appendChild(resetAll);
-  pop.appendChild(actions);
+  host.appendChild(actions);
+}
+
+function buildPopoverBody(pop: HTMLElement): void {
+  pop.innerHTML = '';
+  populateThemeControls(pop, () => buildPopoverBody(pop));
+}
+
+/**
+ * Open the theme picker as a modal dialog (matches the Tastenkürzel-Übersicht
+ * style). Preferred over `openThemePopover` — it has proper layout, a focus
+ * trap via the modal backdrop, and doesn't need an anchor element.
+ */
+export async function showThemeDialog(): Promise<void> {
+  await openModal((close) => {
+    const panel = document.createElement('div');
+    panel.classList.add('hk-modal-help');
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-labelledby', 'hk-theme-title');
+
+    const head = document.createElement('div');
+    head.className = 'hk-modal-head';
+    const title = document.createElement('div');
+    title.className = 'hk-modal-title';
+    title.id = 'hk-theme-title';
+    title.textContent = 'Design';
+    head.appendChild(title);
+    panel.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'hk-modal-body';
+
+    const rebuild = (): void => {
+      body.innerHTML = '';
+      populateThemeControls(body, rebuild);
+    };
+    rebuild();
+    panel.appendChild(body);
+
+    const actions = document.createElement('div');
+    actions.className = 'hk-modal-actions';
+    const ok = document.createElement('button');
+    ok.type = 'button';
+    ok.className = 'hk-modal-btn hk-modal-btn-primary';
+    ok.textContent = 'Schließen';
+    ok.addEventListener('click', () => close('ok'));
+    actions.appendChild(ok);
+    panel.appendChild(actions);
+
+    queueMicrotask(() => ok.focus());
+    return panel;
+  });
 }
 
 /** The DOM element the popover should anchor to when opened from a menu/button.

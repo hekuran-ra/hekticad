@@ -775,14 +775,38 @@ export function renderLayers(): void {
     sw.className = 'swatch';
     sw.style.background = L.color;
     if (!L.locked) {
-      sw.onclick = (ev) => {
-        ev.stopPropagation();
-        const inp = document.createElement('input');
-        inp.type = 'color';
-        inp.value = rgbToHex(L.color);
-        inp.oninput = () => { L.color = inp.value; renderLayers(); render(); };
-        inp.click();
-      };
+      // WKWebView (Tauri on macOS) ignores `input.click()` on a
+      // hidden/detached <input type="color"> — it doesn't count the call as
+      // a user gesture, so the native colour panel never opens. The robust
+      // pattern is to let the user's real click land on the input directly:
+      // stretch a transparent colour input over the whole swatch. The
+      // visible swatch background still shows the current colour; the input
+      // sits on top, transparent, and receives the click itself.
+      sw.style.position = 'relative';
+      const inp = document.createElement('input');
+      inp.type = 'color';
+      inp.value = rgbToHex(L.color);
+      inp.style.cssText = [
+        'position:absolute',
+        'inset:0',
+        'width:100%',
+        'height:100%',
+        'opacity:0',
+        'cursor:pointer',
+        'border:none',
+        'padding:0',
+        'background:transparent',
+      ].join(';');
+      // Don't bubble to row.onclick (which would activate the layer).
+      inp.addEventListener('click', (ev) => ev.stopPropagation());
+      // `input` fires continuously while the user drags the picker — update
+      // the canvas + swatch background live, but DO NOT rebuild the layers
+      // panel (that would remove this <input> and tear the picker down
+      // mid-drag — same trap as the hatch-colour input, see note below).
+      // `change` fires once on commit/dismiss; rebuild the panel there.
+      inp.oninput = () => { L.color = inp.value; sw.style.background = L.color; render(); };
+      inp.onchange = () => { L.color = inp.value; renderLayers(); render(); };
+      sw.appendChild(inp);
     }
 
     // Layer name — double-click to rename
@@ -820,8 +844,11 @@ export function renderLayers(): void {
     lk.innerHTML = svgIcon(L.locked ? LOCK_CLOSED : LOCK_OPEN);
     lk.onclick = (ev) => {
       ev.stopPropagation();
-      // Don't allow unlocking built-in axis layer (index 0).
-      if (L.locked && i === 0) return;
+      // Toggle must be symmetric: if the user can lock a layer, they must
+      // be able to unlock it too. An earlier guard blocked unlocking the
+      // axis layer (index 0) but still allowed locking it, trapping the
+      // user. If the axis layer ever becomes special-cased again, block
+      // BOTH directions — never one-way.
       L.locked = !L.locked;
       renderLayers();
     };

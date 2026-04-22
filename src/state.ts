@@ -187,7 +187,11 @@ export function loadParametricMode(): boolean {
     if (raw === '1') return true;
     if (raw === '0') return false;
   } catch { /* ignore */ }
-  return true;
+  // Fresh install: parametric mode OFF. Most first-time sketches are ad-hoc —
+  // the moment the user creates or references a variable we auto-enable it
+  // (see `ensureParametricModeOn` in ./parametric-mode.ts), so they don't
+  // need to know the mode exists until they actually want it.
+  return false;
 }
 
 /** Persist the parametric-mode flag. */

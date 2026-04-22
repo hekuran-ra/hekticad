@@ -23,6 +23,7 @@ import {
   setPolygonSides, cancelTool,
 } from './tools';
 import { createParameter, evalExpr, findParamByName, parseExprInput } from './params';
+import { ensureParametricModeOn } from './parametric-mode';
 import { evaluateTimeline, newFeatureId } from './features';
 import { pushUndo } from './undo';
 import { requestRender as render } from './render';
@@ -492,7 +493,13 @@ async function parseValueInput(raw: string, meaningHint?: string): Promise<CmdVa
       placeholder: hint ?? 'z.B. Länge',
     }) ?? '';
     const existing = findParamByName(r.name);
-    if (!existing) createParameter(r.name, val, meaning.trim() || undefined);
+    if (!existing) {
+      createParameter(r.name, val, meaning.trim() || undefined);
+      // Typing an unknown identifier in a measurement prompt is an implicit
+      // opt-in to parametric mode — switch it on so the dimension actually
+      // binds to the variable (instead of baking in the current numeric value).
+      ensureParametricModeOn();
+    }
     // loop: re-parse the original input now that this name is defined.
   }
   toast('Zu viele unbekannte Namen');

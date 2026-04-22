@@ -466,7 +466,7 @@ type Panel = {
   y: number;
 };
 
-type ToolLayout = {
+export type ToolLayout = {
   panels: Panel[];
 };
 
@@ -737,6 +737,25 @@ let layoutCache: ToolLayout | null = null;
 function currentLayout(): ToolLayout {
   if (!layoutCache) layoutCache = loadLayout();
   return layoutCache;
+}
+
+/**
+ * Expose the current in-memory layout to the user-defaults snapshot system.
+ * Returned reference is deep-clone-safe via JSON (Panels are plain data).
+ */
+export function snapshotLayout(): ToolLayout {
+  return JSON.parse(JSON.stringify(currentLayout())) as ToolLayout;
+}
+
+/**
+ * Overwrite the layout (used by the user-defaults restore path at startup).
+ * Persists to the v5 key so subsequent reloads see the same state, and
+ * invalidates the in-memory cache so the next `currentLayout()` call rereads.
+ */
+export function applyLayoutSnapshot(layout: ToolLayout): void {
+  const normalized = normalizeLayoutV5({ panels: layout.panels as unknown[] });
+  saveLayout(normalized);
+  layoutCache = normalized;
 }
 function mutateLayout(fn: (l: ToolLayout) => void): void {
   const l = currentLayout();

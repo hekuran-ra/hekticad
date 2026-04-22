@@ -160,6 +160,15 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
                 .build(app)?,
         )
         .item(&MenuItemBuilder::with_id("settings:reset-tools", "Toolgruppen zurücksetzen").build(app)?)
+        .separator()
+        .item(
+            &MenuItemBuilder::with_id("settings:save-default", "Aktuellen Zustand als Standard speichern…")
+                .build(app)?,
+        )
+        .item(
+            &MenuItemBuilder::with_id("settings:reset-default", "Eigenen Standard zurücksetzen")
+                .build(app)?,
+        )
         .build()?;
 
     // ── Hilfe
