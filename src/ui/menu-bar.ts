@@ -38,6 +38,14 @@ type MenuAction = () => void | Promise<void>;
 type MenuEntry =
   | 'separator'
   | {
+      /**
+       * Stable command id of the form "{menu}:{verb}" — e.g. `datei:neu`,
+       * `bearbeiten:undo`. The native macOS menu bar built in Rust emits
+       * this id when the item is picked, and the frontend dispatches back
+       * to `action()` via `runMenuCommand(id)`. Must match the id used in
+       * `src-tauri/src/lib.rs`.
+       */
+      id: string;
       label: string;
       shortcut?: string;
       action: MenuAction;
@@ -116,49 +124,49 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
   datei: {
     label: 'Datei',
     entries: [
-      { label: 'Neu',          shortcut: '',             action: () => { void clearAll(); } },
-      { label: 'Öffnen…',      shortcut: '',             action: () => { void loadJson(); } },
-      { label: 'Speichern',    shortcut: 'Strg+S',       action: () => saveJson() },
+      { id: 'file:new',      label: 'Neu',          shortcut: '',             action: () => { void clearAll(); } },
+      { id: 'file:open',     label: 'Öffnen…',      shortcut: '',             action: () => { void loadJson(); } },
+      { id: 'file:save',     label: 'Speichern',    shortcut: 'Strg+S',       action: () => saveJson() },
       'separator',
-      { label: 'Importieren…', shortcut: 'Strg+Shift+I', action: () => showImportDialogStub() },
-      { label: 'Exportieren…', shortcut: 'Strg+Shift+E', action: () => { void showExportDialog(); } },
+      { id: 'file:import',   label: 'Importieren…', shortcut: 'Strg+Shift+I', action: () => showImportDialogStub() },
+      { id: 'file:export',   label: 'Exportieren…', shortcut: 'Strg+Shift+E', action: () => { void showExportDialog(); } },
       'separator',
-      { label: 'Alles löschen', action: () => { void clearAll(); } },
+      { id: 'file:clear',    label: 'Alles löschen',                          action: () => { void clearAll(); } },
     ],
   },
   bearbeiten: {
     label: 'Bearbeiten',
     entries: [
-      { label: 'Rückgängig',       shortcut: 'Strg+Z',       action: () => undo() },
-      { label: 'Wiederherstellen', shortcut: 'Strg+Y',       action: () => redo() },
+      { id: 'edit:undo',       label: 'Rückgängig',       shortcut: 'Strg+Z',       action: () => undo() },
+      { id: 'edit:redo',       label: 'Wiederherstellen', shortcut: 'Strg+Y',       action: () => redo() },
       'separator',
-      { label: 'Alles auswählen',  shortcut: 'Strg+A',       action: () => selectAllUnlocked() },
-      { label: 'Auswahl aufheben', shortcut: 'Esc',          action: () => deselectAll() },
+      { id: 'edit:select-all', label: 'Alles auswählen',  shortcut: 'Strg+A',       action: () => selectAllUnlocked() },
+      { id: 'edit:deselect',   label: 'Auswahl aufheben', shortcut: 'Esc',          action: () => deselectAll() },
     ],
   },
   ansicht: {
     label: 'Ansicht',
     entries: [
-      { label: 'Alles zoomen',    shortcut: 'Home', action: () => zoomFit() },
-      { label: 'Vergrößern',      shortcut: '',     action: () => zoomBy(1.25) },
-      { label: 'Verkleinern',     shortcut: '',     action: () => zoomBy(1 / 1.25) },
+      { id: 'view:zoom-fit', label: 'Alles zoomen',    shortcut: 'Home', action: () => zoomFit() },
+      { id: 'view:zoom-in',  label: 'Vergrößern',      shortcut: '',     action: () => zoomBy(1.25) },
+      { id: 'view:zoom-out', label: 'Verkleinern',     shortcut: '',     action: () => zoomBy(1 / 1.25) },
       'separator',
-      { label: 'Raster anzeigen',  shortcut: 'F7', action: () => toggleGrid(),
+      { id: 'view:toggle-grid', label: 'Raster anzeigen',  shortcut: 'F7', action: () => toggleGrid(),
         checked: () => runtime.snapSettings.showGrid },
-      { label: 'Am Raster fangen', shortcut: 'F9', action: () => toggleGridSnap(),
+      { id: 'view:toggle-snap', label: 'Am Raster fangen', shortcut: 'F9', action: () => toggleGridSnap(),
         checked: () => runtime.snapSettings.grid },
     ],
   },
   einfuegen: {
     label: 'Einfügen',
     entries: [
-      { label: 'Linie',      shortcut: 'L', action: () => activateTool('line') },
-      { label: 'Polylinie',  shortcut: 'Y', action: () => activateTool('polyline') },
-      { label: 'Rechteck',   shortcut: 'R', action: () => activateTool('rect') },
-      { label: 'Kreis',      shortcut: 'C', action: () => activateTool('circle') },
-      { label: 'Text',       shortcut: 'T', action: () => activateTool('text') },
-      { label: 'Bemaßung',   shortcut: 'D', action: () => activateTool('dim') },
-      { label: 'Hilfslinie', shortcut: 'H', action: () => activateTool('xline') },
+      { id: 'insert:line',     label: 'Linie',      shortcut: 'L', action: () => activateTool('line') },
+      { id: 'insert:polyline', label: 'Polylinie',  shortcut: 'Y', action: () => activateTool('polyline') },
+      { id: 'insert:rect',     label: 'Rechteck',   shortcut: 'R', action: () => activateTool('rect') },
+      { id: 'insert:circle',   label: 'Kreis',      shortcut: 'C', action: () => activateTool('circle') },
+      { id: 'insert:text',     label: 'Text',       shortcut: 'T', action: () => activateTool('text') },
+      { id: 'insert:dim',      label: 'Bemaßung',   shortcut: 'D', action: () => activateTool('dim') },
+      { id: 'insert:xline',    label: 'Hilfslinie', shortcut: 'H', action: () => activateTool('xline') },
     ],
   },
   format: {
@@ -166,33 +174,61 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
     // menu-bar data-menu attribute and MenuId enum don't have to change.
     label: 'Einstellungen',
     entries: [
-      { label: 'Design…', action: () => {
+      { id: 'settings:theme', label: 'Design…', action: () => {
         // Open the theme popover anchored under the Einstellungen menu
         // item. Moved here from Ansicht — conceptually a settings thing.
         const anchor = document.querySelector<HTMLElement>('.menu-item[data-menu="format"]');
         openThemePopover(anchor);
       } },
       'separator',
-      { label: 'Firmeneinstellungen…', action: () => { void showCompanySettings(); } },
-      { label: 'Bemaßungsstil…',       action: () => { void showDimStyleDialog(); } },
+      { id: 'settings:company',   label: 'Firmeneinstellungen…', action: () => { void showCompanySettings(); } },
+      { id: 'settings:dim-style', label: 'Bemaßungsstil…',       action: () => { void showDimStyleDialog(); } },
       'separator',
       // Toggle entry — ✓ prefix when locked. Locking prevents palette headers
       // from being dragged and tool buttons from being reordered; click-to-
       // activate and right-click menus still work.
-      { label: 'Toolgruppen sperren',
+      { id: 'settings:lock-panels', label: 'Toolgruppen sperren',
         action: () => setPanelsLocked(!getPanelsLocked()),
         checked: () => getPanelsLocked() },
-      { label: 'Toolgruppen zurücksetzen', action: () => resetToolOrder() },
+      { id: 'settings:reset-tools', label: 'Toolgruppen zurücksetzen', action: () => resetToolOrder() },
     ],
   },
   hilfe: {
     label: 'Hilfe',
     entries: [
-      { label: 'Tastenkürzel-Übersicht', action: () => { void showShortcutsDialog(); } },
-      { label: 'Über HektikCad',         action: () => { void showAboutDialog(); } },
+      { id: 'help:shortcuts', label: 'Tastenkürzel-Übersicht', action: () => { void showShortcutsDialog(); } },
+      { id: 'help:about',     label: 'Über HektikCad',         action: () => { void showAboutDialog(); } },
     ],
   },
 };
+
+// ────────────────────────────────────────────────────────────────────────────
+// Command dispatch for the native macOS menu
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The Rust side (see `src-tauri/src/lib.rs`) builds a NSMenu mirroring the
+// `MENUS` structure above, using the same ids. When the user picks a native
+// menu item, Rust emits an `app-menu-command` event; `src/main.ts` listens
+// for it and calls `runMenuCommand(id)`, which re-enters the same action
+// function the in-app dropdown would have called. Single source of truth.
+//
+// Unknown ids are silently ignored — a stale Rust menu (e.g. during a
+// version-skew between binary and frontend) won't crash the app.
+
+export function runMenuCommand(id: string): void {
+  for (const menu of Object.values(MENUS)) {
+    for (const entry of menu.entries) {
+      if (entry === 'separator') continue;
+      if (entry.id === id) {
+        if (entry.disabled && entry.disabled()) return;
+        void entry.action();
+        return;
+      }
+    }
+  }
+  // eslint-disable-next-line no-console
+  console.warn(`[menu] unknown command id "${id}"`);
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Runtime: open/close/render the dropdown

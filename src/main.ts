@@ -37,6 +37,7 @@ import { dom } from './dom';
 import { initThemes } from './themes';
 import { isModalOpen, showPrompt } from './modal';
 import { checkForUpdatesOnStartup } from './updater';
+import { initTauriBridge } from './tauribridge';
 import {
   commitInlineTextIfOpen, isInlineTextOpen, showInlineTextEditor,
 } from './textinline';
@@ -988,8 +989,9 @@ updateSelStatus();
 setTool('select');
 resize();
 
-// Tauri desktop build: check for a newer release on GitHub and offer to
-// install it. No-op in the browser (plain Vite dev or static hosting).
+// Tauri desktop build: wire up the native-menu event bridge and kick off a
+// background update check. Both are no-ops in the plain-browser build.
+void initTauriBridge();
 void checkForUpdatesOnStartup();
 
 // ----------------- Sidebar collapsible sections -----------------

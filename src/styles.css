@@ -161,6 +161,13 @@ header {
   height: 1px; background: var(--hair); margin: 3px 6px;
 }
 
+/* When running inside the Tauri desktop shell the native macOS menu bar
+   replaces the in-app menu. Hide the HTML menu bar and the redundant
+   Save/Import/Export header buttons (they're all reachable via the
+   Datei / Bearbeiten / Ansicht / Einfügen menus in the native bar). */
+body.is-tauri-desktop .menu-bar,
+body.is-tauri-desktop .hdr-actions { display: none !important; }
+
 .spacer { flex: 1; }
 
 /* Header units pill */

@@ -1,9 +1,13 @@
+mod menu;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_updater::Builder::new().build())
     .plugin(tauri_plugin_process::init())
     .plugin(tauri_plugin_dialog::init())
+    .menu(|handle| menu::build(handle))
+    .on_menu_event(|app, event| menu::on_menu_event(app, event))
     .setup(|app| {
       // Log plugin in every build — release logs go to the OS log dir so we
       // can diagnose update failures in shipped builds. Frontend `info!`/

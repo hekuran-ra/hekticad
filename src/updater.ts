@@ -1,54 +1,74 @@
 /**
  * Auto-update bootstrap for the Tauri desktop build.
  *
- * Called once from main.ts at startup. When the page is running inside a Tauri
- * window, this checks the configured updater endpoint (see
- * `src-tauri/tauri.conf.json → plugins.updater.endpoints`) and, if a newer
- * version is published on GitHub Releases, asks the user whether to install
- * it right now. On confirmation the binary is downloaded, the installer runs,
- * and the app is relaunched — no manual re-download, no visiting the repo.
+ * Two entry points:
+ *  - `checkForUpdatesOnStartup()` — called once from main.ts at launch.
+ *     Silent on the happy path (no nag when already up-to-date).
+ *  - `checkForUpdatesManually()` — wired to the "Auf Updates prüfen…" menu
+ *     entry. Always confirms the outcome to the user: offers the update,
+ *     says "you're on the latest version", or surfaces the error.
  *
- * In plain-browser mode (vite dev server, Infomaniak-hosted build, GitHub
- * Pages, etc.) the `@tauri-apps/api/core` import resolves to a stub where
- * `isTauri()` returns false, so this becomes a no-op. That keeps the web
- * bundle shippable without the Tauri runtime.
+ * When the page is running inside a Tauri window, both check the configured
+ * updater endpoint (see `src-tauri/tauri.conf.json → plugins.updater.endpoints`)
+ * and — if a newer version is published on GitHub Releases — ask the user
+ * whether to install it right now. On confirmation the binary is downloaded,
+ * the installer runs, and the app is relaunched.
  *
- * Errors are surfaced as native dialogs so a user on a shipped build can tell
- * the difference between "no update available" and "update check failed" —
- * critical for debugging the release pipeline end-to-end.
+ * In plain-browser mode (vite dev, static hosting) the `@tauri-apps/api/core`
+ * import resolves to a stub where `isTauri()` returns false, so both functions
+ * become no-ops. That keeps the web bundle shippable without the Tauri runtime.
  */
 
-export async function checkForUpdatesOnStartup(): Promise<void> {
-  // Lazy-load so the Tauri packages are only fetched in the desktop build —
-  // Vite tree-shakes them out of the web bundle when this path isn't taken.
-  let isTauri: () => boolean;
-  try {
-    ({ isTauri } = await import('@tauri-apps/api/core'));
-  } catch {
-    return;
-  }
-  if (!isTauri()) return;
+type DlgKind = 'info' | 'warning' | 'error';
+type DlgOpts = { title?: string; kind?: DlgKind };
 
-  type DlgOpts = { title?: string; kind?: 'info' | 'warning' | 'error' };
-  let showDialog: (msg: string, opts?: DlgOpts) => Promise<void>;
-  let askDialog: (msg: string, opts?: DlgOpts) => Promise<boolean>;
+interface DialogApi {
+  showDialog: (msg: string, opts?: DlgOpts) => Promise<void>;
+  askDialog: (msg: string, opts?: DlgOpts) => Promise<boolean>;
+}
+
+async function loadDialogApi(): Promise<DialogApi> {
   try {
     const dialog = await import('@tauri-apps/plugin-dialog');
-    showDialog = async (msg, opts) => { await dialog.message(msg, opts); };
-    askDialog = (msg, opts) => dialog.ask(msg, opts);
+    return {
+      showDialog: async (msg, opts) => { await dialog.message(msg, opts); },
+      askDialog: (msg, opts) => dialog.ask(msg, opts),
+    };
   } catch {
-    // Fallback to browser dialogs if the plugin isn't available.
-    showDialog = async (msg) => { window.alert(msg); };
-    askDialog = async (msg) => window.confirm(msg);
+    return {
+      showDialog: async (msg) => { window.alert(msg); },
+      askDialog: async (msg) => window.confirm(msg),
+    };
   }
+}
+
+async function isTauriEnv(): Promise<boolean> {
+  try {
+    const { isTauri } = await import('@tauri-apps/api/core');
+    return isTauri();
+  } catch {
+    return false;
+  }
+}
+
+async function runUpdateFlow(showUpToDateMessage: boolean): Promise<void> {
+  if (!(await isTauriEnv())) return;
+  const { showDialog, askDialog } = await loadDialogApi();
 
   try {
     const { check } = await import('@tauri-apps/plugin-updater');
     const { relaunch } = await import('@tauri-apps/plugin-process');
+    const { getVersion } = await import('@tauri-apps/api/app');
 
     const update = await check();
     if (!update) {
-      // Nothing to do — silent on the happy path so we don't nag on every launch.
+      if (showUpToDateMessage) {
+        const current = await getVersion().catch(() => 'aktuelle Version');
+        await showDialog(
+          `Du verwendest bereits die neueste Version (${current}).`,
+          { title: 'HektikCad Updater', kind: 'info' },
+        );
+      }
       return;
     }
 
@@ -63,10 +83,8 @@ export async function checkForUpdatesOnStartup(): Promise<void> {
     await update.downloadAndInstall();
     await relaunch();
   } catch (err) {
-    // Surface failures so the user (and we, while debugging the pipeline) can
-    // see *why* the updater didn't offer an install — silent console.warn is
-    // invisible in a release build with no devtools.
     const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    // eslint-disable-next-line no-console
     console.warn('[updater] check failed:', err);
     try {
       await showDialog(
@@ -77,4 +95,14 @@ export async function checkForUpdatesOnStartup(): Promise<void> {
       // Dialog plugin itself could fail — don't crash startup.
     }
   }
+}
+
+/** Silent on "already latest"; only speaks up if there's an update or an error. */
+export function checkForUpdatesOnStartup(): Promise<void> {
+  return runUpdateFlow(false);
+}
+
+/** Triggered by the "Auf Updates prüfen…" menu item — always confirms outcome. */
+export function checkForUpdatesManually(): Promise<void> {
+  return runUpdateFlow(true);
 }
