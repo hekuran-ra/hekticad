@@ -7,3 +7,15 @@ dist/
 .env.local
 .vscode/
 .idea/
+
+# Tauri — Rust build artifacts and generated platform schemas/icons.
+# Keep src-tauri/Cargo.lock tracked (deterministic binary builds need it).
+src-tauri/target/
+src-tauri/gen/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+
+# Tauri updater signing key — the PRIVATE half must never be committed.
+# Store it as a GitHub Actions secret instead (TAURI_SIGNING_PRIVATE_KEY).
+*.key
+*.key.pub

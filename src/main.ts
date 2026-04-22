@@ -36,6 +36,7 @@ import { cmdBarHasFocus, cmdBarHasFields, focusCmdBar, handleBareEnter } from '.
 import { dom } from './dom';
 import { initThemes } from './themes';
 import { isModalOpen, showPrompt } from './modal';
+import { checkForUpdatesOnStartup } from './updater';
 import {
   commitInlineTextIfOpen, isInlineTextOpen, showInlineTextEditor,
 } from './textinline';
@@ -986,6 +987,10 @@ updateStats();
 updateSelStatus();
 setTool('select');
 resize();
+
+// Tauri desktop build: check for a newer release on GitHub and offer to
+// install it. No-op in the browser (plain Vite dev or static hosting).
+void checkForUpdatesOnStartup();
 
 // ----------------- Sidebar collapsible sections -----------------
 
