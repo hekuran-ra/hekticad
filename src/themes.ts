@@ -264,16 +264,21 @@ function getPopover(): HTMLElement | null {
 export function openThemePopover(anchor?: HTMLElement | null): void {
   const pop = getPopover();
   if (!pop) return;
-  popAnchor = anchor ?? null;
+  // A non-null anchor that isn't laid out (e.g. the HTML menu button when
+  // it's hidden under Tauri via `body.is-tauri-desktop`) would produce a
+  // zero-sized bounding rect and drop the popover in the top-left corner.
+  // Fall back to the anchorless placement in that case.
+  const rect = anchor?.getBoundingClientRect();
+  const hasRect = !!rect && (rect.width > 0 || rect.height > 0);
+  popAnchor = hasRect ? anchor! : null;
   buildPopoverBody(pop);
   pop.hidden = false;
-  if (anchor) {
-    const r = anchor.getBoundingClientRect();
-    pop.style.top = `${Math.round(r.bottom + 6)}px`;
-    pop.style.right = `${Math.max(8, Math.round(window.innerWidth - r.right))}px`;
+  if (hasRect && rect) {
+    pop.style.top = `${Math.round(rect.bottom + 6)}px`;
+    pop.style.right = `${Math.max(8, Math.round(window.innerWidth - rect.right))}px`;
   } else {
-    // No specific anchor — drop into the upper-right so it's at least obvious
-    // where the panel came from.
+    // No specific anchor (or anchor has no layout) — drop into the upper-right
+    // so it's at least obvious where the panel came from.
     pop.style.top = `48px`;
     pop.style.right = `12px`;
   }
