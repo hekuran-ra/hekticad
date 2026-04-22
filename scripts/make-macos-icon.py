@@ -1,48 +1,69 @@
 #!/usr/bin/env python3
 """
-Render the HektikCad app icon from scratch.
+Render the HektikCad app icon from the VisualsbyHekuran brand SVG.
 
-Draws a macOS-style squircle background with an outline-only rendition
-of the HektikCad brackets-and-joint mark centered on it. Nothing is
-filled except the background — the mark itself is stroked so it reads
-as a linework icon, which fits the CAD subject matter and avoids the
-"too-heavy" feel of the old filled variant.
+Pipeline:
+  1. Rasterise `src-tauri/icons/mark.svg` to a transparent PNG at the
+     target content resolution via `rsvg-convert` (librsvg).
+  2. Draw a macOS-style squircle background at full canvas resolution.
+  3. Composite the rasterised mark centered on the squircle.
+  4. Write the result to `src-tauri/icons/source-1024.png`.
 
-Knobs (tweak and re-run):
-  CANVAS         — output resolution. 1024 is the macOS standard.
-  BG_COLOR       — squircle fill.
-  STROKE_COLOR   — color of the drawn mark.
-  CONTENT_SCALE  — fraction of the canvas the mark occupies (per axis).
-  STROKE_WIDTH   — line weight of the mark, in canvas pixels.
-  BG_RADIUS_PCT  — corner radius of the background, as a fraction of
-                   CANVAS. macOS Big Sur+ uses roughly 22% for its
-                   built-in squircle.
-
-After running this, regenerate the platform icon set:
+Then:
     npx tauri icon src-tauri/icons/source-1024.png
+regenerates the full platform icon set (icon.icns, icon.ico, PNGs).
+
+Requires `rsvg-convert` (Homebrew: `brew install librsvg`).
 """
 from pathlib import Path
+import subprocess
+import sys
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
+SVG = ROOT / "src-tauri" / "icons" / "mark.svg"
 OUT = ROOT / "src-tauri" / "icons" / "source-1024.png"
+TMP_MARK = ROOT / "src-tauri" / "icons" / ".mark-raster.png"
 
 # -----------------------------------------------------------------------
 # Style
 # -----------------------------------------------------------------------
 CANVAS = 1024
-BG_COLOR = (15, 17, 23, 255)      # near-black, matches app chrome
-STROKE_COLOR = (230, 232, 236, 255)  # off-white
-BG_RADIUS_PCT = 0.225             # macOS-ish squircle corner radius
-CONTENT_SCALE = 0.62              # mark fills 62% of the canvas
-STROKE_WIDTH = 24                 # line weight
+BG_COLOR = (15, 17, 23, 255)   # near-black squircle — matches SVG's intended backdrop
+BG_RADIUS_PCT = 0.225          # macOS Big Sur+ squircle radius
+CONTENT_SCALE = 0.66           # mark fills this fraction of the canvas (per axis)
+
+
+def rasterise_svg(svg_path: Path, size: int, dest: Path) -> None:
+    """Invoke rsvg-convert to produce a transparent PNG of `svg_path` at `size` px square."""
+    cmd = [
+        "rsvg-convert",
+        "--width", str(size),
+        "--height", str(size),
+        "--keep-aspect-ratio",
+        "--output", str(dest),
+        str(svg_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except FileNotFoundError:
+        sys.exit("rsvg-convert not found — install with `brew install librsvg`.")
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"rsvg-convert failed:\n{exc.stderr.decode()}")
 
 
 def main() -> None:
+    if not SVG.exists():
+        sys.exit(f"source SVG missing: {SVG}")
+
+    # Content canvas: fraction of the final canvas the mark should occupy.
+    content_size = int(CANVAS * CONTENT_SCALE)
+    rasterise_svg(SVG, content_size, TMP_MARK)
+    mark = Image.open(TMP_MARK).convert("RGBA")
+
+    # Base canvas with the dark squircle.
     img = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-
-    # -- Background squircle -------------------------------------------------
     radius = int(CANVAS * BG_RADIUS_PCT)
     draw.rounded_rectangle(
         (0, 0, CANVAS - 1, CANVAS - 1),
@@ -50,53 +71,19 @@ def main() -> None:
         fill=BG_COLOR,
     )
 
-    # -- Mark geometry -------------------------------------------------------
-    # Two vertical rounded rectangles flanking a central circle — a stylised
-    # "bracket-joint-bracket" echoing the HektikCad wordmark's glyph pair.
-    content_w = int(CANVAS * CONTENT_SCALE)
-    content_h = int(CANVAS * CONTENT_SCALE)
-    cx = CANVAS // 2
-    cy = CANVAS // 2
-    left = cx - content_w // 2
-    right = cx + content_w // 2
-    top = cy - content_h // 2
-    bottom = cy + content_h // 2
+    # Paste the mark centered. The alpha channel of `mark` is the paste mask,
+    # so the transparent SVG rim doesn't overwrite the squircle.
+    offset = ((CANVAS - mark.width) // 2, (CANVAS - mark.height) // 2)
+    img.paste(mark, offset, mark)
 
-    # Gap between the two brackets, as a fraction of the content width.
-    gap = int(content_w * 0.14)
-    bracket_w = (content_w - gap) // 2
-    bracket_radius = int(bracket_w * 0.30)
-
-    # Left bracket (outline only)
-    draw.rounded_rectangle(
-        (left, top, left + bracket_w, bottom),
-        radius=bracket_radius,
-        outline=STROKE_COLOR,
-        width=STROKE_WIDTH,
-    )
-    # Right bracket (outline only)
-    draw.rounded_rectangle(
-        (right - bracket_w, top, right, bottom),
-        radius=bracket_radius,
-        outline=STROKE_COLOR,
-        width=STROKE_WIDTH,
-    )
-
-    # Central circle joining the two. Sized to span the gap with a little
-    # overlap into each bracket so it reads as a connector, not a planet.
-    circle_r = int(content_h * 0.11)
-    draw.ellipse(
-        (cx - circle_r, cy - circle_r, cx + circle_r, cy + circle_r),
-        outline=STROKE_COLOR,
-        width=STROKE_WIDTH,
-    )
-
-    # -- Write --------------------------------------------------------------
     OUT.parent.mkdir(parents=True, exist_ok=True)
     img.save(OUT, format="PNG")
-    print(f"wrote {OUT.relative_to(ROOT)} "
-          f"({CANVAS}x{CANVAS}, squircle r={BG_RADIUS_PCT:.0%}, "
-          f"content {CONTENT_SCALE:.0%}, stroke {STROKE_WIDTH}px)")
+    TMP_MARK.unlink(missing_ok=True)
+    print(
+        f"wrote {OUT.relative_to(ROOT)} "
+        f"(canvas {CANVAS}px, squircle r={BG_RADIUS_PCT:.0%}, "
+        f"mark {CONTENT_SCALE:.0%} from {SVG.name})"
+    )
 
 
 if __name__ == "__main__":
