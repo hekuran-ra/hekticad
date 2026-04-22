@@ -16,6 +16,7 @@ export const dom = {
   cmdPrompt: $('cmd-prompt'),
   stPos: $('st-pos'),
   stZoom: $('st-zoom'),
+  stMeas: $('st-meas'),
   stTool: $('st-tool'),
   stSel: $('st-sel'),
   stTip: $('st-tip'),
@@ -23,6 +24,7 @@ export const dom = {
   layersEl: $('layers'),
   paramsEl: $('parameters'),
   timelineEl: $('timeline'),
+  propsEl: $('props'),
   toastEl: $('toast'),
   toolsPanel: $('tools'),
 } as const;

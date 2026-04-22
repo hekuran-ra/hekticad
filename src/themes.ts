@@ -249,38 +249,67 @@ function buildPopoverBody(pop: HTMLElement): void {
   pop.appendChild(actions);
 }
 
+/** The DOM element the popover should anchor to when opened from a menu/button.
+ *  Defaults to the popover element itself (centered-ish at top-right) when the
+ *  caller doesn't specify. */
+let popAnchor: HTMLElement | null = null;
+
+function getPopover(): HTMLElement | null {
+  return document.getElementById('theme-popover');
+}
+
+/** Open the theme popover, anchored under `anchor` (or in the top-right if
+ *  `anchor` is null — which happens when called from a menu item that has
+ *  already closed itself). Safe to call when already open; re-renders body. */
+export function openThemePopover(anchor?: HTMLElement | null): void {
+  const pop = getPopover();
+  if (!pop) return;
+  popAnchor = anchor ?? null;
+  buildPopoverBody(pop);
+  pop.hidden = false;
+  if (anchor) {
+    const r = anchor.getBoundingClientRect();
+    pop.style.top = `${Math.round(r.bottom + 6)}px`;
+    pop.style.right = `${Math.max(8, Math.round(window.innerWidth - r.right))}px`;
+  } else {
+    // No specific anchor — drop into the upper-right so it's at least obvious
+    // where the panel came from.
+    pop.style.top = `48px`;
+    pop.style.right = `12px`;
+  }
+}
+
+/** Close the theme popover if it's open. */
+export function closeThemePopover(): void {
+  const pop = getPopover();
+  if (!pop) return;
+  pop.hidden = true;
+  popAnchor = null;
+}
+
+export function isThemePopoverOpen(): boolean {
+  const pop = getPopover();
+  return !!pop && !pop.hidden;
+}
+
 export function initThemes(): void {
   applyTheme();
 
-  const btn = document.getElementById('btn-theme');
-  const pop = document.getElementById('theme-popover');
-  if (!btn || !pop) return;
+  const pop = getPopover();
+  if (!pop) return;
 
-  const open = (): void => {
-    buildPopoverBody(pop);
-    pop.hidden = false;
-    const r = btn.getBoundingClientRect();
-    pop.style.top = `${Math.round(r.bottom + 6)}px`;
-    pop.style.right = `${Math.max(8, Math.round(window.innerWidth - r.right))}px`;
-    btn.classList.add('active');
-  };
-  const close = (): void => {
-    pop.hidden = true;
-    btn.classList.remove('active');
-  };
-
-  btn.addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    if (pop.hidden) open(); else close();
-  });
+  // Click outside closes. We check against the current anchor (if any) so
+  // clicking the opener doesn't immediately close the popover that the
+  // opener just opened.
   document.addEventListener('mousedown', (ev) => {
     if (pop.hidden) return;
     const t = ev.target as Node | null;
     if (!t) return;
-    if (pop.contains(t) || btn.contains(t)) return;
-    close();
+    if (pop.contains(t)) return;
+    if (popAnchor && popAnchor.contains(t)) return;
+    closeThemePopover();
   });
   window.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape' && !pop.hidden) close();
+    if (ev.key === 'Escape' && !pop.hidden) closeThemePopover();
   });
 }

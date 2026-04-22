@@ -65,7 +65,11 @@ input, select, textarea { font: inherit; color: inherit; }
 #app {
   display: grid;
   grid-template-rows: 36px 1fr 26px 22px;
-  grid-template-columns: 156px 1fr 288px;
+  /* First column is a tool-palette dock: palettes live *inside* it as docked
+   * children, or float freely over the canvas. `auto` lets the dock widen
+   * when palettes wrap into multiple columns (see `#tools { flex-wrap }`) so
+   * extra columns get the space they need instead of introducing a scrollbar. */
+  grid-template-columns: auto 1fr 288px;
   height: 100vh;
 }
 
@@ -114,6 +118,48 @@ header {
   color: var(--fg-mid); font-weight: 400;
 }
 .menu-item:hover { background: var(--panel-2); color: var(--fg); }
+.menu-item.active {
+  background: var(--panel-2); color: var(--fg);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+/* Menu-bar dropdown popover */
+.menu-popover {
+  position: fixed; z-index: 100;
+  min-width: 220px; max-width: 320px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 4px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+  padding: 4px;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.menu-popover[hidden] { display: none !important; }
+.menu-dropdown-item {
+  display: flex; align-items: center; gap: 16px;
+  justify-content: space-between;
+  padding: 6px 12px; border-radius: 3px;
+  font-size: 12px; color: var(--fg-mid);
+  background: transparent; border: none; text-align: left;
+  cursor: pointer; transition: background 0.08s, color 0.08s;
+  outline: none;
+}
+.menu-dropdown-item:hover { background: var(--panel-2); color: var(--fg); }
+.menu-dropdown-item:focus-visible {
+  background: var(--panel-2);
+  box-shadow: inset 0 0 0 2px color-mix(in oklab, var(--accent) 30%, transparent);
+}
+.menu-dropdown-item.disabled { opacity: 0.4; pointer-events: none; }
+.menu-dropdown-label {
+  flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.menu-dropdown-shortcut {
+  color: var(--fg-dim); font-family: var(--mono); font-size: 10.5px;
+  letter-spacing: 0.4px;
+}
+.menu-dropdown-sep {
+  height: 1px; background: var(--hair); margin: 3px 6px;
+}
 
 .spacer { flex: 1; }
 
@@ -146,63 +192,356 @@ header {
 }
 
 /* ════════════════════════════════════════════════════════════════
-   TOOL RAIL
+   TOOL RAIL — narrow control strip + free-floating palettes
    ════════════════════════════════════════════════════════════════ */
+
+/* ── Dock zone (first column of the app grid) ──
+ * Palettes can live *inside* this column as docked children (flex-stacked)
+ * or float freely over the canvas. The user moves a palette between the two
+ * states by dragging its header: drag out of the dock to undock, drag back
+ * in (cursor lands inside #tools bounds on mouseup) to redock. There are no
+ * lock/add buttons here — all administration happens through a right-click
+ * context menu on any palette (or on the empty dock background). */
 #tools {
   background: var(--panel);
   border-right: 1px solid var(--hair);
-  display: flex; flex-direction: column;
+  /* Horizontal list of explicit dock columns. Each column is a
+   * `.tool-dock-column` flex-column child; palettes inside a column stack
+   * vertically. Multiple columns give the user a way to park palettes
+   * side-by-side so every tool is visible simultaneously. The grid
+   * column's `auto` width (see #app) grows with the number of columns. */
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0;
+  padding: 6px 0;
   overflow: visible;
+  min-width: 48px;
+  height: 100%;
+  box-sizing: border-box;
+}
+.tool-dock-column {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 0 2px;
+  border-right: 1px solid var(--hair-soft);
+}
+.tool-dock-column:last-child {
+  border-right: none;
+}
+/* Highlight a column being dropped into. */
+.tool-dock-column.dock-drop-into {
+  background: color-mix(in oklab, var(--accent) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 35%, transparent);
+}
+/* Drop-indicator for "create new column here" — a vertical accent bar. */
+.tool-dock-new-column-hint {
+  width: 3px;
+  align-self: stretch;
+  margin: 2px 0;
+  background: var(--accent);
+  border-radius: 2px;
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 70%, transparent);
+  pointer-events: none;
 }
 
-/* 3-column category layout */
-.tool-cols {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  flex: 1;
-  overflow: visible;
+/* ── Palette overlay ──
+ * A transparent layer that fills #canvaswrap and hosts every palette. The
+ * overlay itself ignores pointer events (so the canvas beneath receives
+ * clicks, pans, etc.); individual palettes re-enable pointer events on
+ * themselves. z-index 10 keeps palettes above the canvas but below modals. */
+#tool-palettes {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
 }
 
-.tool-col {
-  display: flex; flex-direction: column; align-items: center;
-  padding: 0 2px 6px;
-  overflow-y: auto;
-  scrollbar-width: none;
-  gap: 1px;
+/* ── A single palette — "detachable" floating container ──
+ * Absolute positioning relative to #canvaswrap. `width: fit-content` makes
+ * the panel only as wide as its contents demand.
+ *
+ * CRITICAL layout trick: the palette width must be driven by the tool-body
+ * alone (the buttons), NOT by the header's label text. Otherwise the panel
+ * becomes ~70px wide just to fit "ZEICHNEN" in uppercase tracking, with
+ * wasted space flanking 40px-wide buttons. Solution: the header is
+ * absolutely positioned at top:0, spans full palette width, and does NOT
+ * contribute to intrinsic width calculation. The body's padding + button
+ * widths are the sole width drivers. The palette reserves vertical space
+ * for the overlaid header via `padding-top`. */
+.tool-palette {
+  position: absolute;
+  width: fit-content;
+  min-width: 0;
+  padding-top: 10px;          /* reserves the overlaid header's height */
+  pointer-events: auto;
+  background: color-mix(in oklab, var(--panel) 94%, transparent);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--hair);
+  border-radius: 4px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45),
+              0 0 0 1px rgba(255, 255, 255, 0.02) inset;
+  user-select: none;
+  transition: box-shadow 120ms, border-color 120ms;
 }
-.tool-col::-webkit-scrollbar { display: none; }
-.tool-col + .tool-col { border-left: 1px solid var(--hair-soft); }
+.tool-palette:hover {
+  border-color: color-mix(in oklab, var(--col-accent, var(--accent)) 40%, var(--hair));
+}
 
-/* Category header — small engineer-caps with colored underline */
-.tool-col-hdr {
-  width: 100%;
-  padding: 8px 2px 7px;
-  font-size: 8.5px; font-weight: 700; letter-spacing: 1.4px;
-  text-transform: uppercase; text-align: center;
-  color: var(--col-accent, var(--fg-dim));
-  border-bottom: 1px solid var(--hair-soft);
-  margin-bottom: 4px;
+/* ── Docked / snapped to the left edge of the canvas ──
+ * When the user drags a floating palette within a few px of x=0 it snaps to 0.
+ * Visually the palette loses its left border + left radius + most of its
+ * drop-shadow, so it reads as an extension of the sidebar instead of a
+ * free-floating window. Classic CAD dockable-panel idiom. */
+.tool-palette.snapped-left {
+  border-left: none;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.20);
+}
+.tool-palette.snapped-left .tool-palette-hdr {
+  border-top-left-radius: 0;
+}
+
+/* ── Docked palette — lives inside the #tools column as a flex child ──
+ * Not absolutely positioned: ignore left/top inline styles; let flex stack
+ * the palette under any other docked siblings. No shadow, no left border,
+ * no left radius, so it reads as a flush extension of the sidebar. */
+.tool-palette.docked {
   position: relative;
-  font-family: var(--mono);
+  left: auto !important;
+  top: auto !important;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  backdrop-filter: none;
+  /* No borders — the flex `gap` between palettes is the visual separator.
+   * This keeps the look clean both in the single-column case and when
+   * palettes wrap into a second column (no awkward first-in-column rules). */
+  border: none;
 }
-.tool-col-hdr::after {
-  content: ''; position: absolute;
-  bottom: -1px; left: 50%; transform: translateX(-50%);
-  width: 20px; height: 2px;
-  background: var(--col-accent, var(--fg-dim));
+.tool-palette.docked:hover {
+  background: color-mix(in oklab, var(--col-accent, var(--accent)) 6%, transparent);
+}
+.tool-palette.docked .tool-palette-hdr {
   border-radius: 0;
 }
+/* Drop indicator bars between docked palettes while dragging a palette into
+ * the dock. Placed by JS via `.dock-drop-before` / `.dock-drop-after`. */
+.tool-palette.docked.dock-drop-before::before,
+.tool-palette.docked.dock-drop-after::before {
+  content: ""; position: absolute;
+  left: 2px; right: 2px; height: 2px; border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 80%, transparent);
+  pointer-events: none; z-index: 5;
+}
+.tool-palette.docked.dock-drop-before::before { top: -3px; }
+.tool-palette.docked.dock-drop-after::before  { bottom: -3px; }
 
+/* Accent slots — match `ColumnAccent` in tools.ts. The accent drives the
+ * header tint, the color-swatch dot, and the active-tool indicator on the
+ * buttons inside the palette. Users pick an accent instead of naming the
+ * palette (names aren't legible at this tiny header size anyway — colour
+ * is a faster visual identifier than a 2-character truncated label). */
+.tool-palette.tool-col--accent  { --col-accent: var(--accent); }
+.tool-palette.tool-col--guides  { --col-accent: var(--guides); }
+.tool-palette.tool-col--draw    { --col-accent: var(--draw); }
+.tool-palette.tool-col--modify  { --col-accent: var(--modify); }
+.tool-palette.tool-col--purple  { --col-accent: #a78bfa; }
+.tool-palette.tool-col--pink    { --col-accent: #ec4899; }
+.tool-palette.tool-col--green   { --col-accent: #22c55e; }
+.tool-palette.tool-col--neutral { --col-accent: var(--fg-dim); }
+
+/* ── Palette header — pure drag handle, tinted with the accent colour ──
+ * Absolutely positioned across the top of the palette so it spans the full
+ * palette width (set by the body) without influencing that width. No text
+ * and no buttons: the accent-tinted bar is the identifier AND the drag
+ * handle. All administration (colour, orientation, delete, new palette,
+ * reset) lives in the right-click context menu — this matches the AutoCAD
+ * "right-click a palette" UX and keeps the header visually quiet. */
+.tool-palette-hdr {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 10px;
+  cursor: grab;
+  background: color-mix(in oklab, var(--col-accent, var(--fg-dim)) 28%, transparent);
+  border-bottom: 1px solid color-mix(in oklab, var(--col-accent, var(--hair)) 45%, var(--hair-soft));
+  border-radius: 3px 3px 0 0;
+}
+.tool-palette-hdr:active { cursor: grabbing; }
+/* Lock state (Einstellungen → Werkzeugpaletten sperren). Header becomes a
+ * plain strip that doesn't invite dragging; individual tool buttons still
+ * behave normally (clicking activates the tool), only rearrangement is
+ * suppressed. Re-applied to every palette via `panels-locked` on <body>. */
+body.panels-locked .tool-palette-hdr         { cursor: default; }
+body.panels-locked .tool-palette-hdr:active  { cursor: default; }
+body.panels-locked .tool-btn                 { cursor: pointer; }
+/* Docked palettes have an even thinner header — they don't need a drop
+ * shadow or shine, just a thin strip for the drag handle. */
+.tool-palette.docked { padding-top: 8px; }
+.tool-palette.docked .tool-palette-hdr { height: 8px; border-radius: 0; }
+
+/* ── Palette context menu (right-click on any palette or on #tools) ──
+ * Lives in document.body (position:fixed) so it isn't clipped by any palette
+ * stacking context. Items are compact, ~13px text; the colour row is inline
+ * at the top with the preset dots so picking a colour is one click away. */
+.tool-ctx-menu {
+  position: fixed;
+  background: color-mix(in oklab, var(--panel) 96%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--hair);
+  border-radius: 5px;
+  padding: 4px;
+  min-width: 180px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+  z-index: 2000;
+  font-size: 12px;
+  color: var(--fg);
+  user-select: none;
+}
+.tool-ctx-colors {
+  display: flex; gap: 4px; padding: 4px 6px 6px;
+}
+.tool-ctx-color-dot {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--c);
+  border: 1px solid color-mix(in oklab, var(--c) 50%, var(--bg-deep));
+  cursor: pointer;
+  padding: 0;
+  transition: transform 80ms, box-shadow 80ms;
+  flex-shrink: 0;
+}
+.tool-ctx-color-dot:hover {
+  transform: scale(1.15);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--c) 35%, transparent);
+}
+.tool-ctx-color-dot.current {
+  box-shadow: 0 0 0 2px var(--fg);
+}
+/* Custom-colour swatch — always shows the conic rainbow, regardless of whether
+ * the user has already picked a colour. The rainbow is the swatch's identity
+ * ("pick your own"); swapping it for the chosen colour would make it look
+ * like just another preset and lose the affordance. The `.current` ring
+ * (outer box-shadow) still indicates when a custom colour is active.
+ * The hidden native <input type="color"> lives inside the button; we only
+ * keep it in-DOM so clicking it can trigger the picker — it must not
+ * consume layout space. */
+.tool-ctx-color-dot.custom,
+.tool-ctx-color-dot.custom.current {
+  background: conic-gradient(
+    from 0deg,
+    #ef4444, #f59e0b, #eab308, #22c55e,
+    #06b6d4, #3b82f6, #a855f7, #ec4899, #ef4444
+  );
+  position: relative;
+}
+.tool-ctx-color-input {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  opacity: 0; cursor: pointer;
+  border: 0; padding: 0; background: transparent;
+  pointer-events: none; /* let the parent button handle the click */
+}
+.tool-ctx-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--fg-mid);
+  transition: background 80ms, color 80ms;
+  white-space: nowrap;
+  text-align: left;
+  width: 100%;
+  background: none;
+  border: 0;
+}
+.tool-ctx-item:hover {
+  background: var(--panel-2);
+  color: var(--fg);
+}
+.tool-ctx-item.danger:hover {
+  background: color-mix(in oklab, var(--modify) 18%, transparent);
+  color: var(--modify);
+}
+.tool-ctx-item[aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.tool-ctx-item[aria-disabled="true"]:hover {
+  background: none;
+  color: var(--fg-mid);
+}
+.tool-ctx-sep {
+  height: 1px;
+  background: var(--hair);
+  margin: 3px 2px;
+}
+
+/* ── Palette body — holds the tool buttons in the chosen orientation ──
+ * A flex container whose direction depends on `data-orient` on the parent.
+ * Orientation is per-palette so the user can mix vertical and horizontal
+ * containers (a common CAD-tool-palette convention: small dense horizontal
+ * bars for related ops, taller vertical columns for hierarchies). */
+.tool-palette-body {
+  display: flex;
+  padding: 3px;
+  gap: 1px;
+  min-width: 0;
+}
+.tool-palette[data-orient="vertical"]   .tool-palette-body { flex-direction: column; }
+.tool-palette[data-orient="horizontal"] .tool-palette-body { flex-direction: row; }
+
+/* Empty-palette placeholder — when a newly created palette has no tools yet
+ * the body would collapse to ~6×6px (only its padding), making it almost
+ * impossible to drop a tool onto. Size the empty body to roughly one tool-btn
+ * slot with dashed border + "+" glyph so the drop target is obvious. */
+.tool-palette-body:empty {
+  min-width: 44px;
+  min-height: 38px;
+  border: 1px dashed color-mix(in oklab, var(--col-accent, var(--accent)) 55%, transparent);
+  border-radius: 3px;
+  align-items: center;
+  justify-content: center;
+  color: color-mix(in oklab, var(--col-accent, var(--accent)) 70%, transparent);
+  font-family: var(--sans);
+  font-size: 18px;
+  line-height: 1;
+  font-weight: 500;
+}
+.tool-palette-body:empty::before {
+  content: "+";
+}
+.tool-palette-body:empty.drop-target {
+  border-style: solid;
+}
+
+/* While dragging a palette, force grabbing cursor everywhere (document-level
+ * class on <body>). Also disables pointer-events on the other palettes so
+ * the drag doesn't get hijacked by hover states on tool buttons. */
+body.palette-dragging,
+body.palette-dragging * { cursor: grabbing !important; }
+body.palette-dragging .tool-palette { pointer-events: none; }
+
+/* ── Legacy column-accent aliases (used by cached class names) ── */
 .tool-col--guide     { --col-accent: var(--guides); }
 .tool-col--construct { --col-accent: var(--draw); }
-.tool-col--modify    { --col-accent: var(--modify); }
 
-/* Tool buttons — active state uses bottom accent-line (CAD convention) */
+/* ════════════════════════════════════════════════════════════════
+   TOOL BUTTONS (live inside .tool-palette-body)
+   ════════════════════════════════════════════════════════════════ */
 .tool-btn {
   width: 40px; height: 34px;
   border-radius: 3px;
   background: transparent;
-  color: var(--fg-mid);
+  /* Always wear the palette's accent color, not a neutral grey — makes the
+   * tool-type affiliation (draw/modify/dim/…) readable at a glance without
+   * requiring a hover. Active state still stands out via background+border. */
+  color: var(--col-accent, var(--accent));
   display: flex; align-items: center; justify-content: center;
   position: relative;
   transition: background 100ms, color 100ms, border-color 100ms;
@@ -214,8 +553,10 @@ header {
   stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
 }
 .tool-btn:hover {
-  color: var(--fg);
-  background: var(--panel-2);
+  /* Keep the accent color, just add a faint tinted background so hover still
+   * reads as a distinct state. No full-white override — that flattened the
+   * color identity we just established. */
+  background: color-mix(in oklab, var(--col-accent, var(--accent)) 8%, var(--panel-2));
 }
 
 .tool-btn.active {
@@ -223,19 +564,29 @@ header {
   background: color-mix(in oklab, var(--col-accent, var(--accent)) 10%, transparent);
   border-color: color-mix(in oklab, var(--col-accent, var(--accent)) 25%, transparent);
 }
-/* Distinct bottom-edge accent on active tool */
-.tool-btn.active::before {
+/* Active indicator — bottom accent on vertical palettes, right accent on
+ * horizontal ones so the CAD convention reads correctly regardless of the
+ * palette's orientation. */
+.tool-palette[data-orient="vertical"] .tool-btn.active::before {
   content: ''; position: absolute;
   left: 6px; right: 6px; bottom: -1px;
   height: 2px; border-radius: 2px;
   background: var(--col-accent, var(--accent));
   box-shadow: 0 0 6px color-mix(in oklab, var(--col-accent, var(--accent)) 60%, transparent);
 }
+.tool-palette[data-orient="horizontal"] .tool-btn.active::before {
+  content: ''; position: absolute;
+  top: 6px; bottom: 6px; right: -1px;
+  width: 2px; border-radius: 2px;
+  background: var(--col-accent, var(--accent));
+  box-shadow: 0 0 6px color-mix(in oklab, var(--col-accent, var(--accent)) 60%, transparent);
+}
 
-/* Tooltip */
+/* Tooltip — position depends on orientation so it never overlaps the palette
+ * body. Vertical palettes: tooltip to the right; horizontal: below. */
 .tool-btn::after {
   content: attr(data-label) " · " attr(data-key);
-  position: absolute; left: calc(100% + 8px); top: 50%; transform: translateY(-50%);
+  position: absolute;
   background: var(--bg-deep); color: var(--fg);
   padding: 5px 9px; border-radius: 3px; white-space: nowrap; font-size: 11px;
   border: 1px solid var(--hair); opacity: 0; pointer-events: none;
@@ -244,19 +595,17 @@ header {
   font-family: var(--sans);
   letter-spacing: 0.015em;
 }
+.tool-palette[data-orient="vertical"] .tool-btn::after {
+  left: calc(100% + 8px); top: 50%; transform: translateY(-50%);
+}
+.tool-palette[data-orient="horizontal"] .tool-btn::after {
+  top: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+}
 .tool-btn:hover::after { opacity: 1; }
 
-/* Pointer / select / pan: cyan accent (not guide teal) */
-.tool-btn[data-tool="select"],
-.tool-btn[data-tool="select_similar"],
-.tool-btn[data-tool="pan"] {
-  --col-accent: var(--accent);
-}
 
-/* Selection-gated tools (move, copy, rotate, mirror, scale, stretch, offset,
- * delete) greyed-out until something is selected. Click still fires so we can
- * surface a "select something first" toast rather than silently ignoring.
- */
+/* Selection-gated tools (move, copy, rotate, mirror, …) — greyed out until
+ * something is selected. Click still fires so we can toast "select first". */
 .tool-btn.disabled {
   opacity: 0.32;
   cursor: not-allowed;
@@ -267,7 +616,7 @@ header {
   color: inherit;
 }
 
-/* Drag-reorder */
+/* Drag affordances for tools — grab cursor, dashed outline while dragging. */
 .tool-btn { cursor: grab; }
 .tool-btn:active { cursor: grabbing; }
 .tool-btn.dragging {
@@ -275,16 +624,41 @@ header {
   border-style: dashed;
   border-color: color-mix(in oklab, var(--col-accent, var(--accent)) 60%, transparent);
 }
+/* Drop-indicator bars — orient-aware: on vertical palettes they are
+ * horizontal bars above/below the target button; on horizontal palettes they
+ * are vertical bars to the left/right of the target. */
 .tool-btn.drop-before::before,
 .tool-btn.drop-after::before {
-  content: ""; position: absolute; left: 2px; right: 2px; height: 2px;
+  content: ""; position: absolute;
   background: var(--col-accent, var(--accent));
   border-radius: 2px;
   box-shadow: 0 0 8px color-mix(in oklab, var(--col-accent, var(--accent)) 80%, transparent);
   pointer-events: none;
 }
-.tool-btn.drop-before::before { top: -2px; bottom: auto; left: 2px; right: 2px; }
-.tool-btn.drop-after::before  { bottom: -2px; top: auto; left: 2px; right: 2px; }
+.tool-palette[data-orient="vertical"] .tool-btn.drop-before::before {
+  left: 2px; right: 2px; top: -2px; height: 2px;
+}
+.tool-palette[data-orient="vertical"] .tool-btn.drop-after::before {
+  left: 2px; right: 2px; bottom: -2px; height: 2px;
+}
+.tool-palette[data-orient="horizontal"] .tool-btn.drop-before::before {
+  top: 2px; bottom: 2px; left: -2px; width: 2px;
+}
+.tool-palette[data-orient="horizontal"] .tool-btn.drop-after::before {
+  top: 2px; bottom: 2px; right: -2px; width: 2px;
+}
+
+/* Whole-body drop highlight: shown when the user is dragging a tool over
+ * the palette body but not directly over another tool button (i.e. "drop
+ * here to append to this palette"). */
+.tool-palette-body.drop-target {
+  background: color-mix(in oklab, var(--col-accent, var(--accent)) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--col-accent, var(--accent)) 35%, transparent);
+  border-radius: 3px;
+}
+
+/* (The old "locked" state has been removed entirely — users manage palettes
+ *  through the right-click context menu instead of a global lock toggle.) */
 
 /* ════════════════════════════════════════════════════════════════
    CANVAS
@@ -295,71 +669,254 @@ header {
 canvas { position: absolute; inset: 0; display: block; }
 
 /* ─── Floating snap toolbar ─────────────────────────────────────── */
+/* Right edge of the canvas, stacked vertically directly underneath the
+ * viewcube (+ / − / A). `top` = viewcube height (30px) + its 10px offset +
+ * an 8px visual gap, so the two floating controls read as a single column
+ * of view utilities on the right edge.
+ * z-index must beat `#tool-palettes` (z:10) so free-floating palettes never
+ * occlude the snap bar — it's a primary UI surface that must always read. */
 .snap-toolbar {
-  position: absolute; top: 10px; left: 10px; z-index: 5;
+  position: absolute; top: 48px; right: 10px; z-index: 20;
   background: color-mix(in oklab, var(--panel) 92%, transparent);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   border: 1px solid var(--hair);
   border-radius: 4px;
-  display: flex; align-items: center; padding: 3px; gap: 1px;
+  display: flex; flex-direction: column; align-items: stretch;
+  padding: 3px; gap: 2px;
   box-shadow: 0 2px 12px rgba(0,0,0,0.35);
 }
 .snap-ob-btn {
-  padding: 4px 8px; border-radius: 2px;
+  padding: 4px 6px; border-radius: 2px;
   font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.5px;
   color: var(--fg-dim);
   font-weight: 500;
+  text-align: center; min-width: 58px;
 }
 .snap-ob-btn:hover { background: var(--panel-2); color: var(--fg); }
 .snap-ob-btn.on {
   color: var(--guides);
   background: color-mix(in oklab, var(--guides) 12%, transparent);
 }
-.snap-sep { width: 1px; height: 14px; background: var(--hair); margin: 0 3px; }
+/* Accent variant — for global mode toggles (e.g. PARAM) that should
+   stand out from the regular cyan snap-option buttons. Amber palette. */
+.snap-ob-accent {
+  font-weight: 700;
+  letter-spacing: 0.8px;
+}
+.snap-ob-accent.on {
+  color: #ffb020;
+  background: color-mix(in oklab, #ffb020 16%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, #ffb020 45%, transparent);
+}
+.snap-ob-accent:not(.on) {
+  color: color-mix(in oklab, #ffb020 55%, var(--fg-dim));
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, #ffb020 20%, transparent);
+}
+.snap-ob-accent:hover {
+  background: color-mix(in oklab, #ffb020 10%, transparent);
+  color: #ffb020;
+}
+/* Horizontal hair-line divider between button groups in the vertical stack. */
+.snap-sep { height: 1px; width: auto; background: var(--hair); margin: 3px 4px; }
 .snap-ob-grid {
-  width: 52px; padding: 3px 6px; margin: 0 2px;
+  width: auto; padding: 3px 6px; margin: 1px 2px;
   background: var(--bg-deep); border: 1px solid var(--hair); border-radius: 2px;
   color: var(--fg); font-family: var(--mono); font-size: 9.5px;
   font-feature-settings: var(--num-feat);
-  outline: none;
+  outline: none; text-align: center;
 }
 .snap-ob-grid:focus { border-color: var(--guides); }
 .snap-ob-grid::-webkit-inner-spin-button,
 .snap-ob-grid::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 
-/* ─── Dimension end-cap style picker ────────────────────────────── */
+/* ─── Dimension mode picker (tool HUD) ──────────────────────────── */
+/* Top-center docking: the picker lives centered near the top of the canvas so
+   it doubles as a tool-status banner without competing with the snap toolbar
+   on the left or the viewcube on the right. `left: 50%; transform` instead of
+   a fixed offset keeps it centered across resizes. */
 .dim-picker {
-  position: absolute; top: 50px; left: 10px; z-index: 5;
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+  z-index: 5;
   background: color-mix(in oklab, var(--panel) 92%, transparent);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   border: 1px solid var(--hair); border-radius: 4px;
-  display: flex; align-items: center; padding: 3px; gap: 2px;
+  display: flex; align-items: center; padding: 3px 4px; gap: 3px;
   box-shadow: 0 2px 12px rgba(0,0,0,0.35);
 }
 .dim-picker[hidden] { display: none; }
+/* Single-input panels (divide-count, fillet-radius, chamfer-distance) sit
+   flush against their label — they don't share space with a mode radio
+   group or Winkel-toggle, so no extra left-margin is needed. Slightly wider
+   than the angle input because expression input ("L/2 + 3") can run longer
+   than plain integers. */
+.dim-picker .divide-count,
+.dim-picker .fillet-radius,
+.dim-picker .chamfer-distance { width: 90px; margin-left: 0; text-align: left; padding-left: 6px; }
+.dim-picker .divide-count { width: 60px; text-align: center; padding-left: 4px; }
+.dim-picker-sep {
+  /* Vertical hairline between the mode radio group and the independent
+     Winkel toggle — signals that the button on the other side is NOT part
+     of the radio group. Same visual weight as the sep in the snap toolbar. */
+  width: 1px; background: var(--hair);
+  margin: 2px 4px; align-self: stretch;
+}
 .dim-picker-label {
   font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.5px;
-  color: var(--fg-dim); padding: 0 6px; text-transform: uppercase;
+  color: var(--fg-dim); padding: 0 8px 0 4px; text-transform: uppercase;
   font-weight: 500;
-}
-.dim-style-btn {
-  padding: 3px 4px; border-radius: 2px; background: transparent;
-  color: var(--fg-dim); border: 1px solid transparent;
+  border-right: 1px solid var(--hair);
+  margin-right: 2px; align-self: stretch;
   display: flex; align-items: center;
 }
-.dim-style-btn:hover { background: var(--panel-2); color: var(--fg); }
-.dim-style-btn.on {
-  color: var(--guides);
-  background: color-mix(in oklab, var(--guides) 14%, transparent);
-  border-color: color-mix(in oklab, var(--guides) 30%, transparent);
+/* Segmented-control look: every button is a distinct affordance, not just the
+   active one. Text buttons — each mode has a descriptive German label so the
+   picker doubles as documentation for the interaction flows. `.dim-mode-btn`
+   drives the linear-dim picker (Einfach / Gekettet / Automatisch);
+   `.radius-mode-btn` drives the radius-dim picker (Radius / Durchmesser).
+   They share styling so both pickers read as one visual family — the only
+   thing that differs is which runtime setting they toggle. */
+.dim-mode-btn,
+.radius-mode-btn,
+.line-offset-mode-btn,
+.line-offset-angle-btn,
+.cross-mirror-mode-btn {
+  padding: 4px 10px; border-radius: 3px; background: transparent;
+  color: var(--fg); border: 1px solid var(--hair);
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.3px;
+  display: flex; align-items: center;
+  cursor: pointer;
 }
-.dim-style-btn svg { display: block; }
+.dim-mode-btn:hover,
+.radius-mode-btn:hover,
+.line-offset-mode-btn:hover,
+.line-offset-angle-btn:hover,
+.cross-mirror-mode-btn:hover {
+  background: var(--panel-2);
+  border-color: color-mix(in oklab, var(--fg) 25%, var(--hair));
+}
+.dim-mode-btn.on,
+.radius-mode-btn.on,
+.line-offset-mode-btn.on,
+.line-offset-angle-btn.on,
+.cross-mirror-mode-btn.on {
+  color: var(--guides);
+  background: color-mix(in oklab, var(--guides) 18%, transparent);
+  border-color: color-mix(in oklab, var(--guides) 55%, transparent);
+}
+/* Icon-only variant for the cross-mirror mode picker — square tile with the
+   SVG centered, no text padding. The SVG uses currentColor so it inherits
+   the on/off/hover color transitions from the shared rules above. */
+.cross-mirror-mode-btn {
+  padding: 3px; width: 28px; height: 28px;
+  justify-content: center;
+}
+.cross-mirror-mode-btn svg { display: block; }
+
+/* Angle number-input next to the "Winkel" toggle — visible only when the
+   toggle is on. Reuses the snap-ob-grid styling so it blends with the other
+   inline numeric inputs in the HUD family. */
+.line-offset-angle-value {
+  width: 46px; padding: 3px 4px; margin-left: 2px;
+  background: var(--bg-deep);
+  border: 1px solid var(--hair); border-radius: 3px;
+  color: var(--fg); font-family: var(--mono); font-size: 10px;
+  font-feature-settings: var(--num-feat);
+  outline: none; text-align: center;
+}
+.line-offset-angle-value:focus { border-color: var(--guides); }
+.line-offset-angle-value[hidden] { display: none; }
+.line-offset-angle-value::-webkit-inner-spin-button,
+.line-offset-angle-value::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
+/* ─── Dim properties HUD (bottom-left, appears on dim selection) ──
+ * Sits above the coord-readout so it never overlaps the X/Y numbers — the
+ * coord strip bottoms out at ~10px, we start at 50px. Same glass-panel look
+ * as the dim-mode picker so the two HUDs read as a family. */
+.dim-props {
+  position: absolute; bottom: 50px; left: 10px; z-index: 5;
+  background: color-mix(in oklab, var(--panel) 92%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid var(--hair); border-radius: 4px;
+  display: flex; align-items: center; padding: 3px 4px; gap: 3px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+}
+.dim-props[hidden] { display: none; }
+.dim-props-label {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.5px;
+  color: var(--fg-dim); padding: 0 8px 0 4px; text-transform: uppercase;
+  font-weight: 500;
+  border-right: 1px solid var(--hair);
+  margin-right: 2px; align-self: stretch;
+  display: flex; align-items: center;
+}
+.dim-props-size {
+  width: 54px; padding: 3px 6px;
+  background: var(--bg-deep); border: 1px solid var(--hair); border-radius: 2px;
+  color: var(--fg); font-family: var(--mono); font-size: 10px;
+  font-feature-settings: var(--num-feat);
+  outline: none; text-align: center;
+}
+.dim-props-size:focus { border-color: var(--guides); }
+.dim-props-size::-webkit-inner-spin-button,
+.dim-props-size::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+/* Thin vertical separator between the size field and the align buttons —
+ * matches the top-group divider on the dim-picker. */
+.dim-props-sep {
+  width: 1px; align-self: stretch; background: var(--hair); margin: 0 4px;
+}
+/* Three segmented align buttons. Monospace glyphs (├ ┼ ┤) visually encode
+ * "label at start / center / end of the dim line" without needing localised
+ * labels. */
+.dim-props-align-btn {
+  padding: 4px 8px; border-radius: 3px; background: transparent;
+  color: var(--fg); border: 1px solid var(--hair);
+  font-family: var(--mono); font-size: 12px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; min-width: 26px;
+}
+.dim-props-align-btn:hover {
+  background: var(--panel-2);
+  border-color: color-mix(in oklab, var(--fg) 25%, var(--hair));
+}
+.dim-props-align-btn.on {
+  color: var(--guides);
+  background: color-mix(in oklab, var(--guides) 18%, transparent);
+  border-color: color-mix(in oklab, var(--guides) 55%, transparent);
+}
+
+/* ─── Dim style dialog (Format → Bemaßungsstil) ─────────────────── */
+.dim-style-dialog-grid {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;
+  margin-top: 8px;
+}
+.dim-style-option {
+  display: flex; flex-direction: column; align-items: stretch;
+  padding: 10px 12px; border-radius: 4px;
+  background: var(--panel-2); border: 1px solid var(--hair);
+  color: var(--fg); cursor: pointer;
+  gap: 6px; text-align: left;
+}
+.dim-style-option:hover {
+  border-color: color-mix(in oklab, var(--fg) 25%, var(--hair));
+}
+.dim-style-option.on {
+  color: var(--guides);
+  background: color-mix(in oklab, var(--guides) 14%, var(--panel-2));
+  border-color: color-mix(in oklab, var(--guides) 55%, transparent);
+}
+.dim-style-option .dim-style-preview {
+  display: block; width: 100%; height: 28px;
+}
+.dim-style-option .dim-style-label {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.3px;
+}
 
 /* ─── View cube ─────────────────────────────────────────────────── */
 .viewcube {
-  position: absolute; top: 10px; right: 10px; z-index: 5;
+  position: absolute; top: 10px; right: 10px; z-index: 20;
   background: color-mix(in oklab, var(--panel) 92%, transparent);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
@@ -394,12 +951,22 @@ canvas { position: absolute; inset: 0; display: block; }
 }
 .coord-readout b { color: var(--fg); font-weight: 500; }
 
-#st-pos, #st-zoom {
+#st-pos, #st-zoom, #st-meas {
   font-family: var(--mono); font-size: 11px; color: var(--fg-mid);
   font-feature-settings: var(--num-feat);
 }
-#st-pos em, #st-zoom em { font-style: normal; color: var(--fg-dim); margin-right: 5px; font-size: 10px; letter-spacing: 0.5px; }
-#st-pos b, #st-zoom b { color: var(--fg); font-weight: 500; }
+#st-pos em, #st-zoom em, #st-meas em {
+  font-style: normal; color: var(--fg-dim); margin-right: 5px;
+  font-size: 10px; letter-spacing: 0.5px;
+}
+#st-pos b, #st-zoom b, #st-meas b { color: var(--fg); font-weight: 500; }
+#st-meas[hidden] { display: none; }
+/* Visual separator before the measurement block so X/Y and the measurement
+   don't read as one run-on string. */
+#st-meas:not([hidden])::before {
+  content: ''; display: inline-block; width: 1px; height: 12px;
+  background: var(--hair); margin: 0 4px 0 2px; vertical-align: -2px;
+}
 
 /* ─── Toast ─────────────────────────────────────────────────────── */
 #toast {
@@ -414,6 +981,442 @@ canvas { position: absolute; inset: 0; display: block; }
   font-feature-settings: var(--num-feat);
 }
 #toast.show { opacity: 1; }
+
+/* ─── Modal (replaces window.alert / confirm / prompt) ──────────── */
+.hk-modal-root {
+  position: fixed; inset: 0;
+  z-index: 10000;
+  pointer-events: none;
+}
+.hk-modal-root[hidden] { display: none; }
+.hk-modal-backdrop {
+  position: absolute; inset: 0;
+  background: color-mix(in oklab, var(--bg-deep) 65%, transparent);
+  backdrop-filter: blur(2px);
+  display: grid; place-items: center;
+  pointer-events: auto;
+  animation: hkModalFadeIn 0.12s ease-out;
+}
+@keyframes hkModalFadeIn { from { opacity: 0; } to { opacity: 1; } }
+.hk-modal {
+  min-width: 320px; max-width: 480px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 4px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+  display: flex; flex-direction: column;
+  animation: hkModalPopIn 0.14s ease-out;
+}
+@keyframes hkModalPopIn {
+  from { transform: translateY(4px) scale(0.98); opacity: 0; }
+  to   { transform: none; opacity: 1; }
+}
+.hk-modal-head {
+  padding: 14px 16px 8px 16px;
+  border-bottom: 1px solid var(--hair);
+}
+.hk-modal-title {
+  color: var(--fg); font-size: 13px; font-weight: 500;
+  letter-spacing: 0.2px;
+}
+.hk-modal-msg {
+  color: var(--fg-mid); font-size: 12px;
+  margin-top: 4px; line-height: 1.4;
+}
+.hk-modal-body {
+  padding: 12px 16px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.hk-modal-input {
+  width: 100%;
+  background: var(--bg-deep); color: var(--fg);
+  border: 1px solid var(--hair); border-radius: 2px;
+  padding: 6px 8px; font-family: var(--mono); font-size: 12px;
+  outline: none;
+}
+.hk-modal-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 20%, transparent);
+}
+.hk-modal-err {
+  color: var(--modify); font-size: 11px; font-family: var(--mono);
+  margin-top: 2px;
+}
+.hk-modal-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 10px 16px 12px 16px;
+  border-top: 1px solid var(--hair);
+}
+.hk-modal-btn {
+  min-width: 72px;
+  padding: 6px 14px; border-radius: 3px;
+  font-size: 12px; font-family: inherit;
+  border: 1px solid var(--hair);
+  cursor: pointer; outline: none;
+  transition: background 0.08s, border-color 0.08s, color 0.08s;
+}
+.hk-modal-btn:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 40%, transparent);
+}
+.hk-modal-btn-secondary {
+  background: transparent; color: var(--fg-mid);
+}
+.hk-modal-btn-secondary:hover {
+  background: var(--panel-2); color: var(--fg);
+}
+.hk-modal-btn-primary {
+  background: var(--accent); color: var(--bg-deep);
+  border-color: var(--accent); font-weight: 500;
+}
+.hk-modal-btn-primary:hover {
+  background: color-mix(in oklab, var(--accent) 85%, white);
+}
+.hk-modal-btn-danger {
+  background: var(--modify); color: var(--bg-deep);
+  border-color: var(--modify); font-weight: 500;
+}
+.hk-modal-btn-danger:hover {
+  background: color-mix(in oklab, var(--modify) 85%, white);
+}
+
+/* ─── Text editor modal ──────────────────────────────────────────
+   Wider than the default prompt so the textarea has room. The toolbar sits
+   directly above the textarea (A-/A+ nudgers and the height input), followed
+   by the textarea and a live preview strip. */
+.hk-modal.hk-modal-text {
+  min-width: 480px; max-width: 640px; width: 90vw;
+}
+.hk-modal.hk-modal-text .hk-modal-body { gap: 10px; }
+
+.hk-texted-toolbar {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px; background: var(--bg-deep);
+  border: 1px solid var(--hair); border-radius: 3px;
+}
+.hk-texted-nudge {
+  min-width: 28px; height: 24px;
+  background: transparent; color: var(--fg);
+  border: 1px solid var(--hair); border-radius: 2px;
+  font-family: var(--sans); font-size: 11px; font-weight: 500;
+  cursor: pointer; outline: none;
+  transition: background 0.08s, border-color 0.08s;
+}
+.hk-texted-nudge:hover {
+  background: var(--panel-2);
+  border-color: color-mix(in oklab, var(--fg) 25%, var(--hair));
+}
+.hk-texted-size {
+  display: flex; align-items: center; gap: 6px;
+  margin-left: auto; color: var(--fg-mid);
+  font-family: var(--mono); font-size: 11px;
+}
+.hk-texted-size-input {
+  width: 72px !important;
+  padding: 3px 6px !important;
+  text-align: right;
+}
+.hk-texted-unit {
+  color: var(--fg-dim); font-size: 10px;
+  font-family: var(--mono); letter-spacing: 0.5px;
+}
+
+.hk-texted-area {
+  font-family: "Inter", system-ui, sans-serif !important;
+  font-size: 13px !important;
+  line-height: 1.4;
+  min-height: 120px;
+  resize: vertical;
+  padding: 10px !important;
+}
+
+.hk-texted-preview {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px;
+  background: var(--bg-deep);
+  border: 1px solid var(--hair); border-radius: 3px;
+  /* Fixed max height + scroll so extreme font sizes don't push the modal
+     off-screen. */
+  max-height: 120px; overflow: auto;
+}
+.hk-texted-preview-label {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.5px;
+  color: var(--fg-dim); text-transform: uppercase;
+}
+.hk-texted-preview-text {
+  color: var(--fg);
+  font-family: "Inter", system-ui, sans-serif;
+  line-height: 1.25;
+  white-space: pre-wrap; word-break: break-word;
+  min-height: 1em;
+}
+
+.hk-texted-hint {
+  flex: 1 0 auto; align-self: center;
+  color: var(--fg-dim); font-family: var(--mono);
+  font-size: 10.5px; letter-spacing: 0.3px;
+}
+
+/* ─── Export dialog ──────────────────────────────────────────────
+   Wider than the default prompt so the form rows breathe. Four-column
+   format tabs up top, PDF-only metadata form + logo slot underneath. */
+.hk-modal.hk-modal-export {
+  min-width: 480px; max-width: 520px; width: 92vw;
+  max-height: 86vh;
+}
+.hk-export-body {
+  gap: 14px;
+  overflow-y: auto;
+  max-height: calc(86vh - 110px);
+}
+
+.hk-export-tabs {
+  display: flex; gap: 0;
+  border-bottom: 1px solid var(--hair);
+  margin: -4px -4px 0 -4px;
+}
+.hk-export-tab {
+  flex: 1;
+  padding: 9px 10px;
+  font-size: 12px; font-family: var(--sans); letter-spacing: 0.3px;
+  color: var(--fg-mid);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer; outline: none;
+  transition: color 0.08s, border-color 0.08s, background 0.08s;
+}
+.hk-export-tab:hover { color: var(--fg); background: var(--panel-2); }
+.hk-export-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.hk-export-tab:focus-visible {
+  box-shadow: inset 0 0 0 2px color-mix(in oklab, var(--accent) 30%, transparent);
+}
+
+.hk-export-dynamic { display: flex; flex-direction: column; gap: 12px; }
+
+.hk-export-section-label {
+  font-family: var(--mono);
+  font-size: 9.5px; letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin: 2px 0 -2px 0;
+}
+
+.hk-export-select {
+  height: 30px;
+  /* Native select chevron — keep it simple. */
+}
+
+.hk-export-form { display: flex; flex-direction: column; gap: 6px; }
+.hk-export-row {
+  display: grid; grid-template-columns: 130px 1fr; align-items: center;
+  gap: 8px;
+}
+.hk-export-row-multiline { align-items: start; }
+.hk-export-row-multiline .hk-export-field-label { padding-top: 6px; }
+.hk-export-field-label {
+  color: var(--fg-mid); font-size: 11px;
+}
+.hk-export-row textarea.hk-modal-input {
+  resize: vertical; min-height: 60px;
+  font-family: var(--sans);
+}
+
+.hk-export-logo {
+  display: flex; align-items: stretch; gap: 10px;
+}
+.hk-export-logo-preview {
+  width: 72px; height: 72px; flex: 0 0 72px;
+  background: var(--bg-deep);
+  border: 1px dashed var(--hair);
+  border-radius: 3px;
+  display: grid; place-items: center;
+  overflow: hidden;
+}
+.hk-export-logo-preview img {
+  max-width: 100%; max-height: 100%; object-fit: contain;
+}
+.hk-export-logo-empty {
+  color: var(--fg-dim); font-size: 10px; font-family: var(--mono);
+  text-align: center;
+}
+.hk-export-logo-btns {
+  display: flex; flex-direction: column; gap: 6px; justify-content: center;
+}
+.hk-export-logo-btns .hk-modal-btn {
+  min-width: 110px;
+}
+.hk-export-logo-btns .hk-modal-btn:disabled {
+  opacity: 0.4; cursor: not-allowed;
+}
+
+.hk-export-info {
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-left: 3px solid var(--accent);
+  border-radius: 3px;
+  padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.hk-export-info-line {
+  color: var(--fg-mid); font-size: 11.5px; line-height: 1.5;
+}
+.hk-export-info-line:first-child {
+  color: var(--fg);
+}
+
+/* Company-data summary in the export dialog. Single row: summary text on
+   the left, "Bearbeiten…" button on the right — a direct shortcut into the
+   Firmeneinstellungen modal so users can fix a missing logo without leaving. */
+.hk-export-company-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+}
+.hk-export-company-summary {
+  flex: 1;
+  color: var(--fg-mid); font-size: 11.5px;
+  font-family: var(--mono); letter-spacing: 0.2px;
+}
+
+/* Firmeneinstellungen modal — same width class as the export dialog so the
+   two feel like part of the same workflow. */
+.hk-modal.hk-modal-company {
+  min-width: 420px; max-width: 460px; width: 90vw;
+}
+.hk-modal.hk-modal-company .hk-export-body {
+  gap: 10px; max-height: calc(86vh - 140px);
+}
+
+/* Help dialogs: Tastenkürzel-Übersicht grid + Über HektikCad panel. */
+.hk-modal.hk-modal-help {
+  min-width: 520px; max-width: 640px; width: 92vw; max-height: 86vh;
+}
+.hk-modal.hk-modal-help .hk-help-body {
+  gap: 14px; overflow-y: auto; max-height: calc(86vh - 110px);
+}
+.hk-help-section {
+  display: flex; flex-direction: column; gap: 4px;
+}
+.hk-help-table {
+  display: flex; flex-direction: column; gap: 1px;
+}
+.hk-help-row {
+  display: grid; grid-template-columns: 160px 1fr;
+  gap: 12px; padding: 3px 6px; border-radius: 2px;
+  font-size: 12px;
+}
+.hk-help-row:hover { background: var(--panel-2); }
+.hk-help-kbd {
+  color: var(--accent);
+  font-family: var(--mono); font-size: 11px;
+  letter-spacing: 0.3px;
+  font-feature-settings: var(--num-feat);
+}
+.hk-help-desc { color: var(--fg-mid); }
+.hk-modal.hk-modal-about { min-width: 360px; max-width: 460px; }
+
+/* ─── Inline canvas text editor ──────────────────────────────────────
+   A floating pill toolbar sits above a dashed-border textarea; together
+   they ARE the frame — visually matching the on-canvas frame grips so the
+   user doesn't relearn an interface to place vs. edit text. */
+.hk-inlinetext {
+  position: absolute;
+  z-index: 200;
+  pointer-events: auto;
+}
+
+.hk-inlinetext-toolbar {
+  display: inline-flex; align-items: center; gap: 6px;
+  width: fit-content;
+  padding: 3px 8px 3px 9px;
+  margin-bottom: 4px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  font-family: var(--sans);
+  color: var(--fg-mid);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  user-select: none;
+}
+
+.hk-inlinetext-label {
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.5px;
+}
+
+.hk-inlinetext-size {
+  width: 44px;
+  padding: 1px 4px;
+  background: var(--bg-deep);
+  color: var(--fg);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-align: right;
+  outline: none;
+  -moz-appearance: textfield;
+}
+.hk-inlinetext-size:focus {
+  border-color: var(--sel, #67c1ff);
+}
+/* Hide native spin buttons — users nudge via Ctrl+↑/↓ or direct typing. */
+.hk-inlinetext-size::-webkit-inner-spin-button,
+.hk-inlinetext-size::-webkit-outer-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
+
+.hk-inlinetext-unit {
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.5px;
+}
+
+.hk-inlinetext-divider {
+  width: 1px; height: 12px;
+  background: var(--hair);
+  margin: 0 2px;
+}
+
+.hk-inlinetext-hint {
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.2px;
+}
+
+.hk-inlinetext-area {
+  display: block;
+  margin: 0;
+  padding: 0;
+  background: color-mix(in oklab, var(--bg) 78%, transparent);
+  color: var(--fg);
+  /* Must match the canvas renderer (see render.ts drawText). */
+  font-family: "Inter", system-ui, sans-serif;
+  /* Dashed accent-coloured border = the frame. Same colour family as the
+     on-canvas corner grips for visual continuity. */
+  border: 1.5px dashed var(--sel, #67c1ff);
+  border-radius: 2px;
+  resize: none;
+  outline: none;
+  overflow: hidden;
+  box-sizing: content-box;
+}
+.hk-inlinetext-area::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.55;
+}
+.hk-inlinetext-area:focus {
+  background: color-mix(in oklab, var(--bg) 88%, transparent);
+}
 
 /* ════════════════════════════════════════════════════════════════
    SIDEBAR
@@ -493,11 +1496,11 @@ canvas { position: absolute; inset: 0; display: block; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-.layer-vis, .layer-lock-btn, .layer-move-btn {
+.layer-vis, .layer-lock-btn, .layer-move-btn, .layer-del-btn {
   width: 22px; height: 22px; display: grid; place-items: center;
   color: var(--fg-dim); border-radius: 3px; flex-shrink: 0;
 }
-.layer-vis svg, .layer-lock-btn svg, .layer-move-btn svg {
+.layer-vis svg, .layer-lock-btn svg, .layer-move-btn svg, .layer-del-btn svg {
   width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 1.5;
   stroke-linecap: round; stroke-linejoin: round;
 }
@@ -508,8 +1511,68 @@ canvas { position: absolute; inset: 0; display: block; }
   color: var(--fg);
   background: color-mix(in oklab, var(--guides) 18%, transparent);
 }
+.layer-del-btn:hover {
+  color: var(--modify);
+  background: color-mix(in oklab, var(--modify) 18%, transparent);
+}
 .layer-row.hidden .layer-name, .layer-row.hidden .swatch { opacity: 0.35; }
 .layer-row.hidden .layer-vis { color: var(--fg-faint); }
+
+/* Linetype picker (per-layer) */
+.layer-linestyle-btn {
+  display: grid; place-items: center; flex-shrink: 0;
+  width: 60px; height: 20px; padding: 0 2px;
+  background: var(--panel-2); border: 1px solid var(--panel-3); border-radius: 3px;
+  cursor: pointer; transition: border-color 80ms, background 80ms;
+}
+.layer-linestyle-btn:hover { border-color: var(--fg-dim); background: var(--panel-3); }
+.layer-linestyle-btn:disabled { cursor: default; opacity: 0.5; }
+.layer-linestyle-btn .linestyle-preview { display: block; }
+.layer-row.locked .layer-linestyle-btn { cursor: default; }
+
+.linestyle-popover {
+  position: fixed; z-index: 200;
+  width: 260px;
+  /* Opaque background — the popover often covers the snap toolbar (z:20) and
+   * tool palettes; without a solid fill their text bleeds through. There is
+   * no --panel-1 token, only --panel / --panel-2 / --panel-3. `--panel` is the
+   * darkest surface and matches the menu-dropdown style elsewhere. */
+  background: var(--panel); border: 1px solid var(--panel-3); border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  padding: 6px;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.linestyle-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 5px 8px; border-radius: 3px;
+  background: transparent; border: none; color: var(--fg);
+  cursor: pointer; text-align: left;
+  font: inherit; font-size: 12px;
+}
+.linestyle-item:hover { background: var(--panel-2); }
+.linestyle-item.active {
+  background: color-mix(in oklab, var(--sel) 14%, transparent);
+}
+.linestyle-item .linestyle-preview { flex-shrink: 0; }
+.linestyle-item-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.linestyle-item-label.active { color: var(--sel); font-weight: 500; }
+
+.linestyle-custom {
+  margin-top: 4px; padding: 6px 8px 4px;
+  border-top: 1px solid var(--panel-3);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.linestyle-custom-input {
+  background: var(--panel-2); border: 1px solid var(--panel-3); border-radius: 3px;
+  color: var(--fg); padding: 4px 6px; font: inherit; font-size: 12px;
+  outline: none;
+}
+.linestyle-custom-input:focus { border-color: var(--sel); }
 
 /* Panel empty state */
 .panel-empty {
@@ -520,6 +1583,138 @@ canvas { position: absolute; inset: 0; display: block; }
   background: var(--bg-deep);
   border-radius: 0 2px 2px 0;
 }
+
+/* ─── Properties panel ──────────────────────────────────────────── */
+/* Shown in the sidebar under "Eigenschaften". Renders an editor for the
+ * currently selected entity (hatch/fill get full controls; others fall back
+ * to a placeholder line). Layout is a compact 2-column grid — label left,
+ * field right — matching the param rows. */
+
+.props-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px 6px; gap: 8px;
+  border-bottom: 1px solid var(--hair);
+}
+.props-title {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
+  color: var(--fg); text-transform: uppercase;
+}
+.props-layer-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 10.5px; color: var(--fg-mid);
+  background: var(--bg-deep); border: 1px solid var(--hair);
+  padding: 2px 7px; border-radius: 10px;
+}
+.props-layer-sw {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  border: 1px solid var(--hair);
+}
+
+.props-body {
+  padding: 6px 10px 10px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+
+.props-row {
+  display: grid;
+  grid-template-columns: 68px 1fr;
+  align-items: center; gap: 8px;
+  font-size: 11.5px;
+  min-height: 24px;
+}
+.props-label {
+  color: var(--fg-dim); font-size: 11px;
+  user-select: none;
+}
+.props-field {
+  display: flex; align-items: center; gap: 6px;
+  min-width: 0;
+}
+.props-num {
+  flex: 1; min-width: 0;
+  background: var(--bg-deep); color: var(--fg);
+  border: 1px solid var(--hair); padding: 3px 6px;
+  border-radius: 2px; font-family: var(--mono); font-size: 11px;
+  font-feature-settings: var(--num-feat);
+}
+.props-num:focus { outline: none; border-color: var(--accent); }
+.props-num:disabled { opacity: 0.4; cursor: not-allowed; }
+.props-unit {
+  color: var(--fg-dim); font-size: 10.5px; font-family: var(--mono);
+  min-width: 18px;
+}
+
+.props-seg {
+  display: flex; background: var(--bg-deep);
+  border: 1px solid var(--hair); border-radius: 3px;
+  overflow: hidden;
+  flex: 1;
+}
+.props-seg-btn {
+  flex: 1; background: transparent; border: 0;
+  color: var(--fg-mid); font-size: 10.5px; font-weight: 500;
+  padding: 4px 2px; cursor: pointer;
+  transition: background 100ms, color 100ms;
+}
+.props-seg-btn:hover { background: var(--panel-2); color: var(--fg); }
+.props-seg-btn.active {
+  background: color-mix(in oklab, var(--accent) 28%, var(--bg-deep));
+  color: var(--fg);
+}
+.props-seg-btn + .props-seg-btn { border-left: 1px solid var(--hair); }
+
+.props-color-wrap {
+  display: flex; align-items: center; gap: 8px; flex: 1;
+}
+.props-color {
+  width: 28px; height: 20px; padding: 0;
+  border: 1px solid var(--hair); border-radius: 2px;
+  background: var(--bg-deep); cursor: pointer;
+}
+.props-color:disabled { opacity: 0.4; cursor: not-allowed; }
+.props-checkbox-lbl {
+  font-size: 11px; color: var(--fg-mid); cursor: pointer;
+  user-select: none;
+}
+.props-color-wrap input[type="checkbox"] {
+  accent-color: var(--accent); cursor: pointer; margin: 0;
+}
+
+.props-info {
+  padding: 6px 0 0;
+  font-size: 10.5px; color: var(--fg-dim);
+  border-top: 1px solid var(--hair);
+  margin-top: 4px;
+}
+
+/* Tiny inline label between paired inputs (e.g. "X ____ Y ____"). */
+.props-mini-lbl {
+  color: var(--fg-dim); font-size: 10px; font-family: var(--mono);
+  min-width: 10px;
+}
+
+/* Read-only "(verknüpft)" coord display for parametric PointRefs. */
+.props-ref-info {
+  flex: 1; min-width: 0;
+  color: var(--fg-dim); font-size: 10.5px; font-family: var(--mono);
+  font-feature-settings: var(--num-feat);
+  font-style: italic;
+}
+
+/* Multi-line text rows (textarea spans full width under its label). */
+.props-row-stack {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+  gap: 4px;
+}
+.props-textarea {
+  width: 100%; box-sizing: border-box;
+  background: var(--bg-deep); color: var(--fg);
+  border: 1px solid var(--hair); border-radius: 2px;
+  padding: 4px 6px; font-family: var(--mono); font-size: 11px;
+  resize: vertical; min-height: 36px;
+}
+.props-textarea:focus { outline: none; border-color: var(--accent); }
 
 /* ─── Mini button ───────────────────────────────────────────────── */
 .mini-btn {
@@ -593,12 +1788,8 @@ canvas { position: absolute; inset: 0; display: block; }
   background: color-mix(in oklab, var(--modify) 12%, transparent);
 }
 
-/* Stats (Info section) */
-#stats {
-  padding: 10px 14px; color: var(--fg-dim); font-size: 11px;
-  font-family: var(--mono);
-  font-feature-settings: var(--num-feat);
-}
+/* Objektzahl in der Statusleiste — inherits the `.stat` chip layout from
+   #statusbar, so no padding/flex overrides needed here. */
 
 /* ─── Timeline ──────────────────────────────────────────────────── */
 .feat-row {
@@ -616,6 +1807,8 @@ canvas { position: absolute; inset: 0; display: block; }
 
 .feat-row:hover { background: var(--panel-2); }
 .feat-row.active { background: color-mix(in oklab, var(--sel) 10%, transparent); }
+.feat-row.hidden-feat { opacity: 0.45; font-style: italic; cursor: pointer; }
+.feat-row.hidden-feat:hover { opacity: 0.75; }
 
 .feat-dot {
   width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
@@ -698,6 +1891,42 @@ canvas { position: absolute; inset: 0; display: block; }
 .cmd-field-input:focus { border-color: var(--draw); }
 .cmd-field-input.cmd-field-invalid { border-color: var(--modify); }
 
+/* Variable / parameter autocomplete dropdown for cmdbar expr fields. */
+.cmd-suggest {
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+  padding: 2px 0;
+  max-height: 220px;
+  overflow-y: auto;
+  font: 500 12px var(--mono);
+  color: var(--fg);
+  font-feature-settings: var(--num-feat);
+}
+.cmd-suggest-row {
+  display: flex; align-items: baseline; gap: 0;
+  padding: 3px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cmd-suggest-row:hover,
+.cmd-suggest-row.active {
+  background: var(--panel-2);
+}
+.cmd-suggest-name { color: var(--fg); font-weight: 600; }
+.cmd-suggest-val { color: var(--fg-dim); font-size: 11px; }
+.cmd-suggest-meaning {
+  color: var(--fg-dim);
+  font-family: var(--sans);
+  font-weight: 400;
+  font-size: 11px;
+  margin-left: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
 #st-tip {
   color: var(--fg-dim); font-size: 11px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -754,12 +1983,6 @@ canvas { position: absolute; inset: 0; display: block; }
 /* ════════════════════════════════════════════════════════════════
    THEME POPOVER
    ════════════════════════════════════════════════════════════════ */
-#btn-theme { display: inline-flex; align-items: center; gap: 6px; }
-#btn-theme.active {
-  color: var(--accent);
-  background: color-mix(in oklab, var(--accent) 14%, transparent);
-  border-color: color-mix(in oklab, var(--accent) 30%, transparent);
-}
 .theme-popover {
   position: fixed; z-index: 100;
   min-width: 280px; max-width: 320px;
@@ -768,6 +1991,7 @@ canvas { position: absolute; inset: 0; display: block; }
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
   display: flex; flex-direction: column; gap: 10px;
 }
+.theme-popover[hidden] { display: none !important; }
 .theme-section-label {
   font-size: 9.5px; letter-spacing: 1.4px; text-transform: uppercase;
   color: var(--fg-dim); margin-top: 2px;
@@ -835,7 +2059,7 @@ canvas { position: absolute; inset: 0; display: block; }
 #st-pos .st-dim, #st-sel .st-dim { color: var(--fg-dim); }
 
 .hdr-btn, .mini-btn, .side-section-header, .menu-item,
-.snap-ob-btn, .vc-btn, .layer-vis, .layer-lock-btn, .layer-move-btn,
+.snap-ob-btn, .vc-btn, .layer-vis, .layer-lock-btn, .layer-move-btn, .layer-del-btn,
 .dim-style-btn, .theme-preset-tile, .theme-color-reset {
   transition: background 140ms, color 140ms, border-color 140ms, opacity 140ms;
 }

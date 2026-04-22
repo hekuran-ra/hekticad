@@ -1,9 +1,10 @@
 import type {
-  DimEntity, EllipseEntity, Entity, LineEntity, PolylineEntity, Pt, RectEntity,
-  SplineEntity, TextEntity, XLineEntity,
+  DimEntity, EllipseEntity, Entity, HatchEntity, LineEntity, PolylineEntity, Pt,
+  RectEntity, SplineEntity, TextEntity, XLineEntity,
 } from './types';
-import { state } from './state';
+import { runtime, state } from './state';
 import { dot, len, norm, scale, sub } from './math';
+import { layoutText } from './textlayout';
 
 export function distPtSeg(p: Pt, a: Pt, b: Pt): number {
   const ab = sub(b, a);
@@ -57,6 +58,8 @@ function hitArc(p: Pt, e: { cx: number; cy: number; r: number; a1: number; a2: n
 }
 
 function hitDim(p: Pt, e: DimEntity, tol: number): boolean {
+  if (e.dimKind === 'angular') return hitAngularDim(p, e, tol);
+  if (e.dimKind === 'radius' || e.dimKind === 'diameter') return hitRadialDim(p, e, tol);
   const dx = e.p2.x - e.p1.x, dy = e.p2.y - e.p1.y;
   const L = Math.hypot(dx, dy);
   if (L < 1e-9) return false;
@@ -64,20 +67,107 @@ function hitDim(p: Pt, e: DimEntity, tol: number): boolean {
   const sd = (e.offset.x - e.p1.x) * nx + (e.offset.y - e.p1.y) * ny;
   const a = { x: e.p1.x + nx * sd, y: e.p1.y + ny * sd };
   const b = { x: e.p2.x + nx * sd, y: e.p2.y + ny * sd };
-  return distPtSeg(p, a, b) < tol;
+  // 1) The dim line itself.
+  if (distPtSeg(p, a, b) < tol) return true;
+  // 2) The two extension lines (measurement point → dim line endpoint). Users
+  //    routinely click near the extension when a dim is crowded against other
+  //    geometry, so hitting these counts as selecting the dim.
+  if (distPtSeg(p, e.p1, a) < tol) return true;
+  if (distPtSeg(p, e.p2, b) < tol) return true;
+  // 3) The label — a band centered on the midpoint of (a,b), oriented along
+  //    the dim. Size is approximate: along-axis ≈ 4 × textHeight (covers a
+  //    typical number like "123.45"), perp-axis ≈ textHeight. Tolerance is
+  //    added so clicks just next to the text also register.
+  const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  const ux = dx / L, uy = dy / L;
+  const along  = (p.x - mid.x) * ux + (p.y - mid.y) * uy;
+  const across = (p.x - mid.x) * nx + (p.y - mid.y) * ny;
+  const halfAlong  = Math.min(L, e.textHeight * 4) / 2 + tol;
+  const halfAcross = e.textHeight + tol;
+  if (Math.abs(along) <= halfAlong && Math.abs(across) <= halfAcross) return true;
+  return false;
+}
+
+/**
+ * Angular dim hit test: click counts when it lands on the arc, near the label,
+ * or on the extension lines from vertex along either ray up to the arc.
+ */
+function hitAngularDim(p: Pt, e: DimEntity, tol: number): boolean {
+  const V = e.vertex, r1 = e.ray1, r2 = e.ray2;
+  if (!V || !r1 || !r2) return false;
+  const dOx = e.offset.x - V.x, dOy = e.offset.y - V.y;
+  const R = Math.hypot(dOx, dOy);
+  if (R < 1e-9) return false;
+  const d1x = r1.x - V.x, d1y = r1.y - V.y;
+  const d2x = r2.x - V.x, d2y = r2.y - V.y;
+  if (Math.hypot(d1x, d1y) < 1e-9 || Math.hypot(d2x, d2y) < 1e-9) return false;
+
+  const TAU = Math.PI * 2;
+  const norm2pi = (x: number) => ((x % TAU) + TAU) % TAU;
+  const a1 = Math.atan2(d1y, d1x);
+  const a2 = Math.atan2(d2y, d2x);
+  const aO = Math.atan2(dOy, dOx);
+  const sweep12 = norm2pi(a2 - a1);
+  const sweep1O = norm2pi(aO - a1);
+  const [aS, aE] = (sweep1O <= sweep12 + 1e-9) ? [a1, a2] : [a2, a1];
+  const sweep = norm2pi(aE - aS) || TAU;
+
+  const dx = p.x - V.x, dy = p.y - V.y;
+  const rP = Math.hypot(dx, dy);
+
+  // Arc body.
+  if (Math.abs(rP - R) <= tol) {
+    const aP = Math.atan2(dy, dx);
+    const dP = norm2pi(aP - aS);
+    if (dP <= sweep + 1e-9) return true;
+  }
+  // Label band around arc midpoint.
+  const aM = aS + sweep / 2;
+  const mx = V.x + R * Math.cos(aM), my = V.y + R * Math.sin(aM);
+  if (Math.hypot(p.x - mx, p.y - my) <= e.textHeight * 2 + tol) return true;
+  return false;
+}
+
+/**
+ * Radial dim hit test: click counts on the leader line (near-edge → anchor for
+ * radius, or far-edge → anchor for diameter), on the caps, or near the label
+ * at the anchor.
+ */
+function hitRadialDim(p: Pt, e: DimEntity, tol: number): boolean {
+  const C = e.vertex, E = e.ray1;
+  if (!C || !E) return false;
+  const r = Math.hypot(E.x - C.x, E.y - C.y);
+  if (r < 1e-9) return false;
+  let ux = e.offset.x - C.x, uy = e.offset.y - C.y;
+  let ul = Math.hypot(ux, uy);
+  if (ul < 1e-9) { ux = E.x - C.x; uy = E.y - C.y; ul = r; }
+  ux /= ul; uy /= ul;
+  const near: Pt = { x: C.x + ux * r, y: C.y + uy * r };
+  const far:  Pt = { x: C.x - ux * r, y: C.y - uy * r };
+  // Leader hit.
+  if (e.dimKind === 'diameter') {
+    if (distPtSeg(p, far, e.offset) < tol) return true;
+  } else {
+    if (distPtSeg(p, near, e.offset) < tol) return true;
+  }
+  // Label band around the anchor.
+  const dx = p.x - e.offset.x, dy = p.y - e.offset.y;
+  if (Math.hypot(dx, dy) <= e.textHeight * 2 + tol) return true;
+  return false;
 }
 
 function hitText(p: Pt, e: TextEntity, tol: number): boolean {
-  // Unrotated bbox approximation. Rotated text uses axis-aligned approx of the
-  // rotated box — good enough for picking, since text is usually axis-aligned.
-  const w = Math.max(e.height * 0.3, e.height * e.text.length * 0.6);
-  const h = e.height;
+  // Inverse-rotate the hit point into the text's local frame, then do an
+  // axis-aligned box check against the laid-out block. Multi-line Grafiktext
+  // and wrapped Rahmentext both fall out of the shared layout helper.
   const rot = e.rotation ?? 0;
   const c = Math.cos(-rot), s = Math.sin(-rot);
   const dx = p.x - e.x, dy = p.y - e.y;
-  const lx = dx * c - dy * s;
-  const ly = dx * s + dy * c;
-  return lx >= -tol && lx <= w + tol && ly >= -tol && ly <= h + tol;
+  const lx = e.x + (dx * c - dy * s);
+  const ly = e.y + (dx * s + dy * c);
+  const layout = layoutText(e);
+  return lx >= layout.minX - tol && lx <= layout.maxX + tol
+      && ly >= layout.minY - tol && ly <= layout.maxY + tol;
 }
 
 /**
@@ -153,6 +243,93 @@ function hitPolyline(p: Pt, e: PolylineEntity, tol: number): boolean {
   return false;
 }
 
+/**
+ * Hatch hit-test. A click anywhere inside the boundary polygon hits —
+ * hatches are 2D regions, not 1D outlines, so "close to an edge" is too
+ * narrow a target. Uses even-odd ray casting on the boundary.
+ */
+function hitHatch(p: Pt, e: HatchEntity, _tol: number): boolean {
+  const inPoly = (pts: Pt[]): boolean => {
+    if (pts.length < 3) return false;
+    let inside = false;
+    const n = pts.length;
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+      const xi = pts[i].x, yi = pts[i].y;
+      const xj = pts[j].x, yj = pts[j].y;
+      const intersect = ((yi > p.y) !== (yj > p.y)) &&
+        (p.x < ((xj - xi) * (p.y - yi)) / ((yj - yi) || 1e-12) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  };
+  if (!inPoly(e.pts)) return false;
+  // Inside the outer boundary — but if the point falls in any hole, it's
+  // outside the actual hatched region.
+  if (e.holes) {
+    for (const h of e.holes) {
+      if (inPoly(h)) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Bbox pre-reject: cursor-box must overlap entity-box. Cheap compared to the
+ * sampling-based hit tests for ellipse/spline/polyline — a single compare per
+ * bound on entities the cursor isn't even near. Skipped for xlines (infinite)
+ * and lines (already O(1) check).
+ */
+function bboxReject(worldPt: Pt, e: Entity, t: number): boolean {
+  let minX: number, minY: number, maxX: number, maxY: number;
+  switch (e.type) {
+    case 'rect':
+      minX = Math.min(e.x1, e.x2); maxX = Math.max(e.x1, e.x2);
+      minY = Math.min(e.y1, e.y2); maxY = Math.max(e.y1, e.y2);
+      break;
+    case 'circle': case 'arc':
+      minX = e.cx - e.r; maxX = e.cx + e.r;
+      minY = e.cy - e.r; maxY = e.cy + e.r;
+      break;
+    case 'ellipse': {
+      const c = Math.cos(e.rot), s = Math.sin(e.rot);
+      const hx = Math.sqrt((e.rx * c) ** 2 + (e.ry * s) ** 2);
+      const hy = Math.sqrt((e.rx * s) ** 2 + (e.ry * c) ** 2);
+      minX = e.cx - hx; maxX = e.cx + hx;
+      minY = e.cy - hy; maxY = e.cy + hy;
+      break;
+    }
+    case 'polyline': case 'spline': case 'hatch': {
+      if (!e.pts.length) return true;
+      minX = Infinity; minY = Infinity; maxX = -Infinity; maxY = -Infinity;
+      for (const p of e.pts) {
+        if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
+      }
+      break;
+    }
+    case 'dim': {
+      minX = Math.min(e.p1.x, e.p2.x, e.offset.x);
+      maxX = Math.max(e.p1.x, e.p2.x, e.offset.x);
+      minY = Math.min(e.p1.y, e.p2.y, e.offset.y);
+      maxY = Math.max(e.p1.y, e.p2.y, e.offset.y);
+      // Diameter dims also extend to the far edge (centre − (anchor−centre)/r).
+      // Be safe: include the whole radius-sized circle around the centre.
+      if (e.dimKind === 'diameter' && e.vertex && e.ray1) {
+        const r = Math.hypot(e.ray1.x - e.vertex.x, e.ray1.y - e.vertex.y);
+        minX = Math.min(minX, e.vertex.x - r);
+        maxX = Math.max(maxX, e.vertex.x + r);
+        minY = Math.min(minY, e.vertex.y - r);
+        maxY = Math.max(maxY, e.vertex.y + r);
+      }
+      break;
+    }
+    default:
+      return false;
+  }
+  return worldPt.x < minX - t || worldPt.x > maxX + t
+      || worldPt.y < minY - t || worldPt.y > maxY + t;
+}
+
 export function hitTest(worldPt: Pt, tol?: number, includeLocked = false): Entity | null {
   const t = tol ?? 6 / state.view.scale;
   for (let i = state.entities.length - 1; i >= 0; i--) {
@@ -160,6 +337,8 @@ export function hitTest(worldPt: Pt, tol?: number, includeLocked = false): Entit
     const layer = state.layers[e.layer];
     if (!layer || !layer.visible) continue;
     if (!includeLocked && layer.locked) continue;
+    // Cheap bbox reject for bounded types before hitting the expensive samplers.
+    if (bboxReject(worldPt, e, t)) continue;
     if (e.type === 'line'     && hitLine(worldPt, e, t))     return e;
     if (e.type === 'xline'    && distPtXLine(worldPt, e) < t) return e;
     if (e.type === 'rect'     && hitRect(worldPt, e, t))     return e;
@@ -170,6 +349,7 @@ export function hitTest(worldPt: Pt, tol?: number, includeLocked = false): Entit
     if (e.type === 'polyline' && hitPolyline(worldPt, e, t)) return e;
     if (e.type === 'text'     && hitText(worldPt, e, t))     return e;
     if (e.type === 'dim'      && hitDim(worldPt, e, t))      return e;
+    if (e.type === 'hatch'    && hitHatch(worldPt, e, t))    return e;
   }
   return null;
 }
@@ -214,7 +394,6 @@ export function nearestPolySegment(poly: PolylineEntity, pt: Pt): { a: Pt; b: Pt
 export function pickReference(worldPt: Pt):
   | { entity: Entity | { _axis: 'x' | 'y' }; dir: Pt; base: Pt }
   | null {
-  // Include locked layers so the origin axis xlines can be used as references.
   const hit = hitTest(worldPt, undefined, true);
   if (hit) {
     if (hit.type === 'line') {
@@ -231,6 +410,25 @@ export function pickReference(worldPt: Pt):
     if (hit.type === 'polyline') {
       const seg = nearestPolySegment(hit, worldPt);
       if (seg) return { entity: hit, dir: norm(sub(seg.b, seg.a)), base: seg.a };
+    }
+  }
+
+  // Fallback: virtual origin axes. The axes are no longer stored as entities
+  // (they're rendered directly by the viewport), so `hitTest` can't find them.
+  // Tools that want "eine Linie, Achse, …" must still be able to pick them as
+  // a reference — check distance to the X and Y axes in screen pixels and
+  // synthesize a virtual reference. Only offered when the axes are actually
+  // visible — picking an invisible reference would be confusing.
+  if (runtime.snapSettings.showAxes) {
+    // 8 px tolerance, independent of zoom.
+    const tolWorld = 8 / state.view.scale;
+    const dX = Math.abs(worldPt.y);  // distance to X-axis (y = 0)
+    const dY = Math.abs(worldPt.x);  // distance to Y-axis (x = 0)
+    if (dX < tolWorld && dX <= dY) {
+      return { entity: { _axis: 'x' }, dir: { x: 1, y: 0 }, base: { x: 0, y: 0 } };
+    }
+    if (dY < tolWorld) {
+      return { entity: { _axis: 'y' }, dir: { x: 0, y: 1 }, base: { x: 0, y: 0 } };
     }
   }
   return null;

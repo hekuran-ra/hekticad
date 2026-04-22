@@ -10,21 +10,24 @@
  *   commit()        → may call setPrompt again for the next step
  */
 
-import type { Expr, Feature, Pt, ToolCtx, ToolId } from './types';
+import type { Expr, Feature, PointRef, Pt, ToolCtx, ToolId } from './types';
 import { state, runtime } from './state';
 import { dom } from './dom';
 import { add, directionAtAngle, dot, len, norm, perp, perpOffset, scale, sub } from './math';
 import {
-  addEntity, applyChamfer, applyGroupOffsetAt, applyRotate, applyScale,
-  finishPolyline, finishSpline, getFilletRadius, getPolygonSides, handleClick,
-  handlePolylineClick, makeParallelXLine, makeXLineThrough, setChamferDist,
-  setFilletRadius, setPolygonSides, setTextHeight, cancelTool,
+  addEntity, applyGroupOffsetAt, applyLineOffsetAt, applyRotate, applyScale,
+  applyStretchTarget, commitArcBulge, commitRectAsLines,
+  commitRectAsLinesExpr, crossMirrorPrompt, finishPolyline, finishSpline,
+  getPolygonSides, handleClick, handlePolylineClick, makeAxisParallelXLine,
+  makeParallelXLine, makeXLineThroughRef, promptDivideCount,
+  setPolygonSides, cancelTool,
 } from './tools';
 import { createParameter, evalExpr, findParamByName, parseExprInput } from './params';
 import { evaluateTimeline, newFeatureId } from './features';
 import { pushUndo } from './undo';
 import { requestRender as render } from './render';
 import { toast, updateSelStatus, updateStats } from './ui';
+import { showPrompt } from './modal';
 
 const numE = (v: number): Expr => ({ kind: 'num', value: v });
 
@@ -93,6 +96,7 @@ export function rebuildCmdBar(promptFallback: string): void {
   const schema = schemaFor(state.tool, runtime.toolCtx ?? null);
   currentSchema = schema;
   fieldValues = {};
+  hideSuggestions();
   const label = (schema?.prompt ?? promptFallback) + ':';
   dom.cmdPrompt.textContent = label;
   dom.cmdFields.innerHTML = '';
@@ -158,7 +162,7 @@ function markInvalid(inp: HTMLInputElement): void {
   setTimeout(() => inp.classList.remove('cmd-field-invalid'), 600);
 }
 
-function parseField(inp: HTMLInputElement): boolean {
+async function parseField(inp: HTMLInputElement): Promise<boolean> {
   const name = inp.dataset.fieldName!;
   const kind = inp.dataset.fieldKind as CmdFieldKind;
   const hint = inp.dataset.meaningHint;
@@ -182,16 +186,213 @@ function parseField(inp: HTMLInputElement): boolean {
     fieldValues[name] = { expr: numE(n), value: n };
     return true;
   }
-  // expr: number or parameter name
-  const r = parseValueInput(raw, hint);
+  // expr: number or parameter name — async because unknown-ident dialogs are modal.
+  const r = await parseValueInput(raw, hint);
   if (!r) { toast('Eingabe nicht erkannt'); markInvalid(inp); return false; }
   fieldValues[name] = r;
   return true;
 }
 
+// ============================================================================
+// Variable / parameter autocomplete
+// ============================================================================
+//
+// When the user types an identifier-like prefix into an `expr`-kind field, pop
+// a floating list of matching parameter names underneath. Arrow keys walk the
+// list; Enter (with a highlighted suggestion) inserts it into the field
+// instead of committing the field. This makes "use a variable" discoverable —
+// users no longer need to remember exactly what they named it.
+
+/** Is the character typeable as part of a parameter identifier? */
+function isIdentChar(c: string): boolean {
+  return /[A-Za-z0-9_]/.test(c);
+}
+
+/**
+ * Extract the identifier token the caret is currently sitting in (or on the
+ * right edge of). Returns `{ token, start }` where `start` is the index the
+ * token begins at, used to replace it on accept. Returns null if the caret
+ * isn't next to an identifier (e.g. right after an operator / space).
+ */
+function identTokenAtCaret(inp: HTMLInputElement): { token: string; start: number } | null {
+  const caret = inp.selectionStart ?? inp.value.length;
+  const v = inp.value;
+  let start = caret;
+  while (start > 0 && isIdentChar(v[start - 1])) start--;
+  let end = caret;
+  while (end < v.length && isIdentChar(v[end])) end++;
+  const token = v.slice(start, end);
+  // Don't suggest for purely numeric tokens — they're just numbers.
+  if (!token || /^\d+(\.\d*)?$/.test(token)) return null;
+  return { token, start };
+}
+
+/** DOM for the dropdown. Built lazily and reused. */
+let suggestionBox: HTMLDivElement | null = null;
+let activeSuggestions: Array<{ name: string; value: number; meaning?: string }> = [];
+let suggestionIndex = -1;
+let suggestionFor: HTMLInputElement | null = null;
+
+function ensureSuggestionBox(): HTMLDivElement {
+  if (suggestionBox) return suggestionBox;
+  const box = document.createElement('div');
+  box.className = 'cmd-suggest';
+  box.style.position = 'absolute';
+  box.style.display = 'none';
+  box.style.zIndex = '50';
+  document.body.appendChild(box);
+  box.addEventListener('mousedown', (e) => {
+    // Prevent input blur on click; accept the clicked suggestion.
+    e.preventDefault();
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const idx = Number(target.dataset.idx);
+    if (Number.isInteger(idx) && suggestionFor) {
+      acceptSuggestion(suggestionFor, idx);
+    }
+  });
+  suggestionBox = box;
+  return box;
+}
+
+function hideSuggestions(): void {
+  if (suggestionBox) suggestionBox.style.display = 'none';
+  activeSuggestions = [];
+  suggestionIndex = -1;
+  suggestionFor = null;
+}
+
+function renderSuggestions(inp: HTMLInputElement): void {
+  const box = ensureSuggestionBox();
+  if (!activeSuggestions.length) { hideSuggestions(); return; }
+  const rect = inp.getBoundingClientRect();
+  box.style.left = `${rect.left}px`;
+  box.style.top = `${rect.bottom + 2}px`;
+  box.style.minWidth = `${rect.width}px`;
+  box.innerHTML = '';
+  for (let i = 0; i < activeSuggestions.length; i++) {
+    const s = activeSuggestions[i];
+    const row = document.createElement('div');
+    row.className = 'cmd-suggest-row' + (i === suggestionIndex ? ' active' : '');
+    row.dataset.idx = String(i);
+    const name = document.createElement('span');
+    name.className = 'cmd-suggest-name';
+    name.textContent = s.name;
+    const val = document.createElement('span');
+    val.className = 'cmd-suggest-val';
+    val.textContent = ` = ${s.value}`;
+    row.append(name, val);
+    if (s.meaning) {
+      const m = document.createElement('span');
+      m.className = 'cmd-suggest-meaning';
+      m.textContent = ` — ${s.meaning}`;
+      row.append(m);
+    }
+    box.appendChild(row);
+  }
+  box.style.display = 'block';
+  suggestionFor = inp;
+}
+
+function updateSuggestions(inp: HTMLInputElement): void {
+  // Only for expr-kind fields. Angle/integer/text don't accept identifiers.
+  if (inp.dataset.fieldKind !== 'expr') { hideSuggestions(); return; }
+  const tok = identTokenAtCaret(inp);
+  if (!tok) { hideSuggestions(); return; }
+  const q = tok.token.toLowerCase();
+  const matches = state.parameters
+    .filter(p => p.name.toLowerCase().includes(q))
+    // Exact-prefix matches first, then contains-matches. Preserves user intent
+    // when they type the full name (shows it on top) but still surfaces loose
+    // matches when they type e.g. "L" for "BoxLength".
+    .sort((a, b) => {
+      const an = a.name.toLowerCase(), bn = b.name.toLowerCase();
+      const ap = an.startsWith(q) ? 0 : 1;
+      const bp = bn.startsWith(q) ? 0 : 1;
+      if (ap !== bp) return ap - bp;
+      return an.localeCompare(bn);
+    })
+    .slice(0, 8);
+  if (!matches.length || (matches.length === 1 && matches[0].name === tok.token)) {
+    hideSuggestions();
+    return;
+  }
+  activeSuggestions = matches.map(p => ({ name: p.name, value: p.value, meaning: p.meaning }));
+  suggestionIndex = 0;
+  renderSuggestions(inp);
+}
+
+function acceptSuggestion(inp: HTMLInputElement, idx: number): void {
+  if (idx < 0 || idx >= activeSuggestions.length) return;
+  const pick = activeSuggestions[idx];
+  const tok = identTokenAtCaret(inp);
+  if (!tok) return;
+  const v = inp.value;
+  const before = v.slice(0, tok.start);
+  const after = v.slice(tok.start + tok.token.length);
+  inp.value = before + pick.name + after;
+  const caret = (before + pick.name).length;
+  inp.setSelectionRange(caret, caret);
+  hideSuggestions();
+}
+
+dom.cmdFields.addEventListener('input', (e) => {
+  const target = e.target;
+  if (!(target instanceof HTMLInputElement) || !target.classList.contains('cmd-field-input')) return;
+  updateSuggestions(target);
+});
+
+dom.cmdFields.addEventListener('focusin', (e) => {
+  const target = e.target;
+  if (target instanceof HTMLInputElement && target.classList.contains('cmd-field-input')) {
+    updateSuggestions(target);
+  }
+});
+
+dom.cmdFields.addEventListener('focusout', () => {
+  // Defer hiding a tick so a click on a suggestion row can fire first.
+  setTimeout(hideSuggestions, 100);
+});
+
 dom.cmdFields.addEventListener('keydown', (e) => {
   const target = e.target;
   if (!(target instanceof HTMLInputElement) || !target.classList.contains('cmd-field-input')) return;
+
+  // When the suggestion dropdown is visible, arrow keys navigate it and Tab /
+  // Enter accept. Escape also closes it without cancelling the tool.
+  if (activeSuggestions.length && suggestionFor === target) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      suggestionIndex = (suggestionIndex + 1) % activeSuggestions.length;
+      renderSuggestions(target);
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      suggestionIndex = (suggestionIndex - 1 + activeSuggestions.length) % activeSuggestions.length;
+      renderSuggestions(target);
+      return;
+    }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      acceptSuggestion(target, suggestionIndex);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      hideSuggestions();
+      return;
+    }
+    if (e.key === 'Enter') {
+      // Enter on a highlighted suggestion accepts it rather than committing
+      // the field — users expect autocomplete to consume Enter.
+      if (suggestionIndex >= 0) {
+        e.preventDefault();
+        acceptSuggestion(target, suggestionIndex);
+        return;
+      }
+    }
+  }
 
   if (e.key === 'Escape') {
     e.preventDefault();
@@ -218,33 +419,41 @@ dom.cmdFields.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     e.preventDefault();
     if (!currentSchema) return;
-    if (!parseField(target)) return;
-    const inputs = allInputs();
-    const idx = inputs.indexOf(target);
-    const isLast = idx === inputs.length - 1;
-    // Advance to the next empty field unless we're on the last one — OR unless
-    // the schema wants commit-on-Enter (line/polyline: angle-only Enter must
-    // lock immediately, not bounce focus to the length field).
-    if (!isLast && !currentSchema.commitOnEnter) {
-      for (let i = idx + 1; i < inputs.length; i++) {
-        if (!inputs[i].value) { inputs[i].focus(); return; }
+    // parseField is async because it may pop a modal for unknown identifiers.
+    // Guard against the schema changing between await boundaries (cancel / new
+    // tool) by capturing a snapshot and re-checking before commit.
+    const schemaAtStart = currentSchema;
+    void (async () => {
+      const ok = await parseField(target);
+      if (!ok) return;
+      if (currentSchema !== schemaAtStart) return;
+      const inputs = allInputs();
+      const idx = inputs.indexOf(target);
+      const isLast = idx === inputs.length - 1;
+      // Advance to the next empty field unless we're on the last one — OR unless
+      // the schema wants commit-on-Enter (line/polyline: angle-only Enter must
+      // lock immediately, not bounce focus to the length field).
+      if (!isLast && !currentSchema.commitOnEnter) {
+        for (let i = idx + 1; i < inputs.length; i++) {
+          if (!inputs[i].value) { inputs[i].focus(); return; }
+        }
+        // All later fields already filled → commit (fall through).
       }
-      // All later fields already filled → commit (fall through).
-    }
-    // Before committing, ensure all required fields are filled.
-    const firstMissing = inputs.find(inp => {
-      const fname = inp.dataset.fieldName!;
-      const field = currentSchema!.fields.find(f => f.name === fname);
-      return (field?.required !== false) && fieldValues[fname] === undefined;
-    });
-    if (firstMissing) {
-      markInvalid(firstMissing);
-      firstMissing.focus();
-      return;
-    }
-    const schema = currentSchema;
-    const values = fieldValues;
-    schema.commit(values);
+      // Before committing, ensure all required fields are filled.
+      const firstMissing = inputs.find(inp => {
+        const fname = inp.dataset.fieldName!;
+        const field = currentSchema!.fields.find(f => f.name === fname);
+        return (field?.required !== false) && fieldValues[fname] === undefined;
+      });
+      if (firstMissing) {
+        markInvalid(firstMissing);
+        firstMissing.focus();
+        return;
+      }
+      const schema = currentSchema;
+      const values = fieldValues;
+      schema.commit(values);
+    })();
     return;
   }
 });
@@ -253,21 +462,41 @@ dom.cmdFields.addEventListener('keydown', (e) => {
 // Number/parameter parsing with create-on-unknown dialog
 // ============================================================================
 
-function parseValueInput(raw: string, meaningHint?: string): CmdValue | null {
-  const r = parseExprInput(raw);
-  if (!r) return null;
-  if (r.kind === 'expr') return { expr: r.expr, value: evalExpr(r.expr) };
-  const valRaw = prompt(`Neuer Parameter „${r.name}" — Wert:`, '');
-  if (valRaw == null) return null;
-  const val = parseFloat(valRaw.replace(',', '.'));
-  if (!Number.isFinite(val)) { toast('Ungültige Zahl'); return null; }
-  const meaning = prompt(
-    `Bedeutung von ${r.name}${meaningHint ? ` (z.B. ${meaningHint})` : ''}:`,
-    meaningHint ?? '',
-  ) ?? '';
-  const existing = findParamByName(r.name);
-  const p = existing ?? createParameter(r.name, val, meaning.trim() || undefined);
-  return { expr: { kind: 'param', id: p.id }, value: p.value };
+async function parseValueInput(raw: string, meaningHint?: string): Promise<CmdValue | null> {
+  // Repeatedly parse; whenever the parser reports an unknown identifier, ask
+  // the user for its value, create the parameter, then re-parse the ORIGINAL
+  // input from scratch. This matters for mixed formulas like `L-X` where only
+  // X is missing — the old code returned just X's param and silently dropped
+  // the surrounding formula, so the dimension ended up as X instead of L-X.
+  // Cap retries to avoid infinite loops if something pathological happens.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const r = parseExprInput(raw);
+    if (!r) return null;
+    if (r.kind === 'expr') return { expr: r.expr, value: evalExpr(r.expr) };
+
+    // r.kind === 'unknown' — ask the user to define it, then retry.
+    const isBareIdent = raw.trim() === r.name;
+    const hint = isBareIdent ? meaningHint : undefined;
+    const valRaw = await showPrompt({
+      title: `Neue Variable: ${r.name}`,
+      message: 'Wert eingeben (Zahl oder Formel).',
+      validate: (v) => Number.isFinite(parseFloat(v.replace(',', '.'))) ? null : 'Zahl erwartet',
+    });
+    if (valRaw == null) return null;
+    const val = parseFloat(valRaw.replace(',', '.'));
+    if (!Number.isFinite(val)) { toast('Ungültige Zahl'); return null; }
+    const meaning = await showPrompt({
+      title: `Bedeutung von ${r.name}`,
+      message: hint ? `Optional — z.B. ${hint}` : 'Optional — wofür steht diese Variable?',
+      defaultValue: hint ?? '',
+      placeholder: hint ?? 'z.B. Länge',
+    }) ?? '';
+    const existing = findParamByName(r.name);
+    if (!existing) createParameter(r.name, val, meaning.trim() || undefined);
+    // loop: re-parse the original input now that this name is defined.
+  }
+  toast('Zu viele unbekannte Namen');
+  return null;
 }
 
 // ============================================================================
@@ -327,13 +556,26 @@ function schemaFor(tool: ToolId, tc: ToolCtx | null): CmdSchema | null {
       commit: (v) => commitRefCircle(tc, v),
     };
   }
+  if (tool === 'arc3' && tc && tc.step === 'bulge' && tc.pts && tc.pts.length === 2) {
+    return {
+      prompt: 'Bogenhöhe (Abstand zur Sehne)',
+      fields: [{ name: 'bulge', label: 'Höhe', kind: 'expr', meaningHint: 'Bogenhöhe', placeholder: 'z.B. 5' }],
+      commit: (v) => {
+        const b = v.bulge;
+        if (!b) { toast('Höhe eingeben'); return; }
+        commitArcBulge(tc, b.value);
+      },
+    };
+  }
   if (tool === 'ellipse' && tc) {
     if (tc.step === 'axis1' && tc.centerPt) {
       return {
-        prompt: 'Halbachse 1: Länge + Winkel',
+        prompt: 'Halbachse 1: Winkel + Länge',
+        // Angle first per user preference — Tab from the angle field jumps to
+        // length, matching the "polar (α, r)" order common in CAD prompts.
         fields: [
-          { name: 'length', label: 'Länge',  kind: 'expr',  meaningHint: 'Halbachse 1' },
           { name: 'angle',  label: 'Winkel', kind: 'angle', placeholder: '°', required: false },
+          { name: 'length', label: 'Länge',  kind: 'expr',  meaningHint: 'Halbachse 1' },
         ],
         commit: (v) => commitEllipseAxis1(tc, v),
       };
@@ -406,37 +648,26 @@ function schemaFor(tool: ToolId, tc: ToolCtx | null): CmdSchema | null {
       commit: (v) => commitOffsetDistance(tc, v),
     };
   }
-  if (tool === 'text' && tc) {
-    if (tc.step === 'text' && tc.basePt) {
-      return {
-        prompt: 'Text eingeben',
-        fields: [{ name: 'text', label: 'Text', kind: 'text', placeholder: 'z.B. M8' }],
-        commit: (v) => commitTextCreate(tc, v),
-      };
-    }
+  if (tool === 'line_offset' && tc && tc.step === 'side') {
+    // Only the distance field lives here. The Winkel angle moved to the
+    // top-right picker (next to the Winkel toggle) per user request —
+    // entering both values in the same place is the natural ergonomic.
     return {
-      prompt: 'Texthöhe',
-      fields: [{ name: 'height', label: 'Höhe', kind: 'expr' }],
-      commit: (v) => commitTextHeight(v),
+      prompt: 'Abstand, dann Seite klicken',
+      fields: [
+        { name: 'distance', label: 'Abstand', kind: 'expr', required: false },
+      ],
+      commit: (v) => commitLineOffset(tc, v),
     };
   }
-  if (tool === 'fillet' && tc) {
-    return {
-      prompt: 'Radius (sticky — gilt bis neu eingegeben)',
-      fields: [{
-        name: 'radius', label: 'Radius', kind: 'expr',
-        value: String(getFilletRadius()),
-      }],
-      commit: (v) => commitFilletRadius(tc, v),
-    };
-  }
-  if (tool === 'chamfer' && tc) {
-    return {
-      prompt: tc.entity1 && tc.entity2 ? 'Abstand (Enter committed)' : 'Abstand (Default)',
-      fields: [{ name: 'distance', label: 'Abstand', kind: 'expr' }],
-      commit: (v) => commitChamferDistance(tc, v),
-    };
-  }
+  // Text tool: all content + size editing happens in the text-editor modal.
+  // Deliberately no cmdbar fields here — the bottom command bar is for
+  // parameter values only and must never steal focus while the text modal is
+  // building its own editor.
+  // Fillet / chamfer: radius and distance are sticky modifiers, not per-step
+  // length values, so they live in the top panels (fillet-picker /
+  // chamfer-picker). The cmdbar stays empty for these tools — keeps the rule
+  // "cmdbar = lengths/angles per step, top panel = modifiers/properties".
   if (tool === 'rotate' && tc && tc.step === 'angle' && tc.centerPt) {
     return {
       prompt: 'Drehwinkel',
@@ -444,13 +675,40 @@ function schemaFor(tool: ToolId, tc: ToolCtx | null): CmdSchema | null {
       commit: (v) => commitRotate(tc, v),
     };
   }
-  if ((tool === 'move' || tool === 'copy') && tc && tc.step === 'target' && tc.basePt) {
+  if (tool === 'move' && tc && tc.step === 'target' && tc.basePt) {
     return {
       prompt: 'Abstand (Richtung = Maus)',
       fields: [{ name: 'distance', label: 'Abstand', kind: 'expr' }],
-      commit: (v) => commitMoveCopyTarget(tc, v),
+      commit: (v) => commitMoveCopyTarget(tc, v, false),
     };
   }
+  if (tool === 'copy' && tc && tc.step === 'target' && tc.basePt) {
+    return {
+      prompt: 'Abstand + Matrix (Spalten×Zeilen)',
+      fields: [
+        { name: 'distance', label: 'Abstand', kind: 'expr' },
+        { name: 'cols',     label: 'Spalten', kind: 'integer', placeholder: String(runtime.copyCols), required: false, value: String(runtime.copyCols) },
+        { name: 'rows',     label: 'Zeilen',  kind: 'integer', placeholder: String(runtime.copyRows), required: false, value: String(runtime.copyRows) },
+      ],
+      commit: (v) => commitMoveCopyTarget(tc, v, true),
+    };
+  }
+  if (tool === 'stretch' && tc && tc.step === 'direction' && tc.basePt) {
+    return {
+      prompt: 'Winkel (oder Richtung klicken)',
+      fields: [{ name: 'angle', label: 'Winkel', kind: 'angle' }],
+      commit: (v) => commitStretchDirection(tc, v),
+    };
+  }
+  if (tool === 'stretch' && tc && tc.step === 'distance' && tc.basePt) {
+    return {
+      prompt: 'Abstand (oder klicken)',
+      fields: [{ name: 'distance', label: 'Abstand', kind: 'expr' }],
+      commit: (v) => commitStretchDistance(tc, v),
+    };
+  }
+  // Backward-compat: the old single-step 'target' schema, in case any entry
+  // point still lands on that step.
   if (tool === 'stretch' && tc && tc.step === 'target' && tc.basePt) {
     return {
       prompt: 'Abstand (Richtung = Maus)',
@@ -458,6 +716,9 @@ function schemaFor(tool: ToolId, tc: ToolCtx | null): CmdSchema | null {
       commit: (v) => commitStretchTarget(tc, v),
     };
   }
+  // Note: divide_xline count is asked via a modal (showPrompt) instead of the
+  // cmdbar — see promptDivideCount in tools.ts. Tool activation opens the
+  // modal directly; Enter at 'pick' re-opens it (see handleBareEnter below).
   return null;
 }
 
@@ -481,22 +742,35 @@ export function handleBareEnter(): boolean {
   if ((state.tool === 'move' || state.tool === 'copy') && tc?.step === 'pick') {
     if (!state.selection.size) { toast('Erst Objekte wählen'); return true; }
     runtime.toolCtx = { step: 'base' };
-    setPromptRef('Basispunkt');
+    setPromptRef(state.tool === 'move' ? 'Basispunkt · Shift = Kopie' : 'Basispunkt');
     render();
     return true;
   }
   if (state.tool === 'rotate' && tc?.step === 'pick') {
     if (!state.selection.size) { toast('Erst Objekte wählen'); return true; }
     runtime.toolCtx = { step: 'center' };
-    setPromptRef('Drehzentrum');
+    setPromptRef('Drehzentrum · Shift = Kopie');
     render();
     return true;
   }
   if (state.tool === 'mirror' && tc?.step === 'pick') {
     if (!state.selection.size) { toast('Erst Objekte wählen'); return true; }
     runtime.toolCtx = { step: 'axis1' };
-    setPromptRef('Spiegelachse: erster Punkt');
+    setPromptRef('Spiegelachse: erster Punkt · Shift = Kopie');
     render();
+    return true;
+  }
+  if (state.tool === 'cross_mirror' && tc?.step === 'pick') {
+    if (!state.selection.size) { toast('Erst Objekte wählen'); return true; }
+    runtime.toolCtx = { step: 'center' };
+    setPromptRef(crossMirrorPrompt(runtime.crossMirrorMode));
+    render();
+    return true;
+  }
+  if (state.tool === 'divide_xline' && tc?.step === 'pick') {
+    // Enter at the 'pick' step re-focuses the top-docked count panel so the
+    // user can adjust N without leaving the tool.
+    promptDivideCount();
     return true;
   }
   if (state.tool === 'offset' && tc?.step === 'pick') {
@@ -548,12 +822,51 @@ function commitLine(tc: ToolCtx, v: CmdValues): void {
   }
 
   // Commit the line: use the lock if it exists, otherwise the typed angle,
-  // otherwise the mouse direction.
+  // otherwise the mouse direction. We compute an exact endpoint from (angle,
+  // length), so bypass the cursor-based snap override inside handleClick —
+  // otherwise a nearby snappable feature would steal our typed length.
   if (length !== undefined && length > 0) {
     const dir = tc.lockedDir
       ?? (angle !== undefined ? directionAtAngle(tc.p1, state.mouseWorld, angle) : norm(sub(state.mouseWorld, tc.p1)));
     if (len(dir) < 1e-9) { toast('Erst Mausrichtung wählen'); return; }
-    handleClick(add(tc.p1, scale(dir, length)));
+
+    // If the user typed a variable or formula (not a plain number) for angle
+    // or length, build the LineFeature directly with a polar p2 PointRef so
+    // the binding survives. Changing the variable later re-resolves the
+    // endpoint via `resolvePt` and moves the line accordingly. For pure
+    // numeric input we keep the original handleClick path (cheaper, and the
+    // resulting feature is indistinguishable from a mouse-placed one).
+    const lenExpr = v.length?.expr;
+    const angleExpr = v.angle?.expr;
+    const parametric = (lenExpr && lenExpr.kind !== 'num') || (angleExpr && angleExpr.kind !== 'num');
+    if (parametric && lenExpr) {
+      const angleDeg = Math.atan2(dir.y, dir.x) * 180 / Math.PI;
+      const finalAngle: Expr = (angleExpr && angleExpr.kind !== 'num') ? angleExpr : numE(angleDeg);
+      const p1Ref: PointRef = tc.p1Ref
+        ?? { kind: 'abs', x: numE(tc.p1.x), y: numE(tc.p1.y) };
+      const p2Ref: PointRef = {
+        kind: 'polar',
+        from: p1Ref,
+        angle: finalAngle,
+        distance: lenExpr,
+      };
+      pushUndo();
+      state.features.push({
+        id: newFeatureId(),
+        kind: 'line',
+        layer: state.activeLayer,
+        p1: p1Ref,
+        p2: p2Ref,
+      });
+      evaluateTimeline();
+      updateStats();
+      runtime.toolCtx = { step: 'p1' };
+      setPromptRef('Erster Punkt');
+      render();
+      return;
+    }
+
+    handleClick(add(tc.p1, scale(dir, length)), false, { useSnap: false });
     return;
   }
   toast('Mindestens Winkel oder Länge eingeben');
@@ -592,7 +905,58 @@ function commitPolyline(tc: ToolCtx, v: CmdValues): void {
     const dir = tc.lockedDir
       ?? (angle !== undefined ? directionAtAngle(last, state.mouseWorld, angle) : norm(sub(state.mouseWorld, last)));
     if (len(dir) < 1e-9) { toast('Erst Mausrichtung wählen'); return; }
-    handlePolylineClick(add(last, scale(dir, length)));
+
+    // Parametric path: if the user typed a variable or formula for length or
+    // angle, commit the next polyline segment as a polar PointRef off the
+    // previous vertex so the binding survives. Mirrors the line tool logic.
+    const lenExpr = v.length?.expr;
+    const angleExpr = v.angle?.expr;
+    const parametric = (lenExpr && lenExpr.kind !== 'num') || (angleExpr && angleExpr.kind !== 'num');
+    if (parametric && lenExpr) {
+      const angleDeg = Math.atan2(dir.y, dir.x) * 180 / Math.PI;
+      const finalAngle: Expr = (angleExpr && angleExpr.kind !== 'num') ? angleExpr : numE(angleDeg);
+      // Reuse the existing tail ref as the polar anchor so the new vertex
+      // tracks the previous one exactly (important when earlier vertices are
+      // themselves parametric — chain stays coherent).
+      const prevRef: PointRef = (tc.ptRefs && tc.ptRefs.length > 0 && tc.ptRefs[tc.ptRefs.length - 1])
+        ? tc.ptRefs[tc.ptRefs.length - 1] as PointRef
+        : { kind: 'abs', x: numE(last.x), y: numE(last.y) };
+      const newRef: PointRef = {
+        kind: 'polar',
+        from: prevRef,
+        angle: finalAngle,
+        distance: lenExpr,
+      };
+      const endPt = add(last, scale(dir, length));
+      pushUndo();
+      state.features.push({
+        id: newFeatureId(),
+        kind: 'line',
+        layer: state.activeLayer,
+        p1: prevRef,
+        p2: newRef,
+      });
+      evaluateTimeline();
+      updateStats();
+      // Advance tool state by hand (we bypassed handlePolylineClick).
+      if (!tc.pts) tc.pts = [];
+      if (!tc.ptRefs) tc.ptRefs = [];
+      tc.pts.push(endPt);
+      tc.ptRefs.push(newRef);
+      tc.lockedDir = null;
+      tc.angleDeg = null;
+      setPromptRef('Nächster Punkt (Enter beendet)');
+      render();
+      return;
+    }
+
+    // Mask the cursor snap — same reason as in commitLine: the computed
+    // endpoint is exact, and handlePolylineClick would otherwise read
+    // runtime.lastSnap and parametrize to whatever the cursor hovers over.
+    const savedSnap = runtime.lastSnap;
+    runtime.lastSnap = null;
+    try { handlePolylineClick(add(last, scale(dir, length))); }
+    finally { runtime.lastSnap = savedSnap; }
   }
 }
 
@@ -600,22 +964,29 @@ function commitRect(tc: ToolCtx, v: CmdValues): void {
   if (!tc.p1) return;
   const w = v.width, h = v.height;
   if (!w || w.value <= 0 || !h || h.value <= 0) { toast('Breite und Höhe eingeben'); return; }
+  // Sign follows the cursor direction relative to the first corner, so the
+  // rectangle opens "into" the quadrant the mouse is currently in (matches
+  // the live preview). Splitting into 4 lines at commit keeps parity with the
+  // click-click path — every rect is immediately edge-editable, no single
+  // `rect` feature lingers.
   const cur = state.mouseWorld;
   const sX: 1 | -1 = (cur.x - tc.p1.x) >= 0 ? 1 : -1;
   const sY: 1 | -1 = (cur.y - tc.p1.y) >= 0 ? 1 : -1;
-  pushUndo();
-  const feat: Feature = {
-    id: newFeatureId(),
-    kind: 'rect',
-    layer: state.activeLayer,
-    p1: { kind: 'abs', x: numE(tc.p1.x), y: numE(tc.p1.y) },
-    width:  w.expr,
-    height: h.expr,
-    signX: sX, signY: sY,
-  };
-  state.features.push(feat);
-  evaluateTimeline();
-  updateStats();
+
+  // If the user typed a variable or formula (not a plain number) for either
+  // width or height, take the parametric path — corners B/C/D become polar
+  // PointRefs off corner A so changing the variable later updates the
+  // rectangle automatically. For pure numeric input keep the original
+  // constant-coordinate path (matches click-click output exactly).
+  const parametric = (w.expr.kind !== 'num') || (h.expr.kind !== 'num');
+  if (parametric) {
+    const p1Ref: PointRef = tc.p1Ref ?? { kind: 'abs', x: numE(tc.p1.x), y: numE(tc.p1.y) };
+    commitRectAsLinesExpr(p1Ref, w.expr, h.expr, sX, sY, state.activeLayer);
+  } else {
+    const x2 = tc.p1.x + sX * w.value;
+    const y2 = tc.p1.y + sY * h.value;
+    commitRectAsLines(tc.p1.x, tc.p1.y, x2, y2);
+  }
   runtime.toolCtx = { step: 'p1' };
   setPromptRef('Erster Eckpunkt');
   render();
@@ -626,11 +997,16 @@ function commitCircle(tc: ToolCtx, v: CmdValues): void {
   const r = v.radius;
   if (!r || r.value <= 0) { toast('Radius eingeben'); return; }
   pushUndo();
+  // Parametrischen Mittelpunkt erhalten, falls beim Klicken ein Snap aktiv
+  // war. Radius übernimmt den getippten Expr (kann Variable sein) — beides
+  // zusammen ergibt einen vollständig parametrischen Kreis.
+  const center: PointRef = tc.centerRef
+    ?? { kind: 'abs', x: numE(tc.cx), y: numE(tc.cy) };
   const feat: Feature = {
     id: newFeatureId(),
     kind: 'circle',
     layer: state.activeLayer,
-    center: { kind: 'abs', x: numE(tc.cx), y: numE(tc.cy) },
+    center,
     radius: r.expr,
   };
   state.features.push(feat);
@@ -656,12 +1032,46 @@ function commitPolygonRadius(tc: ToolCtx, v: CmdValues): void {
   if (tc.cx == null || tc.cy == null) return;
   const r = v.radius;
   if (!r || r.value <= 0) { toast('Radius eingeben'); return; }
-  const startAng = Math.atan2(state.mouseWorld.y - tc.cy, state.mouseWorld.x - tc.cx);
+  const startAngRad = Math.atan2(state.mouseWorld.y - tc.cy, state.mouseWorld.x - tc.cx);
+  const startAngDeg = startAngRad * 180 / Math.PI;
   const n = getPolygonSides();
+
+  // Parametric: build a closed polyline where each vertex is a polar PointRef
+  // off a shared center, with the typed radius Expr as distance. Changing the
+  // variable later rebuilds the polygon around the same center.
+  if (r.expr.kind !== 'num') {
+    const center: PointRef = { kind: 'abs', x: numE(tc.cx), y: numE(tc.cy) };
+    const refs: PointRef[] = [];
+    const stepDeg = 360 / n;
+    for (let i = 0; i < n; i++) {
+      const angDeg = startAngDeg + i * stepDeg;
+      refs.push({
+        kind: 'polar',
+        from: center,
+        angle: numE(angDeg),
+        distance: r.expr,
+      });
+    }
+    pushUndo();
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'polyline',
+      layer: state.activeLayer,
+      pts: refs,
+      closed: true,
+    });
+    evaluateTimeline();
+    updateStats();
+    runtime.toolCtx = { step: 'center' };
+    setPromptRef(`Mittelpunkt (n=${n})`);
+    render();
+    return;
+  }
+
   const step = 2 * Math.PI / n;
   const pts: Pt[] = [];
   for (let i = 0; i < n; i++) {
-    const a = startAng + i * step;
+    const a = startAngRad + i * step;
     pts.push({ x: tc.cx + Math.cos(a) * r.value, y: tc.cy + Math.sin(a) * r.value });
   }
   addEntity({ type: 'polyline', pts, closed: true, layer: state.activeLayer });
@@ -675,8 +1085,14 @@ function commitXlineDist(tc: ToolCtx, v: CmdValues): void {
   const d = v.distance;
   if (!d || d.value <= 0) { toast('Abstand eingeben'); return; }
   const off = perpOffset(tc.base, tc.dir, state.mouseWorld);
-  const refEnt = tc.ref && !('_axis' in tc.ref) ? tc.ref : undefined;
-  makeParallelXLine(tc.base, tc.dir, d.expr, off.sign, refEnt);
+  // Virtual-axis reference → the dedicated `axisParallelXLine` feature that
+  // keeps the distance expression live (variable edits propagate). Real
+  // entities go through the regular parallelXLine path.
+  if (tc.ref && '_axis' in tc.ref) {
+    makeAxisParallelXLine(tc.ref._axis, d.expr, off.sign);
+  } else {
+    makeParallelXLine(tc.base, tc.dir, d.expr, off.sign, tc.ref);
+  }
   runtime.toolCtx = { step: 'ref' };
   setPromptRef('Referenzlinie wählen');
   render();
@@ -686,7 +1102,15 @@ function commitXlineAngle(tc: ToolCtx, v: CmdValues): void {
   if (!tc.p1) return;
   const ang = v.angle?.value;
   if (ang === undefined) { toast('Winkel eingeben'); return; }
-  makeXLineThrough(tc.p1, directionAtAngle(tc.p1, state.mouseWorld, ang));
+  // Preserve the anchor's parametric ref (captured on the click that entered
+  // `angle-pt`) so the xline stays tied to the source corner/mid/intersection
+  // when upstream variables change. Falls through to abs if the anchor had
+  // no feature-backed snap.
+  makeXLineThroughRef(
+    tc.p1Ref ?? null,
+    tc.p1,
+    directionAtAngle(tc.p1, state.mouseWorld, ang),
+  );
   runtime.toolCtx = { step: 'ref' };
   setPromptRef('Referenzlinie wählen');
   render();
@@ -703,31 +1127,25 @@ function commitOffsetDistance(tc: ToolCtx, v: CmdValues): void {
   applyGroupOffsetAt(state.mouseWorld);
 }
 
-function commitTextHeight(v: CmdValues): void {
-  const h = v.height;
-  if (!h || h.value <= 0) { toast('Höhe eingeben'); return; }
-  setTextHeight(h.value);
-  toast('Texthöhe = ' + h.value);
-}
-
-function commitFilletRadius(_tc: ToolCtx, v: CmdValues): void {
-  const r = v.radius;
-  if (!r || r.value <= 0) { toast('Radius eingeben'); return; }
-  // Sticky radius: store and reuse until explicitly changed. The fillet
-  // itself is committed by picking the second line.
-  setFilletRadius(r.value);
-  toast('Radius = ' + r.value);
-}
-
-function commitChamferDistance(tc: ToolCtx, v: CmdValues): void {
+/**
+ * Commit handler for the line_offset tool's 'side' step.
+ *
+ * Distance is required. If typed as a variable/formula, stash the Expr in the
+ * tool ctx so `applyLineOffsetAt` builds a parametric polar PointRef from it.
+ * The angle, when enabled via the "Winkel" toggle, is read directly from
+ * `runtime.lineOffsetAngleDeg` inside `applyLineOffsetAt` — it's edited in
+ * the top picker, not here.
+ *
+ * Side-of-line is always determined by the current mouse position, so the
+ * user can type the distance and then move the cursor to the desired side
+ * before pressing Enter — matches the Versatz tool's ergonomics.
+ */
+function commitLineOffset(tc: ToolCtx, v: CmdValues): void {
   const d = v.distance;
   if (!d || d.value <= 0) { toast('Abstand eingeben'); return; }
-  if (tc.step === 'distance' && tc.entity1 && tc.entity2) {
-    applyChamfer(d.value);
-  } else {
-    setChamferDist(d.value);
-    toast('Abstand = ' + d.value);
-  }
+  tc.distance = d.value;
+  tc.distanceExpr = d.expr;
+  applyLineOffsetAt(state.mouseWorld, d.value);
 }
 
 function commitRotate(tc: ToolCtx, v: CmdValues): void {
@@ -742,13 +1160,21 @@ function commitRotate(tc: ToolCtx, v: CmdValues): void {
   render();
 }
 
-function commitMoveCopyTarget(tc: ToolCtx, v: CmdValues): void {
+function commitMoveCopyTarget(tc: ToolCtx, v: CmdValues, isCopy: boolean): void {
   if (!tc.basePt) return;
   const d = v.distance;
   if (!d || d.value <= 0) { toast('Abstand eingeben'); return; }
   const dir = norm(sub(state.mouseWorld, tc.basePt));
   if (len(dir) < 1e-9) { toast('Erst Mausrichtung wählen'); return; }
-  handleClick(add(tc.basePt, scale(dir, d.value)));
+  // Copy tool: stash the matrix dims so the click handler (below) uses them.
+  // A cols/rows field left empty keeps the previous sticky value.
+  if (isCopy) {
+    const cols = v.cols?.value;
+    const rows = v.rows?.value;
+    if (cols !== undefined) runtime.copyCols = Math.max(1, Math.floor(cols));
+    if (rows !== undefined) runtime.copyRows = Math.max(1, Math.floor(rows));
+  }
+  handleClick(add(tc.basePt, scale(dir, d.value)), false, { useSnap: false });
 }
 
 function commitStretchTarget(tc: ToolCtx, v: CmdValues): void {
@@ -757,7 +1183,42 @@ function commitStretchTarget(tc: ToolCtx, v: CmdValues): void {
   if (!d || d.value <= 0) { toast('Abstand eingeben'); return; }
   const dir = norm(sub(state.mouseWorld, tc.basePt));
   if (len(dir) < 1e-9) { toast('Erst Mausrichtung wählen'); return; }
-  handleClick(add(tc.basePt, scale(dir, d.value)));
+  handleClick(add(tc.basePt, scale(dir, d.value)), false, { useSnap: false });
+}
+
+/**
+ * Lock the stretch direction from a typed angle (absolute world angle, 0° =
+ * +x, 90° = +y). Advances the step to 'distance' so the user can type or
+ * click the magnitude.
+ */
+function commitStretchDirection(tc: ToolCtx, v: CmdValues): void {
+  if (!tc.basePt || !tc.click1 || !tc.click2) return;
+  const a = v.angle;
+  if (!a) { toast('Winkel eingeben'); return; }
+  const rad = (a.value * Math.PI) / 180;
+  const dir: Pt = { x: Math.cos(rad), y: Math.sin(rad) };
+  runtime.toolCtx = {
+    step: 'distance',
+    click1: tc.click1, click2: tc.click2, basePt: tc.basePt,
+    lockedDir: dir,
+  };
+  render();
+}
+
+/**
+ * Apply the stretch using the locked direction (set by a prior click or typed
+ * angle) and the typed magnitude. Falls back to cursor direction when no
+ * direction was locked (defensive — the schema only shows this step after
+ * direction is set).
+ */
+function commitStretchDistance(tc: ToolCtx, v: CmdValues): void {
+  if (!tc.basePt || !tc.click1 || !tc.click2) return;
+  const d = v.distance;
+  if (!d || d.value <= 0) { toast('Abstand eingeben'); return; }
+  const dir = tc.lockedDir ?? norm(sub(state.mouseWorld, tc.basePt));
+  if (len(dir) < 1e-9) { toast('Keine Richtung gesetzt'); return; }
+  const target: Pt = add(tc.basePt, scale(dir, d.value));
+  applyStretchTarget(tc, target);
 }
 
 function commitRefCircle(tc: ToolCtx, v: CmdValues): void {
@@ -788,13 +1249,35 @@ function commitRefCircle(tc: ToolCtx, v: CmdValues): void {
 function commitEllipseAxis1(tc: ToolCtx, v: CmdValues): void {
   if (!tc.centerPt) return;
   const L = v.length;
-  if (!L || L.value <= 0) { toast('Länge eingeben'); return; }
   const ang = v.angle?.value;
-  // Use mouse direction if no angle supplied.
+
+  // Angle-only commit → lock the direction and wait for the user to pick the
+  // length with the mouse (or Enter again with a length). Matches the line /
+  // polyline angle-lock UX: typing "30" and Enter locks 30°, then dragging
+  // lengthens along that ray. Without this, the tool just toasted "Länge
+  // eingeben" and the typed angle was discarded.
+  if (ang !== undefined && (!L || L.value <= 0)) {
+    const radDir = { x: Math.cos(ang * Math.PI / 180), y: Math.sin(ang * Math.PI / 180) };
+    runtime.toolCtx = {
+      step: 'axis1',
+      centerPt: tc.centerPt,
+      lockedDir: radDir,
+      angleDeg: ang,
+    };
+    setPromptRef(`Halbachse 1: Länge (Winkel gesperrt ${ang.toFixed(1)}°)`);
+    toast(`Winkel gesperrt · ${ang.toFixed(1)}°`);
+    render();
+    return;
+  }
+
+  if (!L || L.value <= 0) { toast('Länge eingeben'); return; }
+  // Use mouse direction if no angle supplied and no lock is active.
   let dir: Pt;
   if (ang !== undefined) {
     const radDir = { x: Math.cos(ang * Math.PI / 180), y: Math.sin(ang * Math.PI / 180) };
     dir = radDir;
+  } else if (tc.lockedDir) {
+    dir = tc.lockedDir;
   } else {
     const m = sub(state.mouseWorld, tc.centerPt);
     if (len(m) < 1e-9) { toast('Erst Richtung wählen'); return; }
@@ -802,7 +1285,16 @@ function commitEllipseAxis1(tc: ToolCtx, v: CmdValues): void {
   }
   const a1 = add(tc.centerPt, scale(dir, L.value));
   const rot = Math.atan2(dir.y, dir.x);
-  runtime.toolCtx = { step: 'axis2', centerPt: tc.centerPt, a1, angleDeg: rot, radius: L.value };
+  // Stash the parametric radius expr for axis2 to consume — when it's a
+  // variable/formula we want to emit an EllipseFeature with the binding intact.
+  runtime.toolCtx = {
+    step: 'axis2',
+    centerPt: tc.centerPt,
+    a1,
+    angleDeg: rot,
+    radius: L.value,
+    radiusExpr: L.expr,
+  };
   setPromptRef('Länge der zweiten Halbachse');
   render();
 }
@@ -811,6 +1303,34 @@ function commitEllipseAxis2(tc: ToolCtx, v: CmdValues): void {
   if (!tc.centerPt || tc.radius == null || tc.angleDeg == null) return;
   const L = v.length;
   if (!L || L.value <= 0) { toast('Länge eingeben'); return; }
+
+  // Parametric: if axis1 or axis2 was entered as a variable/formula, push the
+  // ellipse feature directly so both radii and rotation stay bound. The
+  // stashed `radiusExpr` survives from commitEllipseAxis1.
+  const rxExpr = tc.radiusExpr;
+  const ryExpr = L.expr;
+  const parametric = (ryExpr.kind !== 'num')
+                  || (rxExpr != null && rxExpr.kind !== 'num');
+  if (parametric) {
+    const finalRx: Expr = rxExpr ?? numE(tc.radius);
+    pushUndo();
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'ellipse',
+      layer: state.activeLayer,
+      center: { kind: 'abs', x: numE(tc.centerPt.x), y: numE(tc.centerPt.y) },
+      rx: finalRx,
+      ry: ryExpr,
+      rot: numE(tc.angleDeg),
+    });
+    evaluateTimeline();
+    updateStats();
+    runtime.toolCtx = { step: 'center' };
+    setPromptRef('Mittelpunkt der Ellipse');
+    render();
+    return;
+  }
+
   pushUndo();
   addEntity({
     type: 'ellipse',
@@ -832,7 +1352,7 @@ function commitMirrorAxis2(tc: ToolCtx, v: CmdValues): void {
   if (len(d) < 1e-9) return;
   // Delegate to the mirror tool's axis2-click handler by feeding it a
   // synthetic second axis point along the typed direction.
-  handleClick(add(tc.a1, scale(d, 1)));
+  handleClick(add(tc.a1, scale(d, 1)), false, { useSnap: false });
 }
 
 function commitDimOffset(tc: ToolCtx, v: CmdValues): void {
@@ -847,7 +1367,7 @@ function commitDimOffset(tc: ToolCtx, v: CmdValues): void {
   const sgn = dot(mRel, n) >= 0 ? 1 : -1;
   const mid = { x: (tc.click1.x + tc.click2.x) / 2, y: (tc.click1.y + tc.click2.y) / 2 };
   const off = add(mid, scale(n, d.value * sgn));
-  handleClick(off);
+  handleClick(off, false, { useSnap: false });
 }
 
 function commitScaleFactor(tc: ToolCtx, v: CmdValues): void {
@@ -862,20 +1382,3 @@ function commitScaleFactor(tc: ToolCtx, v: CmdValues): void {
   render();
 }
 
-function commitTextCreate(tc: ToolCtx, v: CmdValues): void {
-  if (!tc.basePt) return;
-  const t = v.text?.text;
-  if (!t) { toast('Text eingeben'); return; }
-  const h = tc.textHeight ?? 5;
-  pushUndo();
-  addEntity({
-    type: 'text',
-    x: tc.basePt.x, y: tc.basePt.y,
-    text: t,
-    height: h,
-    layer: state.activeLayer,
-  });
-  runtime.toolCtx = { step: 'pt', textHeight: h };
-  setPromptRef(`Einfügepunkt für Text (Höhe=${h})`);
-  render();
-}

@@ -1,13 +1,32 @@
 import type {
   ArcEntity, CircleEntity, DimEntity, DimStyle, EllipseEntity, Entity, EntityShape,
-  PolylineEntity, Preview, RectEntity, SnapPoint, SplineEntity, TextEntity, XLineEntity,
+  HatchEntity, PolylineEntity, Preview, Pt, RectEntity, SnapPoint, SplineEntity,
+  TextEntity, XLineEntity,
 } from './types';
+import { patternForLineStyle, resolveLineStyle } from './types';
 import { state, runtime } from './state';
 import { css, screenToWorld, worldToScreen } from './math';
 import { dom, ctx } from './dom';
 import { getDraftInfo } from './draftinfo';
+import { layoutText } from './textlayout';
+import { framedTextGrips, GRIP_HALF_PX } from './textgrips';
+// Geometry grips (line endpoints / vertices / corners / …) used to render
+// unconditionally and flatten parametric PointRefs on drag. They're now gated
+// behind `runtime.parametricMode === false` — the free-draw mode explicitly
+// opts out of parametric linking, so direct grip edits are safe there.
+import { entityGrips } from './grips';
+import { featureForEntity, linkedEntityIds } from './features';
 
 const { cv } = dom;
+
+/**
+ * Reference pixels-per-mm at 100% zoom. The zoom-readout in the status bar is
+ * computed as `state.view.scale * 25 %`, so 100% corresponds to scale = 4.
+ * Dash patterns are authored in world-mm; multiplying them by this constant
+ * (instead of the live `state.view.scale`) gives a zoom-invariant visual
+ * density — dashes look identical at 100%, 500% and 1500% zoom.
+ */
+const DASH_REF_SCALE = 4;
 
 export function resize(): void {
   const r = cv.parentElement!.getBoundingClientRect();
@@ -44,6 +63,7 @@ export function render(): void {
   ctx.fillStyle = css('--bg');
   ctx.fillRect(0, 0, w, h);
   drawGrid(w, h);
+  drawOriginAxes(w, h);
   // Two O(N) passes: unselected first, then selected on top. This replaces an
   // older O(N·M) variant that called `state.entities.find()` for every selected
   // id, which quadratically blew up with multi-selection on big drawings.
@@ -53,13 +73,48 @@ export function render(): void {
   }
   if (runtime.toolCtx?.preview) drawPreview(runtime.toolCtx.preview);
   if (sel.size) {
+    // Parametric-link highlight: any entity whose underlying feature depends
+    // on (or is depended on by) the selection gets a dashed teal overlay, so
+    // the user can see the whole cluster that will move together before they
+    // drag/rotate/parameter-edit. Drawn before the selection outline so the
+    // brighter --sel stroke on top stays dominant on the selected entity.
+    const linked = linkedEntityIds(sel);
+    if (linked.size) {
+      for (const e of state.entities) {
+        if (linked.has(e.id)) drawLinkedOverlay(e);
+      }
+    }
     for (const e of state.entities) {
       if (sel.has(e.id)) drawEntity(e, true);
     }
+    // Framed-text corner grips — drawn last so they sit on top of the text
+    // itself and can't be visually swallowed by long selected strings.
+    for (const e of state.entities) {
+      if (sel.has(e.id) && e.type === 'text' && e.boxWidth !== undefined) {
+        drawFrameGrips(e);
+      }
+    }
+    // Geometry grips (line endpoints, rect corners, polyline vertices, …) —
+    // only in free-draw mode with exactly one selected entity, matching the
+    // findGripHit gating in the mouse pipeline. In parametric mode these
+    // would flatten PointRefs on drag, so we hide them entirely.
+    if (!runtime.parametricMode
+        && state.tool === 'select'
+        && sel.size === 1) {
+      const id = [...sel][0];
+      const ent = state.entities.find(x => x.id === id);
+      if (ent) drawGeometryGrips(ent);
+    }
   }
   drawCrosshair(w, h);
+  // Dashed alignment guides for the active polar/DYN snap. Drawn BEFORE the
+  // snap marker so the bright glyph always sits on top.
+  if (runtime.lastSnap && (runtime.lastSnap.type === 'polar' || runtime.lastSnap.type === 'track')) {
+    drawActiveGuide(runtime.lastSnap);
+  }
   if (runtime.lastSnap) drawSnapMarker(runtime.lastSnap);
   if (runtime.dragSelect?.active) drawDragBox();
+  if (runtime.dragText?.active) drawTextFrameBox();
 }
 
 const GUIDE_TOOLS  = new Set(['xline', 'dim', 'ref_circle', 'angle']);
@@ -161,6 +216,108 @@ function drawDragBox(): void {
   ctx.restore();
 }
 
+/**
+ * Dashed frame drawn while the user drags the text tool: previews the box that
+ * will determine the text height. Includes a baseline marker at the bottom
+ * edge so the user knows where the text baseline will sit.
+ */
+function drawTextFrameBox(): void {
+  const dt = runtime.dragText;
+  if (!dt) return;
+  const a = worldToScreen(dt.worldStart);
+  const b = state.mouseScreen;
+  const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+  const w = Math.abs(b.x - a.x), h = Math.abs(b.y - a.y);
+  ctx.save();
+  ctx.strokeStyle = css('--preview');
+  ctx.fillStyle = css('--preview') + '14';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 3]);
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+  // Baseline tick (solid) on the bottom edge — visual hint that text sits here.
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(x, y + h + 0.5);
+  ctx.lineTo(x + w, y + h + 0.5);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * Four corner grips drawn on a selected Rahmentext. Filled squares with a
+ * high-contrast outline so they read clearly on any layer colour. Screen-
+ * space size (GRIP_HALF_PX) so they stay a consistent click target at any
+ * zoom level.
+ */
+function drawFrameGrips(e: TextEntity): void {
+  const grips = framedTextGrips(e);
+  if (!grips.length) return;
+  ctx.save();
+  ctx.fillStyle = css('--sel');
+  ctx.strokeStyle = css('--bg');
+  ctx.lineWidth = 1;
+  const s = GRIP_HALF_PX;
+  for (const g of grips) {
+    const sp = worldToScreen({ x: g.x, y: g.y });
+    const x = Math.round(sp.x - s) + 0.5;
+    const y = Math.round(sp.y - s) + 0.5;
+    ctx.fillRect(x, y, s * 2, s * 2);
+    ctx.strokeRect(x, y, s * 2, s * 2);
+  }
+  ctx.restore();
+}
+
+/**
+ * Geometry grips for the single-selected entity (free-draw mode only).
+ * Endpoint/vertex/corner/quadrant grips render as filled squares; the
+ * "move" grip (line midpoint, rect centre, circle centre, arc centre) is
+ * drawn hollow so users can tell at a glance which grip translates the
+ * whole entity vs. stretches a side. Sub-entities of modifiers (mirror /
+ * array / crossMirror / rotate output) are skipped because they're not
+ * directly editable — mutating them would desync the source.
+ */
+function drawGeometryGrips(e: Entity): void {
+  // xline / dim / hatch have either no grips or very specialised ones that
+  // don't fit the generic drag-a-corner model — skip rendering for those.
+  if (e.type === 'xline' || e.type === 'hatch') return;
+  // Modifier sub-entities (mirror/array/…): feature kind doesn't match entity
+  // type. Dragging a grip on a computed copy would rebuild the source feature
+  // as a free `line`, orphaning the modifier. Skip.
+  const feat = featureForEntity(e.id);
+  if (!feat || feat.kind !== e.type) return;
+  const L = state.layers[e.layer];
+  if (!L || !L.visible || L.locked) return;
+
+  const grips = entityGrips(e);
+  if (!grips.length) return;
+  ctx.save();
+  ctx.fillStyle = css('--sel');
+  ctx.strokeStyle = css('--bg');
+  ctx.lineWidth = 1;
+  const s = GRIP_HALF_PX;
+  for (const g of grips) {
+    const sp = worldToScreen({ x: g.x, y: g.y });
+    const x = Math.round(sp.x - s) + 0.5;
+    const y = Math.round(sp.y - s) + 0.5;
+    if (g.kind === 'move' || g.kind === 'arc-mid') {
+      // Hollow square — visually distinct from edit-grips, signals "drag me
+      // to translate the whole entity". Fill with bg so the stroke reads
+      // even on top of the entity's own body.
+      ctx.fillStyle = css('--bg');
+      ctx.fillRect(x, y, s * 2, s * 2);
+      ctx.fillStyle = css('--sel');
+      ctx.strokeStyle = css('--sel');
+      ctx.strokeRect(x, y, s * 2, s * 2);
+      ctx.strokeStyle = css('--bg');
+    } else {
+      ctx.fillRect(x, y, s * 2, s * 2);
+      ctx.strokeRect(x, y, s * 2, s * 2);
+    }
+  }
+  ctx.restore();
+}
+
 function drawGrid(w: number, h: number): void {
   // Grid display is INDEPENDENT of grid-snap. `showGrid` controls whether the
   // grid is painted; `snapSettings.grid` only controls whether the cursor
@@ -188,11 +345,83 @@ function drawGrid(w: number, h: number): void {
 }
 
 
+/**
+ * WCAG relative luminance for a #rrggbb hex. Returns -1 if the string isn't a
+ * plain 6-digit hex — callers should fall back in that case.
+ */
+function relLum(hex: string): number {
+  const h = hex.trim().replace('#', '');
+  if (h.length !== 6) return -1;
+  const toLin = (v: number) => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  if (Number.isNaN(r + g + b)) return -1;
+  return 0.2126 * toLin(r) + 0.7152 * toLin(g) + 0.0722 * toLin(b);
+}
+
+/**
+ * Layer colours are persisted as raw hex (e.g. '#ffffff' for the default '0'
+ * layer). When the user switches to a light preset those lines vanish against
+ * the light background. This bumps any near-background hex to the theme's
+ * foreground colour so geometry stays visible across presets without us having
+ * to mutate the user's stored palette.
+ *
+ * Called once per entity per frame, so memoize per hex+bg. The bg-key is
+ * derived from the currently-cached `--bg` value (invalidated by
+ * `invalidateCssCache()` on theme change), so the adapter auto-flushes when
+ * the theme switches.
+ */
+const _adaptCache = new Map<string, string>();
+let _adaptCacheBg = '';
+function adaptiveColor(hex: string): string {
+  const bg = css('--bg');
+  if (bg !== _adaptCacheBg) {
+    _adaptCache.clear();
+    _adaptCacheBg = bg;
+  }
+  const hit = _adaptCache.get(hex);
+  if (hit !== undefined) return hit;
+  const lHex = relLum(hex);
+  const lBg = relLum(bg);
+  let result = hex;
+  if (lHex >= 0 && lBg >= 0) {
+    const contrast = (Math.max(lHex, lBg) + 0.05) / (Math.min(lHex, lBg) + 0.05);
+    if (contrast < 2) result = css('--fg');
+  }
+  _adaptCache.set(hex, result);
+  return result;
+}
+
+/**
+ * Teal dashed overlay drawn on top of an entity's normal stroke to signal a
+ * parametric link to the current selection. Skips dim/text/hatch because a
+ * dashed outline on those would misread as a styling change; lines/curves
+ * get a clean accent that reads as "this follows the selection".
+ */
+function drawLinkedOverlay(e: Entity): void {
+  const L = state.layers[e.layer];
+  if (!L || !L.visible) return;
+  if (e.type === 'text' || e.type === 'dim' || e.type === 'hatch') return;
+  ctx.save();
+  ctx.strokeStyle = css('--guides');
+  ctx.lineWidth = 1.8;
+  ctx.setLineDash([5, 4]);
+  ctx.globalAlpha = 0.85;
+  drawShape(e);
+  ctx.restore();
+  ctx.setLineDash([]);
+}
+
 function drawEntity(e: Entity, selected: boolean): void {
   const L = state.layers[e.layer];
   if (!L || !L.visible) return;
   const hovered = !selected && e.id === runtime.hoveredId;
-  const color = selected ? css('--sel') : L.color;
+  const color = selected ? css('--sel') : adaptiveColor(L.color);
+
   if (e.type === 'text') {
     ctx.fillStyle = color;
     drawShape(e);
@@ -210,7 +439,31 @@ function drawEntity(e: Entity, selected: boolean): void {
     }
     return;
   }
-  const dash = L.style === 'dash' ? [6, 4] : [];
+  if (e.type === 'hatch') {
+    // Solid fills use the entity's own colour if set, otherwise the layer
+    // colour. Stripe patterns always stroke with the layer colour.
+    const solidColor = e.color ?? color;
+    const selBoost = selected ? 1.6 : hovered ? 1.2 : 1.0;
+    ctx.strokeStyle = selected ? css('--sel') : adaptiveColor(L.color);
+    ctx.fillStyle = selected ? css('--sel') : adaptiveColor(solidColor);
+    ctx.lineWidth = (e.mode === 'solid' ? 0 : 0.9) * selBoost;
+    ctx.setLineDash([]);
+    drawHatch(e, selected);
+    if (hovered && e.mode !== 'solid') {
+      ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+      drawHatch(e, selected);
+    }
+    return;
+  }
+  // Dash patterns are authored in world mm but rendered at a fixed
+  // screen-pixel scale so the visual rhythm stays identical regardless of
+  // zoom — zooming in on a dashed line used to blow the dashes up into
+  // chunky blocks, zooming out shrank them into near-solid. The geometry
+  // itself still scales with zoom; only the dash cadence is pinned.
+  const patternMm = patternForLineStyle(resolveLineStyle(L.style));
+  const dash = patternMm.length
+    ? patternMm.map(v => Math.max(0.5, v * DASH_REF_SCALE))
+    : [];
   ctx.strokeStyle = color;
   ctx.lineWidth = selected ? 2 : hovered ? 2 : 1.3;
   ctx.setLineDash(dash);
@@ -233,9 +486,12 @@ function drawShape(e: Entity | EntityShape): void {
   else if (e.type === 'polyline') drawPolyline(e);
   else if (e.type === 'text')     drawText(e);
   else if (e.type === 'dim')      drawDim(e);
+  else if (e.type === 'hatch')    drawHatch(e, false);
 }
 
 function drawDim(e: DimEntity | Extract<EntityShape, { type: 'dim' }>): void {
+  if (e.dimKind === 'angular') { drawAngularDim(e); return; }
+  if (e.dimKind === 'radius' || e.dimKind === 'diameter') { drawRadialDim(e); return; }
   const dx = e.p2.x - e.p1.x, dy = e.p2.y - e.p1.y;
   const L = Math.hypot(dx, dy);
   if (L < 1e-9) return;
@@ -277,8 +533,11 @@ function drawDim(e: DimEntity | Extract<EntityShape, { type: 'dim' }>): void {
   drawDimCap(aS.x, aS.y,  ux,  uy, style);
   drawDimCap(bS.x, bS.y, -ux, -uy, style);
 
-  // Label.
-  const mid = { x: (aS.x + bS.x) / 2, y: (aS.y + bS.y) / 2 };
+  // Label — parameter `t` slides along a→b in screen space. 0.12/0.88 keep the
+  // text clear of the end-caps even for short dims while still visibly hugging
+  // the chosen side. `center` (default) is the classic midpoint placement.
+  const t = e.textAlign === 'start' ? 0.12 : e.textAlign === 'end' ? 0.88 : 0.5;
+  const pos = { x: aS.x + (bS.x - aS.x) * t, y: aS.y + (bS.y - aS.y) * t };
   const label = L.toFixed(2);
   const pxH = Math.max(10, e.textHeight * state.view.scale);
   ctx.save();
@@ -288,7 +547,175 @@ function drawDim(e: DimEntity | Extract<EntityShape, { type: 'dim' }>): void {
   let ang = Math.atan2(bS.y - aS.y, bS.x - aS.x);
   if (ang > Math.PI / 2)  ang -= Math.PI;
   if (ang < -Math.PI / 2) ang += Math.PI;
-  ctx.translate(mid.x, mid.y);
+  ctx.translate(pos.x, pos.y);
+  ctx.rotate(ang);
+  ctx.fillText(label, 0, -3);
+  ctx.restore();
+}
+
+/**
+ * Angular dim: arc between two rays from a shared vertex, end-caps at the
+ * arc endpoints, degree label at the arc midpoint. The `offset` field stores
+ * the user-picked arc anchor — its distance from `vertex` is the arc radius,
+ * and it lies in the sector being measured (disambiguates which of the four
+ * sectors around two crossing lines is the one with the dim).
+ */
+function drawAngularDim(e: DimEntity | Extract<EntityShape, { type: 'dim' }>): void {
+  const V = e.vertex, r1 = e.ray1, r2 = e.ray2;
+  if (!V || !r1 || !r2) return;
+  const d1x = r1.x - V.x, d1y = r1.y - V.y;
+  const d2x = r2.x - V.x, d2y = r2.y - V.y;
+  if (Math.hypot(d1x, d1y) < 1e-9 || Math.hypot(d2x, d2y) < 1e-9) return;
+  const dOx = e.offset.x - V.x, dOy = e.offset.y - V.y;
+  const R = Math.hypot(dOx, dOy);
+  if (R < 1e-9) return;
+
+  const TAU = Math.PI * 2;
+  const norm2pi = (x: number) => ((x % TAU) + TAU) % TAU;
+  const a1 = Math.atan2(d1y, d1x);
+  const a2 = Math.atan2(d2y, d2x);
+  const aO = Math.atan2(dOy, dOx);
+
+  // Pick the CCW sweep that contains the offset anchor — that's the sector
+  // the user is measuring. The other three sectors around a pair of crossing
+  // lines are ignored.
+  const sweep12 = norm2pi(a2 - a1);
+  const sweep1O = norm2pi(aO - a1);
+  const [aS, aE] = (sweep1O <= sweep12 + 1e-9) ? [a1, a2] : [a2, a1];
+  const sweep = norm2pi(aE - aS) || TAU;
+
+  // Sample the arc — robust to the world/screen coordinate flip without
+  // fighting ctx.arc's angle convention.
+  const steps = Math.max(24, Math.ceil(sweep / 0.05));
+  ctx.beginPath();
+  for (let i = 0; i <= steps; i++) {
+    const a = aS + sweep * (i / steps);
+    const sp = worldToScreen({ x: V.x + R * Math.cos(a), y: V.y + R * Math.sin(a) });
+    if (i === 0) ctx.moveTo(sp.x, sp.y); else ctx.lineTo(sp.x, sp.y);
+  }
+  ctx.stroke();
+
+  // End-caps sit at the arc endpoints, tangent to the arc, pointing INTO the
+  // arc. Screen-space tangent at world angle a (going CCW in world = CW in
+  // screen, because screen y flips) is (-sin(a), -cos(a)).
+  const startS = worldToScreen({ x: V.x + R * Math.cos(aS), y: V.y + R * Math.sin(aS) });
+  const endS   = worldToScreen({ x: V.x + R * Math.cos(aE), y: V.y + R * Math.sin(aE) });
+  const style: DimStyle = e.style ?? runtime.dimStyle ?? 'arrow';
+  drawDimCap(startS.x, startS.y, -Math.sin(aS), -Math.cos(aS), style);
+  drawDimCap(endS.x,   endS.y,    Math.sin(aE),  Math.cos(aE), style);
+
+  // Degree label: parameterise along the arc sweep so start/center/end drags
+  // the label toward the first ray / midpoint / second ray respectively.
+  const tArc = e.textAlign === 'start' ? 0.12 : e.textAlign === 'end' ? 0.88 : 0.5;
+  const aM = aS + sweep * tArc;
+  const midS = worldToScreen({ x: V.x + R * Math.cos(aM), y: V.y + R * Math.sin(aM) });
+  const degLabel = `${(sweep * 180 / Math.PI).toFixed(1)}°`;
+  const pxH = Math.max(10, e.textHeight * state.view.scale);
+  ctx.save();
+  ctx.font = `${pxH.toFixed(1)}px "Inter", system-ui, sans-serif`;
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'center';
+  // Tangent angle in screen space; flip if upside-down so text stays readable.
+  let textAng = Math.atan2(-Math.cos(aM), -Math.sin(aM));
+  if (textAng >  Math.PI / 2) textAng -= Math.PI;
+  if (textAng < -Math.PI / 2) textAng += Math.PI;
+  ctx.translate(midS.x, midS.y);
+  ctx.rotate(textAng);
+  ctx.fillText(degLabel, 0, -3);
+  ctx.restore();
+}
+
+/**
+ * Radius / diameter dim.
+ *
+ * Data model (see tools.ts):
+ *   vertex  = centre of the measured circle/arc
+ *   ray1    = near-edge point (on the ray from centre through the label anchor)
+ *   offset  = label anchor, where the user clicked to place the leader
+ *   radius  = dist(vertex, ray1)
+ *
+ * Geometry:
+ *   • Radius:    leader from near-edge → label anchor, arrow at the edge
+ *                pointing inward (toward the circle). Label prefix "R".
+ *   • Diameter:  leader from far-edge → near-edge → label anchor with arrows
+ *                at BOTH edges pointing inward (toward the circle). Label
+ *                prefix "Ø" and value = 2 × r.
+ *
+ * Label sits next to the anchor, rotated along the leader direction.
+ */
+function drawRadialDim(e: DimEntity | Extract<EntityShape, { type: 'dim' }>): void {
+  const C = e.vertex, E = e.ray1;
+  if (!C || !E) return;
+  const r = Math.hypot(E.x - C.x, E.y - C.y);
+  if (r < 1e-9) return;
+
+  // Direction from centre through label anchor (normalised). If the anchor
+  // sits exactly on the centre (degenerate), fall back to the stored ray1.
+  let ux = e.offset.x - C.x, uy = e.offset.y - C.y;
+  let ul = Math.hypot(ux, uy);
+  if (ul < 1e-9) { ux = E.x - C.x; uy = E.y - C.y; ul = r; }
+  ux /= ul; uy /= ul;
+
+  const near: Pt = { x: C.x + ux * r, y: C.y + uy * r };
+  const far:  Pt = { x: C.x - ux * r, y: C.y - uy * r };
+  const anchor = e.offset;
+
+  const nearS = worldToScreen(near);
+  const farS  = worldToScreen(far);
+  const anchorS = worldToScreen(anchor);
+
+  // Leader: near-edge → anchor (radius) or far-edge → anchor (diameter).
+  ctx.beginPath();
+  if (e.dimKind === 'diameter') {
+    ctx.moveTo(farS.x, farS.y);
+    ctx.lineTo(anchorS.x, anchorS.y);
+  } else {
+    ctx.moveTo(nearS.x, nearS.y);
+    ctx.lineTo(anchorS.x, anchorS.y);
+  }
+  ctx.stroke();
+
+  // End-cap direction. (ux, uy) is a world-space direction; flip the y
+  // component for screen-space because screen y grows downward.
+  const sUx =  ux, sUy = -uy;                  // outward along leader in screen space
+  const style: DimStyle = e.style ?? runtime.dimStyle ?? 'arrow';
+  // Cap at the near edge, pointing INWARD (away from centre, toward the
+  // leader's tail). drawDimCap draws the cap from (x,y) along (ux,uy). The
+  // cap convention is "tip at (x,y), tail at (x + L*ux, y + L*uy)" — so to
+  // place the arrow TIP on the edge pointing AT the circle, we pass the
+  // outward screen direction (from centre toward anchor = away from centre).
+  drawDimCap(nearS.x, nearS.y, sUx, sUy, style);
+  if (e.dimKind === 'diameter') {
+    // Second cap on the opposite edge, tip on the far edge, pointing toward
+    // the centre (i.e. back along the leader). That's the inverse direction.
+    drawDimCap(farS.x, farS.y, -sUx, -sUy, style);
+  }
+
+  // Label near the anchor, rotated along the leader direction and offset
+  // slightly outward so the text doesn't overlap the cap.
+  const label = e.dimKind === 'diameter'
+    ? `Ø ${(2 * r).toFixed(2)}`
+    : `R ${r.toFixed(2)}`;
+  const pxH = Math.max(10, e.textHeight * state.view.scale);
+  ctx.save();
+  ctx.font = `${pxH.toFixed(1)}px "Inter", system-ui, sans-serif`;
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'center';
+  // Text angle: follow the leader direction (near → anchor in screen space).
+  const lx = anchorS.x - nearS.x, ly = anchorS.y - nearS.y;
+  let ang = Math.atan2(ly, lx);
+  if (ang >  Math.PI / 2) ang -= Math.PI;
+  if (ang < -Math.PI / 2) ang += Math.PI;
+  // Slide the label along the leader: `end` (default) pins it at the anchor
+  // where the user pulled it, `center` drops it halfway along the leader,
+  // `start` hugs the edge near the circle. Using `end` as the implicit
+  // default preserves the behaviour of older dims that have no textAlign.
+  const tLead = e.textAlign === 'start' ? 0.12 : e.textAlign === 'center' ? 0.5 : 1.0;
+  const labelS = {
+    x: nearS.x + (anchorS.x - nearS.x) * tLead,
+    y: nearS.y + (anchorS.y - nearS.y) * tLead,
+  };
+  ctx.translate(labelS.x, labelS.y);
   ctx.rotate(ang);
   ctx.fillText(label, 0, -3);
   ctx.restore();
@@ -352,18 +779,31 @@ function drawDimCap(x: number, y: number, ux: number, uy: number, style: DimStyl
 function drawText(e: TextEntity | Extract<EntityShape, { type: 'text' }>): void {
   const pxH = e.height * state.view.scale;
   if (pxH < 3) return;
-  const p = worldToScreen({ x: e.x, y: e.y });
+  const layout = layoutText(e);
+  const rot = e.rotation ?? 0;
+
   ctx.save();
   ctx.font = `${pxH.toFixed(1)}px "Inter", system-ui, sans-serif`;
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
-  const rot = e.rotation ?? 0;
+
   if (rot) {
-    ctx.translate(p.x, p.y);
+    // Rotate around the anchor point so multi-line blocks pivot sensibly.
+    const origin = worldToScreen({ x: e.x, y: e.y });
+    ctx.translate(origin.x, origin.y);
     ctx.rotate(-rot);
-    ctx.fillText(e.text, 0, 0);
+    // In the rotated frame the anchor is at (0, 0); each line offsets from
+    // there in world-units scaled to screen. dy for canvas = negative of world
+    // dy (screen Y grows down, world Y grows up).
+    for (let i = 0; i < layout.lines.length; i++) {
+      const dyWorld = layout.baselineY[i] - e.y;
+      ctx.fillText(layout.lines[i], 0, -dyWorld * state.view.scale);
+    }
   } else {
-    ctx.fillText(e.text, p.x, p.y);
+    for (let i = 0; i < layout.lines.length; i++) {
+      const pt = worldToScreen({ x: e.x, y: layout.baselineY[i] });
+      ctx.fillText(layout.lines[i], pt.x, pt.y);
+    }
   }
   ctx.restore();
 }
@@ -377,9 +817,126 @@ function drawLineSeg(x1: number, y1: number, x2: number, y2: number): void {
   ctx.stroke();
 }
 
+// Axis tints — X = warm red, Y = cool green. Picked to read clearly on both
+// light and dark themes after adaptiveColor() passes (which nudges them
+// toward the theme contrast). Standard CAD convention (X=red, Y=green, Z=blue).
+const AXIS_X_COLOR = '#d94a4a';
+const AXIS_Y_COLOR = '#3aa84f';
+
+/**
+ * Paint the two origin axes as viewport-wide infinite lines through (0,0).
+ * Axes are independent of the layer system: they're toggled from the snap
+ * toolbar (`runtime.snapSettings.showAxes`) and always drawn with the same
+ * fine-dashed, colour-coded, labelled style — X red, Y green, "X"/"Y" pill
+ * at the positive-direction tip just inside the viewport.
+ *
+ * Draws over the grid but under all geometry so user entities stay on top.
+ */
+function drawOriginAxes(w: number, h: number): void {
+  if (!runtime.snapSettings.showAxes) return;
+  drawOneAxis(w, h, 'x');
+  drawOneAxis(w, h, 'y');
+}
+
+function drawOneAxis(w: number, h: number, kind: 'x' | 'y'): void {
+  const base = kind === 'x' ? AXIS_X_COLOR : AXIS_Y_COLOR;
+  const stroke = adaptiveColor(base);
+  const dx = kind === 'x' ? 1 : 0;
+  const dy = kind === 'x' ? 0 : 1;
+
+  const tl = screenToWorld({ x: -32, y: -32 });
+  const br = screenToWorld({ x: w + 32, y: h + 32 });
+  const minX = Math.min(tl.x, br.x), maxX = Math.max(tl.x, br.x);
+  const minY = Math.min(tl.y, br.y), maxY = Math.max(tl.y, br.y);
+
+  // Liang-Barsky param clip around an infinite line through world origin.
+  let t0 = -Infinity, t1 = Infinity;
+  const clip = (p: number, q: number): boolean => {
+    if (p === 0) return q >= 0;
+    const t = q / p;
+    if (p < 0) { if (t > t1) return false; if (t > t0) t0 = t; }
+    else       { if (t < t0) return false; if (t < t1) t1 = t; }
+    return true;
+  };
+  if (!clip(-dx, 0 - minX)) return;
+  if (!clip( dx, maxX - 0)) return;
+  if (!clip(-dy, 0 - minY)) return;
+  if (!clip( dy, maxY - 0)) return;
+  if (!Number.isFinite(t0) || !Number.isFinite(t1) || t0 >= t1) return;
+
+  ctx.save();
+  ctx.strokeStyle = stroke;
+  ctx.fillStyle = stroke;
+  ctx.lineWidth = 1;
+  // Fine dash in world mm, rendered at the 100%-zoom reference scale so the
+  // axis cadence is identical at every zoom level. Clamp per-segment to a
+  // half-pixel minimum so the pattern doesn't vanish on sub-pixel densities.
+  const patternMm = [1.2, 1];
+  ctx.setLineDash(patternMm.map(v => Math.max(0.5, v * DASH_REF_SCALE)));
+  drawLineSeg(dx * t0, dy * t0, dx * t1, dy * t1);
+  ctx.setLineDash([]);
+
+  // Label at the positive-direction tip. `t1` is the far positive end of the
+  // clipped segment because dx/dy ≥ 0 for both axes. Inset by 10 px so it
+  // doesn't rest on the viewport edge.
+  const tipWorld = { x: dx * t1, y: dy * t1 };
+  const tip = worldToScreen(tipWorld);
+  const INSET = 10;
+  let tx = tip.x, ty = tip.y;
+  if (kind === 'x') { tx -= INSET; ty -= INSET; }   // inside top-right of x tip
+  else              { tx += INSET; ty += INSET; }   // inside bottom-right of y tip
+  ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  // Small pill behind the label so it stays legible over background grid.
+  const label = kind === 'x' ? 'X' : 'Y';
+  const metrics = ctx.measureText(label);
+  const padX = 4;
+  const boxW = metrics.width + padX * 2;
+  const boxH = 14;
+  const boxX = tx - padX;
+  const boxY = ty - boxH / 2;
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = css('--bg');
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = stroke;
+  ctx.fillText(label, tx, ty);
+  ctx.restore();
+}
+
 function drawXLine(e: XLineEntity | Extract<EntityShape, { type: 'xline' }>): void {
-  const T = 100000;
-  drawLineSeg(e.x1 - e.dx * T, e.y1 - e.dy * T, e.x1 + e.dx * T, e.y1 + e.dy * T);
+  // Infinite line — clip to the visible viewport (plus a small margin) before
+  // drawing. Naively using a huge T made the on-screen segment span millions
+  // of pixels at high zoom, which the rasterizer handled very poorly. Clipping
+  // here turns every xline into a short viewport-sized segment regardless of
+  // zoom level.
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const tl = screenToWorld({ x: -32, y: -32 });
+  const br = screenToWorld({ x: w + 32, y: h + 32 });
+  const minX = Math.min(tl.x, br.x), maxX = Math.max(tl.x, br.x);
+  const minY = Math.min(tl.y, br.y), maxY = Math.max(tl.y, br.y);
+
+  // Liang–Barsky parametric clip of the infinite line {p = base + t·d} against
+  // the viewport rect. t0/t1 bracket the visible portion.
+  let t0 = -Infinity, t1 = Infinity;
+  const clip = (p: number, q: number): boolean => {
+    if (p === 0) return q >= 0;
+    const t = q / p;
+    if (p < 0) { if (t > t1) return false; if (t > t0) t0 = t; }
+    else       { if (t < t0) return false; if (t < t1) t1 = t; }
+    return true;
+  };
+  if (!clip(-e.dx, e.x1 - minX)) return;
+  if (!clip( e.dx, maxX - e.x1)) return;
+  if (!clip(-e.dy, e.y1 - minY)) return;
+  if (!clip( e.dy, maxY - e.y1)) return;
+  if (!Number.isFinite(t0) || !Number.isFinite(t1) || t0 >= t1) return;
+
+  drawLineSeg(
+    e.x1 + e.dx * t0, e.y1 + e.dy * t0,
+    e.x1 + e.dx * t1, e.y1 + e.dy * t1,
+  );
 }
 
 function drawRect(e: RectEntity | Extract<EntityShape, { type: 'rect' }>): void {
@@ -464,9 +1021,120 @@ function drawPolyline(e: PolylineEntity | Extract<EntityShape, { type: 'polyline
   ctx.stroke();
 }
 
+/**
+ * Draw a hatch / fill region. For `solid`, fills the boundary polygon with
+ * the current fillStyle. For `lines` / `cross`, clips to the boundary and
+ * draws a family of parallel lines at `angle` rad, spaced `spacing` world-
+ * units apart. Cross-hatch adds a second family at angle + 90°.
+ *
+ * Boundary polygon drawn with a thin visible outline so the user can always
+ * see where the hatch ends — otherwise stripe patterns on a complex shape
+ * look disconnected.
+ */
+function drawHatch(
+  e: HatchEntity | Extract<EntityShape, { type: 'hatch' }>,
+  selected: boolean,
+): void {
+  if (!e.pts || e.pts.length < 3) return;
+  const sPts = e.pts.map(worldToScreen);
+  const sHoles: { x: number; y: number }[][] = (e.holes ?? [])
+    .filter(h => h.length >= 3)
+    .map(h => h.map(worldToScreen));
+
+  // Combined boundary path (outer + holes). Evaluate with the even-odd rule so
+  // the holes cut out of the filled/clipped region.
+  const buildBoundary = (): void => {
+    ctx.beginPath();
+    ctx.moveTo(sPts[0].x, sPts[0].y);
+    for (let i = 1; i < sPts.length; i++) ctx.lineTo(sPts[i].x, sPts[i].y);
+    ctx.closePath();
+    for (const hole of sHoles) {
+      ctx.moveTo(hole[0].x, hole[0].y);
+      for (let i = 1; i < hole.length; i++) ctx.lineTo(hole[i].x, hole[i].y);
+      ctx.closePath();
+    }
+  };
+
+  if (e.mode === 'solid') {
+    buildBoundary();
+    ctx.fill('evenodd');
+    // Very faint outline when not selected so the fill edge stays crisp on
+    // top of other geometry; a stronger outline when selected.
+    if (selected) {
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    return;
+  }
+
+  // Stripe family (lines / cross).
+  const angle = e.angle ?? Math.PI / 4;
+  const spacingWorld = Math.max(0.1, e.spacing ?? 5);
+  const spacingPx = spacingWorld * state.view.scale;
+
+  // Boundary bbox in screen space — we shoot stripes across the whole bbox
+  // then clip to the boundary, which is both correct and simpler than a
+  // proper line-polygon intersection pass.
+  let minX = sPts[0].x, minY = sPts[0].y, maxX = sPts[0].x, maxY = sPts[0].y;
+  for (const p of sPts) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const halfDiag = Math.hypot(maxX - minX, maxY - minY) / 2 + spacingPx;
+
+  ctx.save();
+  buildBoundary();
+  ctx.clip('evenodd');
+
+  // Draw both families (angle, and for 'cross' also angle + 90°).
+  const families = e.mode === 'cross'
+    ? [angle, angle + Math.PI / 2]
+    : [angle];
+
+  for (const a of families) {
+    // Stripes are drawn perpendicular to direction `(cos a, sin a)`, spaced
+    // along the normal `n = (-sin a, cos a)`. Iterate signed-offsets centred
+    // on the bbox centre so the pattern is symmetric and doesn't shift when
+    // the shape moves.
+    const dirX = Math.cos(a), dirY = -Math.sin(a); // screen y is flipped
+    const nx = -dirY, ny = dirX;
+    // Number of stripes needed to span the bbox diagonal.
+    const N = Math.ceil(halfDiag / spacingPx) + 1;
+    ctx.beginPath();
+    for (let k = -N; k <= N; k++) {
+      const off = k * spacingPx;
+      const bx = cx + nx * off, by = cy + ny * off;
+      const x1 = bx - dirX * halfDiag, y1 = by - dirY * halfDiag;
+      const x2 = bx + dirX * halfDiag, y2 = by + dirY * halfDiag;
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // Outline the boundary so the hatch reads as "this area" — faint for
+  // normal, bright when selected.
+  ctx.save();
+  ctx.setLineDash(selected ? [] : [3, 3]);
+  ctx.lineWidth = selected ? 1.4 : 0.7;
+  ctx.globalAlpha = selected ? 1 : 0.55;
+  buildBoundary();
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawPreview(p: Preview): void {
   ctx.save();
-  ctx.strokeStyle = css('--preview');
+  const col = css('--preview');
+  ctx.strokeStyle = col;
+  // Also set fillStyle: dim previews (angular, radius, diameter) and text
+  // previews paint their labels with fillText, which inherits whatever
+  // fillStyle the last-drawn entity left behind. Without this, the label
+  // would come out in the wrong colour — on light themes (Blaupause) the
+  // inherited light fill makes the preview number invisible.
+  ctx.fillStyle = col;
   ctx.lineWidth = 1.2;
   ctx.setLineDash([4, 4]);
   if (p.type === 'group') {
@@ -481,14 +1149,24 @@ function drawPreview(p: Preview): void {
 const SNAP_LABELS: Record<SnapPoint['type'], string> = {
   end: 'END', mid: 'MITTE', int: 'SCHN', center: 'ZENTR',
   axis: 'ACHS', grid: 'RASTER', tangent: 'TANG', perp: 'LOT',
+  polar: 'POLAR', track: 'DYN',
 };
 
 function drawSnapMarker(s: SnapPoint): void {
   const sp = worldToScreen(s);
   ctx.save();
   const snap = css('--snap');
-  // Dark halo + bright marker — works across light/dark entities behind it.
-  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  // Halo passt sich dem Theme an: dunkler Hintergrund → dunkler Halo (macht
+  // den hellen Marker sichtbar), heller Hintergrund → heller Halo (sonst
+  // erzeugt ein hart-schwarzer Umriss in Hell-Themes das störende
+  // „Strichgerüst" um die Beschriftung, das der Nutzer gemeldet hat). Wir
+  // testen Luminanz von --bg; der Halo selbst wird aus --bg mit hoher Alpha
+  // gebaut, damit er unabhängig vom konkreten Theme-Farbton harmoniert.
+  const bg = css('--bg');
+  const isDark = relLum(bg) < 0.5;
+  const markerHalo = isDark ? 'rgba(0,0,0,0.55)' : 'rgba(255,255,255,0.75)';
+  const labelHalo  = isDark ? 'rgba(0,0,0,0.85)' : 'rgba(255,255,255,0.9)';
+  ctx.strokeStyle = markerHalo;
   ctx.lineWidth = 4;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
@@ -499,9 +1177,8 @@ function drawSnapMarker(s: SnapPoint): void {
   drawSnapShape(sp, s.type);
   ctx.stroke();
 
-  // Type label — uppercase Space Mono, 10px, 12px offset to the upper-right
-  // of the marker. Paint-order stroke (dark halo under bright fill) keeps it
-  // legible over any canvas background.
+  // Typ-Beschriftung — Space Mono 10px, 12px oben-rechts vom Marker. Halo
+  // (stroke) unter Füllung für Lesbarkeit auf jedem Hintergrund.
   const label = SNAP_LABELS[s.type];
   if (label) {
     const lx = sp.x + 12;
@@ -510,7 +1187,7 @@ function drawSnapMarker(s: SnapPoint): void {
     ctx.textBaseline = 'alphabetic';
     ctx.lineJoin = 'round';
     ctx.miterLimit = 2;
-    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.strokeStyle = labelHalo;
     ctx.lineWidth = 3;
     ctx.strokeText(label, lx, ly);
     ctx.fillStyle = snap;
@@ -557,5 +1234,53 @@ function drawSnapShape(sp: { x: number; y: number }, type: SnapPoint['type']): v
     ctx.moveTo(sp.x - 4, sp.y + 3);
     ctx.lineTo(sp.x - 4, sp.y + 7);
     ctx.lineTo(sp.x,     sp.y + 7);
+  } else if (type === 'polar' || type === 'track') {
+    // Small square rotated 45° (diamond) — lightweight, reads as "alignment
+    // point" without competing visually with the dashed guide line through it.
+    const r = type === 'polar' ? 6 : 5;
+    ctx.moveTo(sp.x - r, sp.y);
+    ctx.lineTo(sp.x,     sp.y - r);
+    ctx.lineTo(sp.x + r, sp.y);
+    ctx.lineTo(sp.x,     sp.y + r);
+    ctx.closePath();
   }
 }
+
+/**
+ * Dashed guide line for an active polar/track snap. The ray passes through
+ * `origin` in direction `angleRad`; we draw it from a short bit behind the
+ * origin to well past the cursor so it reads as "infinite" on screen.
+ *
+ * For 2-guide intersections (polar × track or track × track) both rays are
+ * drawn so the user sees the geometric construction.
+ */
+function drawActiveGuide(s: SnapPoint): void {
+  if (!s.origin || s.angleRad === undefined) return;
+  ctx.save();
+  ctx.strokeStyle = css('--guides');
+  ctx.globalAlpha = 0.9;
+  ctx.setLineDash([6, 4]);
+  ctx.lineWidth = 1;
+  drawGuideRay(s.origin, s.angleRad);
+  if (s.origin2 && s.angleRad2 !== undefined) {
+    drawGuideRay(s.origin2, s.angleRad2);
+  }
+  ctx.restore();
+}
+
+/** Single infinite-style guide ray in screen-space dashed line. */
+function drawGuideRay(origin: Pt, angleRad: number): void {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  // Project the world ray onto the canvas diagonal so it spans the whole
+  // viewport regardless of zoom/pan. Parametric in world units; the large
+  // extent is trimmed visually by the viewport.
+  const diag = Math.hypot(w, h) / state.view.scale;
+  const dx = Math.cos(angleRad), dy = Math.sin(angleRad);
+  const a = worldToScreen({ x: origin.x - dx * diag, y: origin.y - dy * diag });
+  const b = worldToScreen({ x: origin.x + dx * diag, y: origin.y + dy * diag });
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+}
+

@@ -335,28 +335,87 @@ export function isParameterReferenced(id: string): boolean {
     if (e.kind === 'formula') return e.refs.includes(id);
     return false;
   };
+  // All Exprs transitively contained by a PointRef (polar carries angle +
+  // distance and can nest another PointRef as `from`).
+  const inPtRef = (pt: import('./types').PointRef): boolean => {
+    if (pt.kind === 'abs') return inExpr(pt.x) || inExpr(pt.y);
+    if (pt.kind === 'polar') return inExpr(pt.angle) || inExpr(pt.distance) || inPtRef(pt.from);
+    if (pt.kind === 'rayHit') return inExpr(pt.angle) || inPtRef(pt.from);
+    return false; // endpoint / center / mid / intersection carry no Exprs
+  };
   for (const f of state.features) {
     switch (f.kind) {
       case 'line':
+        if (inPtRef(f.p1) || inPtRef(f.p2)) return true;
+        break;
       case 'polyline':
-        for (const pt of ('pts' in f ? f.pts : [f.p1, f.p2])) {
-          if (pt.kind === 'abs' && (inExpr(pt.x) || inExpr(pt.y))) return true;
-        }
+        for (const pt of f.pts) if (inPtRef(pt)) return true;
         break;
       case 'rect':
-        if (f.p1.kind === 'abs' && (inExpr(f.p1.x) || inExpr(f.p1.y))) return true;
+        if (inPtRef(f.p1)) return true;
         if (inExpr(f.width) || inExpr(f.height)) return true;
         break;
       case 'circle':
-        if (f.center.kind === 'abs' && (inExpr(f.center.x) || inExpr(f.center.y))) return true;
+        if (inPtRef(f.center)) return true;
         if (inExpr(f.radius)) return true;
+        break;
+      case 'arc':
+        if (inPtRef(f.center)) return true;
+        if (inExpr(f.radius) || inExpr(f.a1) || inExpr(f.a2)) return true;
+        break;
+      case 'ellipse':
+        if (inPtRef(f.center)) return true;
+        if (inExpr(f.rx) || inExpr(f.ry) || inExpr(f.rot)) return true;
+        break;
+      case 'spline':
+        for (const pt of f.pts) if (inPtRef(pt)) return true;
+        break;
+      case 'xline':
+        if (inPtRef(f.p)) return true;
+        if (inExpr(f.dx) || inExpr(f.dy)) return true;
         break;
       case 'parallelXLine':
         if (inExpr(f.distance)) return true;
         break;
       case 'text':
-        if (f.p.kind === 'abs' && (inExpr(f.p.x) || inExpr(f.p.y))) return true;
+        if (inPtRef(f.p)) return true;
         if (inExpr(f.height) || inExpr(f.rotation)) return true;
+        break;
+      case 'dim':
+        if (inPtRef(f.p1) || inPtRef(f.p2) || inPtRef(f.offset)) return true;
+        if (f.vertex && inPtRef(f.vertex)) return true;
+        if (f.ray1   && inPtRef(f.ray1))   return true;
+        if (f.ray2   && inPtRef(f.ray2))   return true;
+        if (inExpr(f.textHeight)) return true;
+        break;
+      case 'axisParallelXLine':
+        if (inExpr(f.distance)) return true;
+        break;
+      case 'hatch':
+        for (const pt of f.pts) if (inPtRef(pt)) return true;
+        if (f.holes) for (const h of f.holes) for (const pt of h) if (inPtRef(pt)) return true;
+        if (f.angle   && inExpr(f.angle))   return true;
+        if (f.spacing && inExpr(f.spacing)) return true;
+        break;
+      case 'mirror':
+        if (f.axis.kind === 'twoPoints') {
+          if (inPtRef(f.axis.p1) || inPtRef(f.axis.p2)) return true;
+        }
+        break;
+      case 'array':
+        if (inPtRef(f.offset.p1) || inPtRef(f.offset.p2)) return true;
+        if (f.rowOffset) {
+          if (inPtRef(f.rowOffset.p1) || inPtRef(f.rowOffset.p2)) return true;
+        }
+        if (inExpr(f.cols) || inExpr(f.rows)) return true;
+        break;
+      case 'rotate':
+        if (inPtRef(f.center)) return true;
+        if (inExpr(f.angle)) return true;
+        break;
+      case 'crossMirror':
+        if (inPtRef(f.center)) return true;
+        if (inExpr(f.angle)) return true;
         break;
     }
   }
