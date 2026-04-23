@@ -19,8 +19,9 @@
 
 import { PDFDocument, PDFFont, StandardFonts, degrees, rgb, PDFPage, PDFImage } from 'pdf-lib';
 import type { ArcEntity, CircleEntity, DimEntity, DimStyle, EllipseEntity,
-              Entity, Layer, LineEntity, PdfTemplateId, PolylineEntity,
-              Pt, RectEntity, SplineEntity, TextEntity, TitleBlockData }
+              Entity, HatchEntity, Layer, LineEntity, PdfTemplateId,
+              PolylineEntity, Pt, RectEntity, SplineEntity, TextEntity,
+              TitleBlockData }
   from '../types';
 import { exportBbox, isExportable } from './drawing-bounds';
 import { PT_PER_MM } from './units';
@@ -101,14 +102,27 @@ const DEFAULT_LINE_WIDTH_PT = 0.25 * PT_PER_MM;
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Return an SVG path string for an arc, in pt, Y-up (pdf-lib convention).
- * `startAngle`/`endAngle` in radians, CCW from +X. Subdivides into ≤90°
- * quarters for low Bezier error.
+ * Return an SVG path string for an arc. Coordinates are in pt, pre-flipped
+ * for `page.drawSvgPath({ x: 0, y: pageHeight, scale: 1 })`: we compute each
+ * point in PDF Y-up space and then write `pathY = pageHeight - pdfY` so the
+ * internal `scale(1,-1)` + `translate(0, pageHeight)` that pdf-lib applies
+ * unwinds back to the original PDF-up coord.
+ *
+ * `startAngle`/`endAngle` in radians, CCW from +X (world/PDF convention —
+ * the caller still passes PDF Y-up angles; we flip only the final point
+ * emission). Subdivides into ≤90° quarters for low Bezier error.
+ *
+ * Earlier versions skipped the pre-flip and relied on `y: pageHeight` alone,
+ * which silently mirrored every arc across the page centre line. Full-arc
+ * symmetric shapes hid the bug; partial arcs (fillets at H-shape corners,
+ * e.g. HLogo) drew at the wrong corner and didn't connect to the lines they
+ * were meant to round off.
  */
 function arcPathPt(
   cxPt: number, cyPt: number, rPt: number,
   startAngle: number, endAngle: number,
-  sweepCCW: boolean = true,
+  sweepCCW: boolean,
+  pageH: number,
 ): string {
   // Normalise sweep to [0, 2π] in the correct direction.
   let sweep = endAngle - startAngle;
@@ -124,13 +138,14 @@ function arcPathPt(
   // k is the tangent-handle length for a unit arc of `segAngle` radians.
   const k = (4 / 3) * Math.tan(segAngle / 4);
 
+  const sy = (y: number) => pageH - y;
   const atPt = (a: number) => ({
     x: cxPt + Math.cos(a) * rPt,
     y: cyPt + Math.sin(a) * rPt,
   });
   let a = startAngle;
   let p0 = atPt(a);
-  let out = `M ${p0.x.toFixed(3)} ${p0.y.toFixed(3)}`;
+  let out = `M ${p0.x.toFixed(3)} ${sy(p0.y).toFixed(3)}`;
   for (let i = 0; i < numSegs; i++) {
     const a1 = a + segAngle;
     const p1 = atPt(a1);
@@ -143,11 +158,168 @@ function arcPathPt(
       x: p1.x + Math.sin(a1) * k * rPt,
       y: p1.y - Math.cos(a1) * k * rPt,
     };
-    out += ` C ${c0.x.toFixed(3)} ${c0.y.toFixed(3)} ${c1.x.toFixed(3)} ${c1.y.toFixed(3)} ${p1.x.toFixed(3)} ${p1.y.toFixed(3)}`;
+    out += ` C ${c0.x.toFixed(3)} ${sy(c0.y).toFixed(3)} ${c1.x.toFixed(3)} ${sy(c1.y).toFixed(3)} ${p1.x.toFixed(3)} ${sy(p1.y).toFixed(3)}`;
     a = a1;
     p0 = p1;
   }
   return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Hatch helpers
+//
+// pdf-lib doesn't expose clip-path construction, so instead of clipping a big
+// family of infinite stripes to the boundary we analytically intersect each
+// stripe with every polygon edge (outer + holes) and draw only the interior
+// segments. Even-odd parity pairs adjacent intersections into interior runs,
+// so holes "just work" without a separate pass. Complexity is O(N·E) per
+// hatch with N stripes and E total edges — fine for realistic CAD cases.
+//
+// Solid fills use `drawSvgPath({ color, …, x:0, y:pageH, scale:1 })` with the
+// boundary paths built Y-pre-flipped (same trick as arcPathPt) so pdf-lib's
+// internal scale(1,-1) + translate-to-pageHeight unwinds to PDF-up coords.
+// Even-odd fill rule cuts holes out of the outer region.
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build an SVG path string (Y-pre-flipped for `drawSvgPath({ y: pageH })`)
+ * covering the outer boundary plus each hole as separate sub-paths. pdf-lib
+ * uses the default non-zero fill rule; our renderer (canvas) uses even-odd
+ * explicitly. With same-winding holes the two rules agree; if the user
+ * digitised a hole in the same orientation as the outer ring we still want a
+ * proper cut-out, so we emit a path string that the non-zero rule also
+ * respects (by reversing hole winding — not necessary in practice because the
+ * hatch tool writes holes CW when the outer is CCW, but doing it explicitly
+ * is cheap insurance).
+ */
+function hatchBoundaryPath(
+  outer: { x: number; y: number }[],
+  holes: { x: number; y: number }[][],
+  pageH: number,
+): string {
+  const sy = (y: number) => pageH - y;
+  const subpath = (pts: { x: number; y: number }[]) => {
+    if (pts.length < 2) return '';
+    let s = `M ${pts[0].x.toFixed(3)} ${sy(pts[0].y).toFixed(3)}`;
+    for (let i = 1; i < pts.length; i++) {
+      s += ` L ${pts[i].x.toFixed(3)} ${sy(pts[i].y).toFixed(3)}`;
+    }
+    return s + ' Z';
+  };
+  let d = subpath(outer);
+  for (const hole of holes) d += ' ' + subpath(hole);
+  return d;
+}
+
+/**
+ * Intersect stripe line through (bx,by) with direction (dx,dy) (both in PDF
+ * pt) against every polygon edge (outer + holes). Returns sorted `t` values
+ * where `p = (bx,by) + t * (dx,dy)` crosses an edge. Adjacent pairs are
+ * interior segments (even-odd rule).
+ */
+function stripeHits(
+  bx: number, by: number, dx: number, dy: number,
+  outer: { x: number; y: number }[],
+  holes: { x: number; y: number }[][],
+): number[] {
+  const ts: number[] = [];
+  const edges = (pts: { x: number; y: number }[]): void => {
+    const n = pts.length;
+    if (n < 2) return;
+    for (let i = 0; i < n; i++) {
+      const a = pts[i], b = pts[(i + 1) % n];
+      // Line (bx,by)+t(dx,dy) = edge a + s(b-a) → solve 2x2.
+      const ex = b.x - a.x, ey = b.y - a.y;
+      const det = dx * (-ey) - dy * (-ex);
+      if (Math.abs(det) < 1e-12) continue;              // parallel
+      const rhs_t = (a.x - bx) * (-ey) - (a.y - by) * (-ex);
+      const rhs_s = dx * (a.y - by)  - dy * (a.x - bx);
+      const t = rhs_t / det;
+      const s = rhs_s / det;
+      // Skip the degenerate "ray hits vertex exactly" case by biasing the
+      // half-open edge interval — otherwise a stripe grazing a vertex emits
+      // two hits on adjacent edges and even-odd pairing mis-classifies the
+      // stripe as entering → exiting → entering again.
+      if (s >= 0 && s < 1) ts.push(t);
+    }
+  };
+  edges(outer);
+  for (const hole of holes) edges(hole);
+  ts.sort((a, b) => a - b);
+  return ts;
+}
+
+/**
+ * Render a hatch entity (solid / lines / cross) onto the PDF page.
+ * `xformedOuter`/`xformedHoles` are the boundary polygons already mapped from
+ * world-mm to PDF-pt. `spacingPt` / `angle` are the stripe parameters (pt +
+ * radians, already scale-converted by the caller).
+ */
+function drawHatchPdf(
+  page: PDFPage,
+  mode: 'solid' | 'lines' | 'cross',
+  xformedOuter: { x: number; y: number }[],
+  xformedHoles: { x: number; y: number }[][],
+  spacingPt: number,
+  angle: number,
+  lineWidth: number,
+  color: ReturnType<typeof rgb>,
+): void {
+  if (xformedOuter.length < 3) return;
+  const ph = page.getHeight();
+
+  if (mode === 'solid') {
+    const d = hatchBoundaryPath(xformedOuter, xformedHoles, ph);
+    page.drawSvgPath(d, {
+      color,
+      x: 0, y: ph, scale: 1,
+    });
+    return;
+  }
+
+  // Bounding box of the boundary in PDF pt — governs how far we have to shoot
+  // stripes so every interior cell is covered regardless of the stripe angle.
+  let minX = xformedOuter[0].x, maxX = minX;
+  let minY = xformedOuter[0].y, maxY = minY;
+  for (const p of xformedOuter) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  // Half-diagonal plus a stripe's width of slack so extreme diagonals still
+  // sweep all the way across the shape's bbox.
+  const halfDiag = Math.hypot(maxX - minX, maxY - minY) / 2 + spacingPt;
+
+  const families = mode === 'cross'
+    ? [angle, angle + Math.PI / 2]
+    : [angle];
+
+  const safeSpacing = Math.max(0.1, spacingPt);
+  for (const a of families) {
+    const dirX = Math.cos(a), dirY = Math.sin(a);
+    const nx = -dirY, ny = dirX;
+    const N = Math.ceil(halfDiag / safeSpacing) + 1;
+    for (let k = -N; k <= N; k++) {
+      const off = k * safeSpacing;
+      const bx = cx + nx * off, by = cy + ny * off;
+      const ts = stripeHits(bx, by, dirX, dirY, xformedOuter, xformedHoles);
+      // Cap the sweep range to ±halfDiag so we don't emit lines that run off
+      // to infinity if even-odd pairing is odd (numerical edge case).
+      const tMin = -halfDiag * 2, tMax = halfDiag * 2;
+      for (let i = 0; i + 1 < ts.length; i += 2) {
+        const t0 = Math.max(tMin, ts[i]);
+        const t1 = Math.min(tMax, ts[i + 1]);
+        if (t1 <= t0) continue;
+        const x1 = bx + dirX * t0, y1 = by + dirY * t0;
+        const x2 = bx + dirX * t1, y2 = by + dirY * t1;
+        page.drawLine({
+          start: { x: x1, y: y1 },
+          end:   { x: x2, y: y2 },
+          thickness: lineWidth, color,
+        });
+      }
+    }
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -435,17 +607,17 @@ function drawEntity(
       const A = e as ArcEntity;
       const c = xform(A.cx, A.cy);
       const rPt = (A.r / scaleDenom) * PT_PER_MM;
-      const d = arcPathPt(c.x, c.y, rPt, A.a1, A.a2, true);
-      // pdf-lib's drawSvgPath expects Y-down by default (SVG convention), but
-      // we've already built the path in pt with PDF's Y-up coords. Pass an
-      // explicit y offset of 0 and `scale: 1` with `y:` anchored to page
-      // height to compensate.
+      const ph = page.getHeight();
+      const d = arcPathPt(c.x, c.y, rPt, A.a1, A.a2, true, ph);
+      // `arcPathPt` now bakes the Y-flip into the path so pdf-lib's internal
+      // `scale(1,-1)` + translate by `y: ph` unwinds back to PDF Y-up coords
+      // — pass `borderColor` only (no `color`) so the arc renders as a stroke
+      // and not a filled region.
       page.drawSvgPath(d, {
-        color,
         borderColor: color,
         borderWidth: lineWidth,
         x: 0,
-        y: page.getHeight(),
+        y: ph,
         scale: 1,
       });
       break;
@@ -455,6 +627,10 @@ function drawEntity(
       const c = xform(E.cx, E.cy);
       const rxPt = (E.rx / scaleDenom) * PT_PER_MM;
       const ryPt = (E.ry / scaleDenom) * PT_PER_MM;
+      const ph = page.getHeight();
+      // Pre-flip Y against the page height so pdf-lib's internal `scale(1,-1)`
+      // + `y: ph` unwinds to PDF-up coords. Same fix as `arcPathPt`.
+      const sy = (y: number) => ph - y;
       // Build a parametric ellipse path, rotated by E.rot (CCW in world).
       const steps = 64;
       const cosR = Math.cos(E.rot), sinR = Math.sin(E.rot);
@@ -462,18 +638,18 @@ function drawEntity(
         x: c.x + Math.cos(0) * rxPt * cosR - Math.sin(0) * ryPt * sinR,
         y: c.y + Math.cos(0) * rxPt * sinR + Math.sin(0) * ryPt * cosR,
       };
-      let d = `M ${pt0.x.toFixed(3)} ${pt0.y.toFixed(3)}`;
+      let d = `M ${pt0.x.toFixed(3)} ${sy(pt0.y).toFixed(3)}`;
       for (let i = 1; i <= steps; i++) {
         const t = (i / steps) * Math.PI * 2;
         const px = Math.cos(t) * rxPt, py = Math.sin(t) * ryPt;
         const px2 = c.x + px * cosR - py * sinR;
         const py2 = c.y + px * sinR + py * cosR;
-        d += ` L ${px2.toFixed(3)} ${py2.toFixed(3)}`;
+        d += ` L ${px2.toFixed(3)} ${sy(py2).toFixed(3)}`;
       }
       d += ' Z';
       page.drawSvgPath(d, {
         borderColor: color, borderWidth: lineWidth,
-        x: 0, y: page.getHeight(), scale: 1,
+        x: 0, y: ph, scale: 1,
       });
       break;
     }
@@ -651,6 +827,34 @@ function drawEntity(
         page, L.toFixed(2), labelP,
         { dx: A2.x - A1.x, dy: A2.y - A1.y },
         heightPt, font, color,
+      );
+      break;
+    }
+    case 'hatch': {
+      const H = e as HatchEntity;
+      if (!H.pts || H.pts.length < 3) break;
+      // Hatch colour falls back to the layer colour for non-solid modes; for
+      // solid, the HatchEntity optionally overrides the layer colour. Matches
+      // the canvas renderer's behaviour so a "solid fill with custom colour"
+      // export looks identical to what's on screen.
+      const fillColor = (H.mode === 'solid' && H.color)
+        ? parseHexColor(H.color)
+        : color;
+      const xformedOuter = H.pts.map(p => xform(p.x, p.y));
+      const xformedHoles = (H.holes ?? [])
+        .filter(h => h.length >= 3)
+        .map(h => h.map(p => xform(p.x, p.y)));
+      // Canvas uses default angle=π/4, spacing=5mm when unset (see drawHatch
+      // in render.ts). Keep parity so a hatch saved before those fields became
+      // mandatory still exports with the same stripe pattern.
+      const angle = H.angle ?? Math.PI / 4;
+      const spacingWorld = Math.max(0.1, H.spacing ?? 5);
+      // spacing is in world mm; convert to PDF pt through the same scale
+      // denominator the rest of the exporter uses.
+      const spacingPt = (spacingWorld / scaleDenom) * PT_PER_MM;
+      drawHatchPdf(
+        page, H.mode, xformedOuter, xformedHoles,
+        spacingPt, angle, lineWidth, fillColor,
       );
       break;
     }
