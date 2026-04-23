@@ -5,6 +5,15 @@ name: Release HektikCad
 # signs them with the Tauri updater key (from secrets), and publishes them
 # as a GitHub Release. The Tauri updater in the installed app checks the
 # `latest.json` artifact this workflow publishes and offers in-app updates.
+#
+# Workflow structure (3 jobs):
+#   1. create-release  — ubuntu, creates a draft release, emits release_id
+#   2. build           — macOS + Windows matrix, uploads signed artifacts to
+#                        the draft release via releaseId (no create attempt)
+#   3. publish-release — marks the draft as published once both builds finish
+#
+# This avoids the race condition that occurred when both matrix legs tried to
+# create the same release simultaneously and the slower one got a 403.
 on:
   push:
     tags:
@@ -20,8 +29,60 @@ on:
         required: true
         type: string
 
+# Prevent duplicate runs for the same tag (e.g. from rapid tag delete+push).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # don't cancel a running build; let it finish
+
 jobs:
-  release:
+  # ── 1. Create the GitHub draft release ──────────────────────────────────
+  create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - id: create
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = '${{ steps.tag.outputs.tag }}';
+            // Check if a release for this tag already exists (re-run safety).
+            try {
+              const { data: existing } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+              console.log(`Release already exists (id=${existing.id}), reusing.`);
+              return existing.id;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `HektikCad ${tag}`,
+              body: 'See the changelog below for what changed. The installed app will auto-update on next launch.',
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  # ── 2. Build + upload artifacts ─────────────────────────────────────────
+  build:
+    needs: create-release
     permissions:
       contents: write
     strategy:
@@ -37,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -59,21 +120,32 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
-      - name: Build & publish Tauri release
+      - name: Build & upload artifacts
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          releaseName: 'HektikCad ${{ github.event_name == ''workflow_dispatch'' && inputs.tag || github.ref_name }}'
-          releaseBody: 'See the changelog below for what changed. The installed app will auto-update on next launch.'
-          # Publish immediately — the updater endpoint is
-          # /releases/latest/download/latest.json, which resolves via the
-          # "latest release" redirect and a draft release is NOT considered
-          # latest. Leaving this `true` meant v0.2.5 shipped as a draft and
-          # existing 0.2.4 installs kept seeing 0.2.4's latest.json.
-          releaseDraft: false
-          prerelease: false
+          # Passing releaseId skips release creation — tauri-action uploads
+          # assets directly to the draft created by job 1.
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
+
+  # ── 3. Publish the release (after both builds succeed) ──────────────────
+  publish-release:
+    needs: [create-release, build]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: ${{ needs.create-release.outputs.release_id }},
+              draft: false,
+            });
+            console.log('Release published.');
