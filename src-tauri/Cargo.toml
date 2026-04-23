@@ -1,6 +1,6 @@
 [package]
 name = "hektikcad"
-version = "0.2.5"
+version = "0.2.6"
 description = "Parametric 2D CAD"
 authors = ["Hekuran Rashiti"]
 license = ""

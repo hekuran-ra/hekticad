@@ -5398,11 +5398,23 @@ function findEnclosingShape(p: Pt): { poly: Pt[]; holes: Pt[][]; layer: number }
   }
 
   // Hole candidates: faces fully inside `outer`, not containing p, not outer.
+  //
+  // Containment test uses a point STRICTLY inside the candidate face rather
+  // than `poly[0]`. Two adjacent rects share a corner vertex (e.g., bottom
+  // rect and top rect meeting at (52, 57.875)) — that shared vertex sits
+  // exactly on the outer's boundary, and `ptInPoly` on a boundary point is
+  // ambiguous: the raycasting algorithm can return `true` depending on which
+  // edges the ray grazes. That false positive would mark the bottom rect as
+  // a "hole" of the top rect; `drawHatch` then clips with even-odd across
+  // two disjoint paths, which unions them — so hatching the top rect bled
+  // into the bottom rect. Using the face centroid (strictly interior for
+  // convex faces, which planar-graph rectangle traces always are) removes
+  // the ambiguity.
   const rawCandidates: Face[] = [];
   for (const f of faces) {
     if (f === outer) continue;
     if (ptInPoly(p, f.poly)) continue;
-    if (!ptInPoly(f.poly[0], outer.poly)) continue;
+    if (!ptInPoly(faceInteriorPoint(f.poly), outer.poly)) continue;
     rawCandidates.push(f);
   }
   // Keep only "direct children" by containment: a candidate H is a hole of
@@ -5413,12 +5425,63 @@ function findEnclosingShape(p: Pt): { poly: Pt[]; holes: Pt[][]; layer: number }
   const holes: Pt[][] = [];
   const accepted: Face[] = [];
   for (const H of rawCandidates) {
-    const nested = accepted.some(K => ptInPoly(H.poly[0], K.poly));
+    const hInterior = faceInteriorPoint(H.poly);
+    const nested = accepted.some(K => ptInPoly(hInterior, K.poly));
     if (nested) continue;
     accepted.push(H);
     holes.push(H.poly);
   }
   return { poly: outer.poly, holes, layer: outer.layer };
+}
+
+/**
+ * Pick a point guaranteed to lie strictly inside `poly` (never on its
+ * boundary), suitable for point-in-polygon containment tests where boundary
+ * ambiguity would cause false positives.
+ *
+ * Tries the area centroid first — strictly interior for any convex polygon,
+ * which covers every rectangular / triangular face the planar-cycle tracer
+ * produces in practice. For a pathological concave face where the centroid
+ * falls outside, falls back to nudging an edge midpoint inward along the
+ * edge's inward normal (CCW polygon → rotate edge direction 90° left).
+ */
+function faceInteriorPoint(poly: Pt[]): Pt {
+  // Area centroid via the shoelace formula.
+  let A = 0, cx = 0, cy = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i], q = poly[(i + 1) % poly.length];
+    const cross = p.x * q.y - q.x * p.y;
+    A += cross;
+    cx += (p.x + q.x) * cross;
+    cy += (p.y + q.y) * cross;
+  }
+  A /= 2;
+  if (Math.abs(A) > 1e-9) {
+    const centroid = { x: cx / (6 * A), y: cy / (6 * A) };
+    if (ptInPoly(centroid, poly)) return centroid;
+  }
+  // Concave-face fallback: nudge edge midpoints inward by ε and pick the
+  // first that lands inside. ε is in world units (mm); 1e-4 is small enough
+  // to stay inside sliver regions while being large enough to dodge
+  // floating-point noise on the boundary.
+  const eps = 1e-4;
+  const ccw = A > 0;
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i], q = poly[(i + 1) % poly.length];
+    const midx = (p.x + q.x) / 2, midy = (p.y + q.y) / 2;
+    const dx = q.x - p.x, dy = q.y - p.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-9) continue;
+    // Inward normal: for CCW polygon, 90° CCW rotation of edge direction
+    // points into the interior; for CW, 90° CW.
+    const nx = ccw ? -dy / len :  dy / len;
+    const ny = ccw ?  dx / len : -dx / len;
+    const candidate = { x: midx + nx * eps, y: midy + ny * eps };
+    if (ptInPoly(candidate, poly)) return candidate;
+  }
+  // Last resort — a degenerate polygon. Return the first vertex; the caller
+  // will get the old boundary behaviour but at least won't crash.
+  return poly[0];
 }
 
 /** Default stripe spacing for a new hatch. World units (mm). Kept constant —
