@@ -9,6 +9,16 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual trigger — useful when the tag-push event is swallowed by GitHub
+  # (e.g. after a rapid delete+re-push cycle). Provide the existing tag name
+  # as `tag` (e.g. "v0.2.10"); the workflow checks out that ref and publishes
+  # the release against it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to release (e.g. v0.2.10)'
+        required: true
+        type: string
 
 jobs:
   release:
@@ -26,6 +36,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,8 +66,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'HektikCad ${{ github.ref_name }}'
+          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          releaseName: 'HektikCad ${{ github.event_name == ''workflow_dispatch'' && inputs.tag || github.ref_name }}'
           releaseBody: 'See the changelog below for what changed. The installed app will auto-update on next launch.'
           # Publish immediately — the updater endpoint is
           # /releases/latest/download/latest.json, which resolves via the
