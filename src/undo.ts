@@ -3,6 +3,7 @@ import { state } from './state';
 import { requestRender } from './render';
 import { evaluateTimeline } from './features';
 import { updateSelStatus, updateStats } from './ui';
+import { markDirty } from './dirty';
 
 type Snapshot = {
   selection: number[];
@@ -40,11 +41,17 @@ function restore(s: Snapshot): void {
 /**
  * Capture the current state so the next mutation can be undone.
  * Clears the redo stack because a new branch of history starts here.
+ *
+ * Also flips the dirty flag on: every code path that mutates persisted state
+ * already calls `pushUndo()`, so this is the single choke-point that keeps
+ * the "•" indicator and the close-guard prompt in sync without having to
+ * touch every tool individually.
  */
 export function pushUndo(): void {
   undoStack.push(snapshot());
   if (undoStack.length > MAX_STACK) undoStack.shift();
   redoStack = [];
+  markDirty();
 }
 
 export function undo(): void {

@@ -347,7 +347,8 @@ function drawGrid(w: number, h: number): void {
 
 /**
  * WCAG relative luminance for a #rrggbb hex. Returns -1 if the string isn't a
- * plain 6-digit hex — callers should fall back in that case.
+ * plain 6-digit hex — callers should fall back in that case. Used by the
+ * snap-marker halo to pick a dark or light glow against the theme background.
  */
 function relLum(hex: string): number {
   const h = hex.trim().replace('#', '');
@@ -364,37 +365,13 @@ function relLum(hex: string): number {
 }
 
 /**
- * Layer colours are persisted as raw hex (e.g. '#ffffff' for the default '0'
- * layer). When the user switches to a light preset those lines vanish against
- * the light background. This bumps any near-background hex to the theme's
- * foreground colour so geometry stays visible across presets without us having
- * to mutate the user's stored palette.
- *
- * Called once per entity per frame, so memoize per hex+bg. The bg-key is
- * derived from the currently-cached `--bg` value (invalidated by
- * `invalidateCssCache()` on theme change), so the adapter auto-flushes when
- * the theme switches.
+ * In-app rendering uses layer colours verbatim — the user picks the colour,
+ * the app shows exactly that colour. Earlier builds ran a background-contrast
+ * check here that silently remapped low-contrast layers to the theme
+ * foreground. That hid the user's choice and was confusing when the same
+ * layer rendered differently depending on theme preset. Print legibility
+ * (white-on-white paper) is still handled downstream in the PDF exporter.
  */
-const _adaptCache = new Map<string, string>();
-let _adaptCacheBg = '';
-function adaptiveColor(hex: string): string {
-  const bg = css('--bg');
-  if (bg !== _adaptCacheBg) {
-    _adaptCache.clear();
-    _adaptCacheBg = bg;
-  }
-  const hit = _adaptCache.get(hex);
-  if (hit !== undefined) return hit;
-  const lHex = relLum(hex);
-  const lBg = relLum(bg);
-  let result = hex;
-  if (lHex >= 0 && lBg >= 0) {
-    const contrast = (Math.max(lHex, lBg) + 0.05) / (Math.min(lHex, lBg) + 0.05);
-    if (contrast < 2) result = css('--fg');
-  }
-  _adaptCache.set(hex, result);
-  return result;
-}
 
 /**
  * Teal dashed overlay drawn on top of an entity's normal stroke to signal a
@@ -420,7 +397,7 @@ function drawEntity(e: Entity, selected: boolean): void {
   const L = state.layers[e.layer];
   if (!L || !L.visible) return;
   const hovered = !selected && e.id === runtime.hoveredId;
-  const color = selected ? css('--sel') : adaptiveColor(L.color);
+  const color = selected ? css('--sel') : L.color;
 
   if (e.type === 'text') {
     ctx.fillStyle = color;
@@ -444,8 +421,8 @@ function drawEntity(e: Entity, selected: boolean): void {
     // colour. Stripe patterns always stroke with the layer colour.
     const solidColor = e.color ?? color;
     const selBoost = selected ? 1.6 : hovered ? 1.2 : 1.0;
-    ctx.strokeStyle = selected ? css('--sel') : adaptiveColor(L.color);
-    ctx.fillStyle = selected ? css('--sel') : adaptiveColor(solidColor);
+    ctx.strokeStyle = selected ? css('--sel') : L.color;
+    ctx.fillStyle = selected ? css('--sel') : solidColor;
     ctx.lineWidth = (e.mode === 'solid' ? 0 : 0.9) * selBoost;
     ctx.setLineDash([]);
     drawHatch(e, selected);
@@ -817,9 +794,8 @@ function drawLineSeg(x1: number, y1: number, x2: number, y2: number): void {
   ctx.stroke();
 }
 
-// Axis tints — X = warm red, Y = cool green. Picked to read clearly on both
-// light and dark themes after adaptiveColor() passes (which nudges them
-// toward the theme contrast). Standard CAD convention (X=red, Y=green, Z=blue).
+// Axis tints — X = warm red, Y = cool green. Standard CAD convention
+// (X=red, Y=green, Z=blue). Rendered verbatim; no theme-driven remap.
 const AXIS_X_COLOR = '#d94a4a';
 const AXIS_Y_COLOR = '#3aa84f';
 
@@ -839,8 +815,7 @@ function drawOriginAxes(w: number, h: number): void {
 }
 
 function drawOneAxis(w: number, h: number, kind: 'x' | 'y'): void {
-  const base = kind === 'x' ? AXIS_X_COLOR : AXIS_Y_COLOR;
-  const stroke = adaptiveColor(base);
+  const stroke = kind === 'x' ? AXIS_X_COLOR : AXIS_Y_COLOR;
   const dx = kind === 'x' ? 1 : 0;
   const dy = kind === 'x' ? 0 : 1;
 

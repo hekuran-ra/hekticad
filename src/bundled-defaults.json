@@ -1,0 +1,4 @@
+{
+  "version": 0,
+  "_comment": "Build-time user defaults. Shipped with the app and applied at first launch when the user has no personal snapshot in localStorage. Regenerate via Einstellungen → 'Aktuellen Zustand als Build-Standard exportieren' and commit the resulting file over this one. A version of 0 means 'no bundled defaults, fall through to factory baseline'."
+}

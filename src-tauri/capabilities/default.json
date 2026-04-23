@@ -7,11 +7,14 @@
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-destroy",
+    "core:window:allow-close",
     "updater:default",
     "process:allow-restart",
     "process:allow-exit",
     "dialog:allow-message",
     "dialog:allow-ask",
-    "dialog:allow-confirm"
+    "dialog:allow-confirm",
+    "dialog:allow-save"
   ]
 }

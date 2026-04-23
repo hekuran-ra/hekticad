@@ -26,7 +26,7 @@ import { showExportDialog } from './export-dialog';
 import { showCompanySettings } from './company-settings';
 import { showDimStyleDialog } from './dim-style-dialog';
 import { showAboutDialog, showShortcutsDialog } from './help-dialogs';
-import { resetUserDefaultsFlow, saveCurrentAsDefaultFlow } from './user-defaults-dialogs';
+import { exportBundledDefaultsFlow, resetUserDefaultsFlow, saveCurrentAsDefaultFlow } from './user-defaults-dialogs';
 import { closeThemePopover, showThemeDialog } from '../themes';
 import { cancelTool, getPanelsLocked, resetToolOrder, setPanelsLocked, setTool, TOOLS, toolRequiresSelection } from '../tools';
 import { undo, redo } from '../undo';
@@ -196,6 +196,11 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
         action: () => { void saveCurrentAsDefaultFlow(); } },
       { id: 'settings:reset-default', label: 'Eigenen Standard zurücksetzen',
         action: () => { void resetUserDefaultsFlow(); } },
+      // Developer-only: dump the current state to a bundled-defaults.json the
+      // developer commits over src/bundled-defaults.json. Every future build
+      // then ships those defaults to new users who have no personal snapshot.
+      { id: 'settings:export-bundled-default', label: 'Aktuellen Zustand als Build-Standard exportieren…',
+        action: () => { void exportBundledDefaultsFlow(); } },
     ],
   },
   hilfe: {

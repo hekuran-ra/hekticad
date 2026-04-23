@@ -1,4 +1,4 @@
-import type { CrossMirrorMode, Entity, EntityInit, EntityShape, Expr, Feature, LineEntity, LineFeature, PointRef, Pt, RadiusMode, RectEntity, SnapPoint, ToolCtx, ToolId } from './types';
+import type { CrossMirrorMode, Entity, EntityInit, EntityShape, Expr, Feature, FeatureEdgeRef, LineEntity, LineFeature, PointRef, Pt, RadiusMode, RectEntity, SnapPoint, ToolCtx, ToolId } from './types';
 import { state, runtime, savePanelsLocked } from './state';
 import {
   add, dist, dot, len, norm, orthoSnap, perp, perpOffset, scale, sub,
@@ -288,6 +288,96 @@ function pickBestRectCornerEdge(base: Pt, dir: Pt, entityId: number, snapped: Pt
     if (score > bestScore) { bestScore = score; best = s; }
   }
   return { kind: 'rectEdge', side: best };
+}
+
+/**
+ * Identify which `FeatureEdgeRef` on a cutter best describes the piece of edge
+ * nearest `hitPt`. Used by trim / extend / extend-to to turn an "abs-coord
+ * cut point" into a parametric `rayHit` PointRef so the cut end keeps tracking
+ * the cutter when its variables later change.
+ *
+ * Returns `null` for cutter types rayHit can't resolve (circles, arcs) — the
+ * caller then falls back to an abs PointRef. That mirrors pre-v0.2.4 behaviour
+ * for those cutters: the parametric link is a bonus, not a correctness
+ * requirement.
+ */
+function featureEdgeForCutter(cutter: Entity, hitPt: Pt): FeatureEdgeRef | null {
+  if (cutter.type === 'line' || cutter.type === 'xline') {
+    return { kind: 'lineSeg' };
+  }
+  if (cutter.type === 'rect') {
+    const xl = Math.min(cutter.x1, cutter.x2), xr = Math.max(cutter.x1, cutter.x2);
+    const yb = Math.min(cutter.y1, cutter.y2), yt = Math.max(cutter.y1, cutter.y2);
+    const sides: { side: 'top' | 'right' | 'bottom' | 'left'; d: number }[] = [
+      { side: 'top',    d: Math.abs(hitPt.y - yt) + (hitPt.x < xl ? xl - hitPt.x : hitPt.x > xr ? hitPt.x - xr : 0) },
+      { side: 'bottom', d: Math.abs(hitPt.y - yb) + (hitPt.x < xl ? xl - hitPt.x : hitPt.x > xr ? hitPt.x - xr : 0) },
+      { side: 'left',   d: Math.abs(hitPt.x - xl) + (hitPt.y < yb ? yb - hitPt.y : hitPt.y > yt ? hitPt.y - yt : 0) },
+      { side: 'right',  d: Math.abs(hitPt.x - xr) + (hitPt.y < yb ? yb - hitPt.y : hitPt.y > yt ? hitPt.y - yt : 0) },
+    ];
+    sides.sort((a, b) => a.d - b.d);
+    return { kind: 'rectEdge', side: sides[0].side };
+  }
+  if (cutter.type === 'polyline') {
+    let bestIdx = -1;
+    let bestD = Infinity;
+    const distSeg = (a: Pt, b: Pt): number => {
+      const ax = b.x - a.x, ay = b.y - a.y;
+      const L2 = ax * ax + ay * ay;
+      if (L2 < 1e-12) return Math.hypot(hitPt.x - a.x, hitPt.y - a.y);
+      let t = ((hitPt.x - a.x) * ax + (hitPt.y - a.y) * ay) / L2;
+      t = Math.max(0, Math.min(1, t));
+      return Math.hypot(hitPt.x - (a.x + ax * t), hitPt.y - (a.y + ay * t));
+    };
+    for (let i = 0; i + 1 < cutter.pts.length; i++) {
+      const d = distSeg(cutter.pts[i], cutter.pts[i + 1]);
+      if (d < bestD) { bestD = d; bestIdx = i; }
+    }
+    if (cutter.closed && cutter.pts.length >= 2) {
+      const i = cutter.pts.length - 1;
+      const d = distSeg(cutter.pts[i], cutter.pts[0]);
+      if (d < bestD) { bestD = d; bestIdx = i; }
+    }
+    return bestIdx >= 0 ? { kind: 'polySeg', index: bestIdx } : null;
+  }
+  return null;
+}
+
+/**
+ * Build a parametric override for a cut end (trim / extend / extend-to) as a
+ * `rayHit` PointRef: ray from the kept end at the current cut-direction angle,
+ * hitting the cutter feature's edge.
+ *
+ * Why not `intersection(selfFid, cutterFid)`? Because the timeline evaluator
+ * populates `ctx` in order: `buildEntity(f, ctx)` runs BEFORE `ctx.set(f.id,
+ * e)`, so a self-reference resolves to undefined → NaN, and the line vanishes
+ * on the next re-evaluation. `rayHit` sidesteps this: its `from` is an
+ * independent PointRef (the kept end) and its `target` is the *cutter*, never
+ * self. The only context lookup is the cutter, which was already evaluated
+ * upstream.
+ *
+ * Returns `null` when the cutter isn't rayHit-resolvable (circle/arc) or when
+ * cut/kept coincide — caller should fall back to an abs PointRef.
+ */
+function buildRayHitCutOverride(
+  keptRef: PointRef,
+  keptPt: Pt,
+  cutPt: Pt,
+  cutter: Entity,
+  cutterFeatureId: string,
+): PointRef | null {
+  const dx = cutPt.x - keptPt.x;
+  const dy = cutPt.y - keptPt.y;
+  if (dx * dx + dy * dy < 1e-18) return null;
+  const edge = featureEdgeForCutter(cutter, cutPt);
+  if (!edge) return null;
+  const angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
+  return {
+    kind: 'rayHit',
+    from: keptRef,
+    angle: numE(angleDeg),
+    target: cutterFeatureId,
+    edge,
+  };
 }
 
 export type ToolDef = {
@@ -5070,20 +5160,9 @@ function collectCycleSegments(): { segs: CycleSeg[]; clusters: Pt[] } {
     return clusters.length - 1;
   };
   const segs: CycleSeg[] = [];
-  // Track undirected edges we've already emitted so two rectangles that share
-  // a border (or any pair of coincident segments) don't push duplicate edges
-  // into the planar graph. Duplicates silently corrupt the face tracer: each
-  // extra directed edge gives the "turn-right" walk an alternative path that
-  // can merge two adjacent interior faces into one, which was the root cause
-  // of hatches bleeding from one rectangle into a neighbour when the regions
-  // shared an edge. Key is order-independent so both orientations collapse.
-  const seen = new Set<string>();
   const push = (a: Pt, b: Pt, layer: number): void => {
     const ia = indexOf(a), ib = indexOf(b);
     if (ia === ib) return;
-    const key = ia < ib ? `${ia}:${ib}` : `${ib}:${ia}`;
-    if (seen.has(key)) return;
-    seen.add(key);
     segs.push({ a: ia, b: ib, layer });
   };
   for (const e of state.entities) {
@@ -5189,7 +5268,23 @@ function splitAtTJunctions(g: { segs: CycleSeg[]; clusters: Pt[] }): { segs: Cyc
     }
     if (prev !== s.b) out.push({ a: prev, b: s.b, layer: s.layer });
   }
-  return { segs: out, clusters };
+  // Collapse duplicate undirected edges. Two rectangles that share a border,
+  // or a rect whose edge coincides with a line the user drew over it, both
+  // push the same (a,b) pair — and T-junction splitting above can turn a
+  // long line into sub-segments that now duplicate a neighbouring rect's
+  // edge. Duplicates silently break the planar face tracer: each extra
+  // directed edge gives the "turn-right" walk a redundant path that can
+  // merge two adjacent interior faces into one, so hatch/fill bleeds across
+  // the shared border. Key is order-independent so both orientations collapse.
+  const seen = new Set<string>();
+  const deduped: CycleSeg[] = [];
+  for (const s of out) {
+    const key = s.a < s.b ? `${s.a}:${s.b}` : `${s.b}:${s.a}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(s);
+  }
+  return { segs: deduped, clusters };
 }
 
 type Face = { poly: Pt[]; layer: number; area: number };
@@ -6472,8 +6567,18 @@ function handleExtendClick(worldPt: Pt): void {
   // target later moves (variable change), the extended end tracks it.
   const anchorEnd = keptEndOfLine(hit, anchor);
   const targetFid = featureForEntity(hitTarget.entityId)?.id ?? null;
-  const cutRefOverride: PointRef | null = targetFid
-    ? { kind: 'intersection', feature1: fid, feature2: targetFid }
+  const cutterEntity = hitTarget.entityId != null
+    ? state.entities.find(e => e.id === hitTarget.entityId) ?? null
+    : null;
+  // Parametric cut end: ray from anchor at current direction, hitting the
+  // target feature's edge. `rayHit` (not `intersection`) because the latter
+  // would self-reference this line's own feature — NaN on next eval.
+  const prevFeat = state.features.find(f => f.id === fid);
+  const keptRef = (prevFeat && prevFeat.kind === 'line')
+    ? (anchorEnd === 0 ? prevFeat.p1 : prevFeat.p2)
+    : null;
+  const cutRefOverride: PointRef | null = (targetFid && cutterEntity && keptRef)
+    ? buildRayHitCutOverride(keptRef, anchor, newEnd, cutterEntity, targetFid)
     : null;
   if (!replaceLineEndPreservingRef(fid, anchorEnd, newEnd, hit.layer, cutRefOverride)) {
     replaceFeatureFromInit(fid, entityInit(newLine));
@@ -6544,8 +6649,15 @@ function handleExtendToClick(worldPt: Pt): void {
     if (!fid) return;
     const targetFid = featureForEntity(tgt.id)?.id ?? null;
     const anchorEnd = keptEndOfLine(src, anchorPt);
-    const cutRefOverride: PointRef | null = targetFid
-      ? { kind: 'intersection', feature1: fid, feature2: targetFid }
+    // Parametric cut end via `rayHit` (see `handleExtendClick` for the
+    // self-reference rationale — `intersection(self, cutter)` would evaluate
+    // to NaN on the next timeline re-run and drop the line).
+    const prevFeat = state.features.find(f => f.id === fid);
+    const keptRef = (prevFeat && prevFeat.kind === 'line')
+      ? (anchorEnd === 0 ? prevFeat.p1 : prevFeat.p2)
+      : null;
+    const cutRefOverride: PointRef | null = (targetFid && keptRef)
+      ? buildRayHitCutOverride(keptRef, anchorPt, ip, tgt, targetFid)
       : null;
 
     pushUndo();
@@ -7219,17 +7331,29 @@ function handleTrimClick(worldPt: Pt): void {
       ? { x: a.x + abX * tLow,  y: a.y + abY * tLow  }
       : { x: a.x + abX * tHigh, y: a.y + abY * tHigh };
     const keptEnd = keptEndOfLine(hit, keptPt);
-    // Parametric cut-end: build an `intersection` ref between the trimmed
-    // line and whatever cut it, so when either side later changes the
-    // endpoint tracks the new crossing. `intersection` resolves the exact
-    // math at eval time and works for any cutter type (line/xline/rect/…)
-    // as long as both sides resolve to geometry the intersector handles.
+    // Parametric cut-end: build a `rayHit` ref whose `from` is the kept
+    // end's current ref, whose angle is the line's current direction, and
+    // whose target is the cutter's edge. When the cutter later moves (or
+    // the kept end's source moves), the endpoint tracks the new crossing.
+    //
+    // NOT `intersection(selfFid, cutterFid)` — the timeline evaluator
+    // populates the resolve-ctx in order, and `buildEntity(f, ctx)` runs
+    // BEFORE `ctx.set(f.id, e)`. A self-reference therefore resolves to
+    // undefined → NaN, dropping the line on the next eval. `rayHit` only
+    // needs the cutter in ctx, which was already placed upstream.
     const cutterEntityId = hasLow ? cutterLowId : cutterHighId;
     const cutterFeatureId = cutterEntityId != null
       ? featureForEntity(cutterEntityId)?.id ?? null
       : null;
-    const cutRefOverride: PointRef | null = cutterFeatureId
-      ? { kind: 'intersection', feature1: fid, feature2: cutterFeatureId }
+    const cutterEntity = cutterEntityId != null
+      ? state.entities.find(e => e.id === cutterEntityId) ?? null
+      : null;
+    const prevFeat = state.features.find(f => f.id === fid);
+    const keptRef = (prevFeat && prevFeat.kind === 'line')
+      ? (keptEnd === 0 ? prevFeat.p1 : prevFeat.p2)
+      : null;
+    const cutRefOverride: PointRef | null = (cutterFeatureId && cutterEntity && keptRef)
+      ? buildRayHitCutOverride(keptRef, keptPt, cutPt, cutterEntity, cutterFeatureId)
       : null;
     if (!replaceLineEndPreservingRef(fid, keptEnd, cutPt, hit.layer, cutRefOverride)) {
       replaceFeatureFromInit(fid, pieces[0]);

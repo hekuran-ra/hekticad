@@ -19,6 +19,9 @@
 import { runMenuCommand } from './ui/menu-bar';
 import { checkForUpdatesManually } from './updater';
 import { showAboutDialog } from './ui/help-dialogs';
+import { isDirty } from './dirty';
+import { saveJsonInteractive } from './io';
+import { showUnsavedChangesPrompt } from './modal';
 
 async function isTauriEnv(): Promise<boolean> {
   try {
@@ -61,5 +64,60 @@ export async function initTauriBridge(): Promise<void> {
     // native-menu integration. Log and carry on.
     // eslint-disable-next-line no-console
     console.warn('[tauri-bridge] failed to subscribe to menu events:', err);
+  }
+
+  await installCloseGuard();
+}
+
+/**
+ * Hook the window's close request so a dirty drawing prompts the user before
+ * the app terminates. On Tauri 2, `onCloseRequested` fires for every close
+ * vector (title-bar X, Cmd+Q / Alt+F4, menu quit, …) and lets us veto by
+ * calling `event.preventDefault()`. The native OS confirm would happen
+ * before this if we didn't preventDefault, so the guard has to run first
+ * and then decide whether to destroy the window itself.
+ *
+ * Flow:
+ *   - Clean drawing → return, let the default close proceed.
+ *   - Dirty drawing → preventDefault, show three-way modal:
+ *       • Speichern → run interactive save; proceed to close only on success.
+ *       • Verwerfen → close immediately without saving.
+ *       • Abbrechen / Escape / backdrop → stay open.
+ *
+ * `destroy()` is the right call on Tauri 2 — it bypasses the close-requested
+ * listener (otherwise we'd re-enter this handler), terminates the window,
+ * and (since this is the only window) ends the process.
+ */
+async function installCloseGuard(): Promise<void> {
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    const win = getCurrentWindow();
+    await win.onCloseRequested(async (event) => {
+      if (!isDirty()) return; // Nothing unsaved — let Tauri close normally.
+      event.preventDefault();
+      const choice = await showUnsavedChangesPrompt({
+        title: 'Ungespeicherte Änderungen',
+        message: 'Die Zeichnung enthält Änderungen, die noch nicht gespeichert wurden.',
+        saveText: 'Speichern',
+        discardText: 'Verwerfen',
+        cancelText: 'Abbrechen',
+      });
+      if (choice === 'cancel') return;
+      if (choice === 'save') {
+        const result = await saveJsonInteractive();
+        // If the user cancelled the save dialog or an error bubbled up,
+        // don't close — they still have unsaved work. `saveJsonInteractive`
+        // already toasted the error if any.
+        if (result !== 'saved') return;
+      }
+      // 'discard' or a completed 'save' → tear the window down. `destroy`
+      // skips the onCloseRequested listener so we don't loop here.
+      await win.destroy();
+    });
+  } catch (err) {
+    // If the window plugin isn't available we fall back to the default OS
+    // close behaviour — not great, but better than crashing the bridge.
+    // eslint-disable-next-line no-console
+    console.warn('[tauri-bridge] failed to install close guard:', err);
   }
 }

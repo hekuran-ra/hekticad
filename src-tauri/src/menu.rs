@@ -169,6 +169,13 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &MenuItemBuilder::with_id("settings:reset-default", "Eigenen Standard zurücksetzen")
                 .build(app)?,
         )
+        .item(
+            &MenuItemBuilder::with_id(
+                "settings:export-bundled-default",
+                "Aktuellen Zustand als Build-Standard exportieren…",
+            )
+            .build(app)?,
+        )
         .build()?;
 
     // ── Hilfe

@@ -1,15 +1,70 @@
 import type { Entity, ExportOptions, Feature, Layer, Parameter } from './types';
 import { patternForLineStyle, resolveLineStyle } from './types';
-import { state } from './state';
+import { consumeNextDrawingNumber, saveProjectMeta, state } from './state';
 import { render } from './render';
 import { renderLayers, toast, updateSelStatus, updateStats } from './ui';
 import { drawingBounds } from './view';
 import { ensureAxisFeatures, evaluateTimeline } from './features';
 import { pushUndo, resetHistory } from './undo';
+import { markClean } from './dirty';
 import { showConfirm } from './modal';
 import { exportDxf } from './io/export-dxf';
 import { exportEps } from './io/export-eps';
 import { exportPdf } from './io/export-pdf';
+
+/**
+ * Result of `saveBlobViaDialog`: `path` is set when the user committed to a
+ * location, `cancelled` is true when they dismissed the dialog. On browsers
+ * (no Tauri runtime), we fall back to the anchor-download trick and report
+ * the synthesized filename as `path`.
+ */
+type SaveResult = { path: string; cancelled: false } | { path: null; cancelled: true };
+
+/**
+ * Ask Tauri to open a native save-as dialog; on the user-picked path, write
+ * the blob's bytes via the Rust-side `save_bytes_dialog` command. Falls back
+ * to the browser-only `<a download>` path when no Tauri bridge is available
+ * (dev `vite` preview, unit tests, etc.) so the export flow works everywhere.
+ *
+ * The Tauri path keeps the bytes entirely inside the command so we don't need
+ * to grant the frontend fs-write capability — the Rust command receives
+ * `Vec<u8>` and writes it with `std::fs::write` after the dialog confirms.
+ */
+export async function saveBlobViaDialog(blob: Blob, suggestedName: string): Promise<SaveResult> {
+  try {
+    const core = await import('@tauri-apps/api/core');
+    if (core.isTauri()) {
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      // Tauri IPC marshals Uint8Array as an array of numbers → `Vec<u8>`.
+      // Extract the extension from the suggested filename so the filter
+      // matches what the user is actually exporting (pdf / dxf / eps / svg /
+      // hcad). Fallback to "*" when missing so the dialog doesn't hide the
+      // file.
+      const extMatch = /\.([A-Za-z0-9]+)$/.exec(suggestedName);
+      const ext = extMatch ? extMatch[1].toLowerCase() : '';
+      const filterName = ext ? ext.toUpperCase() : 'Datei';
+      const picked = await core.invoke<string | null>('save_bytes_dialog', {
+        data: Array.from(buf),
+        suggestedName,
+        filterName,
+        filterExtensions: ext ? [ext] : [],
+      });
+      if (picked == null) return { path: null, cancelled: true };
+      return { path: picked, cancelled: false };
+    }
+  } catch {
+    // `@tauri-apps/api/core` failed to import (dev preview without Tauri) →
+    // fall through to browser download below.
+  }
+  // Browser fallback.
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = suggestedName;
+  a.click();
+  URL.revokeObjectURL(url);
+  return { path: suggestedName, cancelled: false };
+}
 
 type SaveFormat = {
   entities: Entity[];
@@ -34,10 +89,15 @@ export async function exportDrawing(opts: ExportOptions): Promise<void> {
     let filename: string;
 
     switch (opts.format) {
-      case 'svg':
-        // Legacy path — keeps the existing SVG button working unchanged.
-        exportSvg();
-        return;
+      case 'svg': {
+        // Build the SVG blob and route through the shared save-as dialog, so
+        // SVG gets the same "choose where to save" flow as PDF / DXF / EPS.
+        const svgBlob = buildSvgBlob();
+        if (!svgBlob) { toast('Nichts zu exportieren'); return; }
+        blob = svgBlob;
+        filename = opts.filename ?? 'zeichnung.svg';
+        break;
+      }
       case 'dxf':
         blob = exportDxf(state.entities, state.layers);
         filename = opts.filename ?? 'zeichnung.dxf';
@@ -52,8 +112,9 @@ export async function exportDrawing(opts: ExportOptions): Promise<void> {
         break;
     }
 
-    downloadBlob(blob, filename);
-    toast(`Zeichnung exportiert: ${filename}`);
+    const res = await saveBlobViaDialog(blob, filename);
+    if (res.cancelled) return;                              // user dismissed — silent
+    toast(`Zeichnung exportiert: ${res.path}`);
   } catch (err) {
     console.error('[exportDrawing]', err);
     const msg = err instanceof Error ? err.message : String(err);
@@ -61,32 +122,59 @@ export async function exportDrawing(opts: ExportOptions): Promise<void> {
   }
 }
 
-/** Download-anchor helper shared by every exporter. */
-function downloadBlob(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
+export async function saveJson(): Promise<void> {
+  try {
+    const data: SaveFormat = {
+      entities: state.entities,
+      layers: state.layers,
+      nextId: state.nextId,
+      parameters: state.parameters,
+      features: state.features,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    // `.hcad` = proprietary HektikCad save; JSON-encoded internally but the
+    // extension communicates "this is a CAD file" rather than "some random JSON".
+    const res = await saveBlobViaDialog(blob, 'zeichnung.hcad');
+    if (res.cancelled) return;
+    // The drawing as it stands on disk now matches state — drop the dirty
+    // flag so the "•" indicator vanishes and the close-guard doesn't
+    // re-prompt for the same unchanged drawing.
+    markClean();
+    toast(`Gespeichert: ${res.path}`);
+  } catch (err) {
+    console.error('[saveJson]', err);
+    const msg = err instanceof Error ? err.message : String(err);
+    toast(`Fehler beim Speichern: ${msg}`);
+  }
 }
 
-export function saveJson(): void {
-  const data: SaveFormat = {
-    entities: state.entities,
-    layers: state.layers,
-    nextId: state.nextId,
-    parameters: state.parameters,
-    features: state.features,
-  };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  // `.hcad` = proprietary HektikCad save; JSON-encoded internally but the
-  // extension communicates "this is a CAD file" rather than "some random JSON".
-  a.download = 'zeichnung.hcad';
-  a.click();
-  URL.revokeObjectURL(a.href);
+/**
+ * Programmatic save that reports whether the user completed the save or
+ * cancelled the dialog. Distinct from `saveJson()` which has a `void` return
+ * — the close-guard handler needs to know whether it should proceed with the
+ * close (save succeeded) or stay open (user cancelled the save dialog).
+ */
+export async function saveJsonInteractive(): Promise<'saved' | 'cancelled' | 'error'> {
+  try {
+    const data: SaveFormat = {
+      entities: state.entities,
+      layers: state.layers,
+      nextId: state.nextId,
+      parameters: state.parameters,
+      features: state.features,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const res = await saveBlobViaDialog(blob, 'zeichnung.hcad');
+    if (res.cancelled) return 'cancelled';
+    markClean();
+    toast(`Gespeichert: ${res.path}`);
+    return 'saved';
+  } catch (err) {
+    console.error('[saveJsonInteractive]', err);
+    const msg = err instanceof Error ? err.message : String(err);
+    toast(`Fehler beim Speichern: ${msg}`);
+    return 'error';
+  }
 }
 
 export function loadJson(): void {
@@ -124,6 +212,8 @@ export function loadJson(): void {
           state.entities = data.entities ?? [];
         }
         resetHistory();
+        // A freshly loaded drawing has no unsaved edits by definition.
+        markClean();
         renderLayers();
         updateStats();
         updateSelStatus();
@@ -137,9 +227,14 @@ export function loadJson(): void {
   inp.click();
 }
 
-export function exportSvg(): void {
+/**
+ * Build the SVG blob without triggering a download. Used by `exportDrawing`
+ * so the SVG format goes through the same save-as dialog as the other
+ * exporters. Returns `null` when the drawing is empty (nothing to export).
+ */
+function buildSvgBlob(): Blob | null {
   const b = drawingBounds();
-  if (!b) { toast('Nichts zu exportieren'); return; }
+  if (!b) return null;
   const pad = 10;
   const w = b.maxX - b.minX + pad * 2;
   const h = b.maxY - b.minY + pad * 2;
@@ -277,12 +372,20 @@ export function exportSvg(): void {
     }
   }
   svg += '</svg>';
-  const blob = new Blob([svg], { type: 'image/svg+xml' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'zeichnung.svg';
-  a.click();
-  URL.revokeObjectURL(a.href);
+  return new Blob([svg], { type: 'image/svg+xml' });
+}
+
+/**
+ * Back-compat wrapper for the legacy SVG-only export path. Any caller that
+ * still imports `exportSvg` directly now goes through the same save-as
+ * dialog as the rest of the export flow.
+ */
+export async function exportSvg(): Promise<void> {
+  const blob = buildSvgBlob();
+  if (!blob) { toast('Nichts zu exportieren'); return; }
+  const res = await saveBlobViaDialog(blob, 'zeichnung.svg');
+  if (res.cancelled) return;
+  toast(`Zeichnung exportiert: ${res.path}`);
 }
 
 export async function clearAll(): Promise<void> {
@@ -299,6 +402,19 @@ export async function clearAll(): Promise<void> {
   state.selection.clear();
   ensureAxisFeatures();
   evaluateTimeline();
+  // A fresh drawing deserves a fresh Zeichnungs-Nr. — consume the next
+  // auto-number and drop it into projectMeta. The title-block dialog and
+  // export dialog pre-fill from this field; the user can still override.
+  // Title + revision reset so the new drawing isn't accidentally labelled
+  // with the old drawing's name; project name + author + company fields
+  // stick so the user doesn't have to retype them every "Neu".
+  const nextNumber = consumeNextDrawingNumber();
+  if (nextNumber) {
+    state.projectMeta.drawingNumber = nextNumber;
+    state.projectMeta.drawingTitle = '';
+    state.projectMeta.revision = '';
+    saveProjectMeta(state.projectMeta);
+  }
   updateStats();
   updateSelStatus();
   render();

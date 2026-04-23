@@ -120,14 +120,28 @@ header {
   padding: 0 12px; border-right: 1px solid var(--hair);
   height: 100%; display: flex; align-items: center; gap: 6px; flex-shrink: 0;
 }
-.doc-dirty { color: var(--draw); font-size: 14px; line-height: 1; }
+/* The bullet-dot is always in the DOM (so the brand block's flex layout stays
+   stable) but only visible while `body.doc-is-dirty` is set. `visibility`
+   keeps the slot reserved so the document name doesn't shift when the dot
+   appears — `display: none` would reflow the header on every edit. */
+.doc-dirty { color: var(--draw); font-size: 14px; line-height: 1; visibility: hidden; }
+body.doc-is-dirty .doc-dirty { visibility: visible; }
 
 /* Menu bar */
-.menu-bar { display: flex; gap: 0; flex-shrink: 0; }
+.menu-bar { display: flex; gap: 0; flex-shrink: 0; flex-basis: max-content; }
 .menu-item {
   padding: 4px 10px; border-radius: 3px; font-size: 12px;
   color: var(--fg-mid); font-weight: 400;
   white-space: nowrap; flex-shrink: 0;
+  /* Lock the flex basis to the intrinsic label width. Without `max-content`,
+     Windows WebView2 (Edge Chromium) occasionally under-measures the label's
+     natural width when the surrounding flex layout negotiates — the last
+     menu item "Einstellungen" ended up rendered as "Einstellun" with the
+     trailing glyphs clipped. `max-content` forces the button to reserve at
+     least the label's intrinsic width even under those rounding edge-cases.
+     macOS WebKit never exhibited this so the fix is just defence-in-depth. */
+  flex-basis: max-content;
+  min-width: max-content;
 }
 .menu-item:hover { background: var(--panel-2); color: var(--fg); }
 .menu-item.active {
@@ -1456,11 +1470,16 @@ canvas { position: absolute; inset: 0; display: block; }
    visible (both in expanded and collapsed states) so the user always has a
    clear click target. The chevron points toward the direction that the
    button will move the sidebar: ‹ when expanded (click to collapse), › when
-   collapsed (click to expand). */
+   collapsed (click to expand).
+
+   Expanded: the tab sits flush against the sidebar's left edge, fully inside
+     the sidebar so it doesn't overlap canvas content or the scrollbar.
+   Collapsed: the 22px rail is too narrow to host a 18px tab with any gap,
+     so we centre the tab in the rail — same visual as before the fix. */
 .sidebar-collapse {
   position: absolute;
   top: 50%; left: 0;
-  transform: translate(-50%, -50%);
+  transform: translateY(-50%);
   width: 18px; height: 48px;
   display: grid; place-items: center;
   background: var(--panel-2);
@@ -1479,9 +1498,9 @@ canvas { position: absolute; inset: 0; display: block; }
 .sidebar-collapse-chev { transition: transform 0.15s; }
 body.sidebar-collapsed .sidebar-collapse-chev { transform: rotate(180deg); }
 body.sidebar-collapsed .sidebar-collapse {
-  /* In collapsed mode the rail is only 22px wide — pull the handle fully
-     inside so it doesn't overhang the canvas. */
+  /* In collapsed mode the rail is only 22px wide — centre the handle in it. */
   left: 50%;
+  transform: translate(-50%, -50%);
 }
 #sidebar::-webkit-scrollbar { width: 6px; }
 #sidebar::-webkit-scrollbar-track { background: transparent; }

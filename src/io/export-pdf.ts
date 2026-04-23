@@ -17,7 +17,7 @@
  * print dialogs add their own margins and scale factors that can't be pinned.
  */
 
-import { PDFDocument, rgb, PDFPage, PDFImage } from 'pdf-lib';
+import { PDFDocument, PDFFont, StandardFonts, degrees, rgb, PDFPage, PDFImage } from 'pdf-lib';
 import type { ArcEntity, CircleEntity, DimEntity, DimStyle, EllipseEntity,
               Entity, Layer, LineEntity, PdfTemplateId, PolylineEntity,
               Pt, RectEntity, SplineEntity, TextEntity, TitleBlockData }
@@ -30,16 +30,12 @@ import { drawTitleBlock, drawPlotFrame } from './titleblock';
 // ────────────────────────────────────────────────────────────────────────────
 // Colour mapping
 //
-// The HektikCad canvas uses a dark background, so layers in white or near-white
-// (e.g. the default "0" layer at #ffffff) are perfectly legible on screen. The
-// PDF paper, however, is white — emitting those colours verbatim would make the
-// geometry invisible on the print.
-//
-// Strategy: compute a perceived luminance, and if a colour would have too
-// little contrast against white paper, remap it to pure black. This preserves
-// all "normal" engineering colours (red, blue, amber, teal …) exactly, and
-// only rescues the white-on-white corner case. Same idea as AutoCAD's
-// "Display as black" print handling for layer colour 7.
+// The HektikCad canvas uses a dark background, so layers stored as pure white
+// (the default "0" layer at #ffffff) are legible on screen but would be
+// invisible on white PDF paper. The only safe contrast check at print time
+// is therefore limited to pure white → pure black; every other colour the
+// user picked (red, blue, mid-grey, pastel, …) passes through unchanged so
+// the printed drawing matches the on-screen palette.
 // ────────────────────────────────────────────────────────────────────────────
 
 /** Parse a CSS hex colour (#rgb or #rrggbb) into a normalised {r,g,b} triple. */
@@ -57,30 +53,19 @@ function parseHexTriple(hex: string): { r: number; g: number; b: number } {
 }
 
 /**
- * Rec. 601 perceived luminance (0 = black, 1 = white). Good-enough model for
- * deciding "is this colour bright?" — we're not colour-matching here, just
- * checking print legibility.
- */
-function luminance(r: number, g: number, b: number): number {
-  return 0.299 * r + 0.587 * g + 0.114 * b;
-}
-
-/**
- * Above this luminance, remap to black. 0.92 catches pure white (#ffffff, Y=1),
- * the near-whites (#f8f8f8, Y≈0.97), and the very-light greys that would
- * otherwise print as ghosted lines. Mid-greys (#cccccc, Y≈0.8) still pass
- * through unchanged — the user explicitly picked those.
- */
-const PAPER_WHITE_LUM_THRESHOLD = 0.92;
-
-/**
- * Convert a CSS hex colour into a pdf-lib `rgb()` value, rescuing colours
- * that would be invisible on white paper. See the header comment for the
- * rationale and threshold choice.
+ * Convert a CSS hex colour into a pdf-lib `rgb()` value. Pure white (`#ffffff`)
+ * becomes pure black so lines drawn on the default "0" layer don't vanish on
+ * white paper; every other colour is emitted verbatim.
+ *
+ * The tolerance is a single quantisation step (≤ 1/255 off per channel) so we
+ * only catch exact white expressed through different hex widths (`#fff`,
+ * `#FFFFFF`, rounding artefacts); light greys like `#f8f8f8` remain light
+ * grey on the print — that's the user's choice.
  */
 function parseHexColor(hex: string): ReturnType<typeof rgb> {
   const { r, g, b } = parseHexTriple(hex);
-  if (luminance(r, g, b) >= PAPER_WHITE_LUM_THRESHOLD) {
+  const eps = 1 / 255 + 1e-6;
+  if (r > 1 - eps && g > 1 - eps && b > 1 - eps) {
     return rgb(0, 0, 0);
   }
   return rgb(r, g, b);
@@ -270,14 +255,22 @@ function drawDimCapPdf(
     const len = DIM_ARROW_LEN_MM * PT_PER_MM;
     const halfW = DIM_ARROW_HALF_MM * PT_PER_MM;
     const bx = tip.x + ux * len, by = tip.y + uy * len;
-    const d = `M ${tip.x.toFixed(3)} ${tip.y.toFixed(3)} ` +
-              `L ${(bx + px * halfW).toFixed(3)} ${(by + py * halfW).toFixed(3)} ` +
-              `L ${(bx - px * halfW).toFixed(3)} ${(by - py * halfW).toFixed(3)} Z`;
-    // `drawSvgPath` treats input as SVG coords (Y-down); we pass an explicit
-    // `y: pageHeight` + `scale: 1` so the coords we built in PDF Y-up pass
-    // through unchanged. Same trick as the arc/ellipse paths above.
+    // pdf-lib's `drawSvgPath` treats SVG path coords as Y-DOWN and maps
+    // them to PDF as `finalY = options.y - pathY`. Our tip/bx/by/etc. are
+    // in PDF Y-UP, so we pre-flip them against the page height: path-Y =
+    // ph − pdf-Y. With `options.y = ph`, the render computes
+    // `ph − (ph − pdf_y) = pdf_y`, putting the triangle exactly where we
+    // want it. Earlier builds skipped this flip, which scattered the
+    // filled arrowheads at `ph − tip.y` — i.e. mirrored across the page
+    // centreline — while the other cap styles (which use `drawLine`) were
+    // unaffected. That's the "Pfeilspitzen irgendwo im Freiraum" bug.
+    const ph = page.getHeight();
+    const sy = (y: number) => ph - y;
+    const d = `M ${tip.x.toFixed(3)} ${sy(tip.y).toFixed(3)} ` +
+              `L ${(bx + px * halfW).toFixed(3)} ${sy(by + py * halfW).toFixed(3)} ` +
+              `L ${(bx - px * halfW).toFixed(3)} ${sy(by - py * halfW).toFixed(3)} Z`;
     page.drawSvgPath(d, {
-      x: 0, y: page.getHeight(), scale: 1,
+      x: 0, y: ph, scale: 1,
       color, borderColor: color, borderWidth: 0.1,
     });
   } else if (style === 'open') {
@@ -327,6 +320,54 @@ function drawDimCapPdf(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Dim label — rotated text aligned with the dim line
+//
+// Canvas draws the dim label rotated along the dim/arc/leader direction with a
+// readability flip that keeps it upright (never upside-down) and a small
+// perpendicular gap above the line. pdf-lib's `drawText` supports a `rotate`
+// option that pivots around the (x, y) reference point, but there's no
+// textAlign=center — so we measure the text width through the embedded font
+// and offset the anchor manually so the text stays centred on `anchorPdf`.
+//
+// `dirPdf` is the direction ALONG the dim line in PDF (Y-up) coords. The
+// readability flip mirrors the canvas logic (`if ang > π/2 …`) so both
+// renderers produce the same visual orientation.
+// ────────────────────────────────────────────────────────────────────────────
+
+function drawDimLabelPdf(
+  page: PDFPage,
+  text: string,
+  anchorPdf: { x: number; y: number },
+  dirPdf: { dx: number; dy: number },
+  heightPt: number,
+  font: PDFFont,
+  color: ReturnType<typeof rgb>,
+): void {
+  let ang = Math.atan2(dirPdf.dy, dirPdf.dx);
+  if (ang >  Math.PI / 2) ang -= Math.PI;
+  if (ang < -Math.PI / 2) ang += Math.PI;
+  const w = font.widthOfTextAtSize(text, heightPt);
+  const cos = Math.cos(ang), sin = Math.sin(ang);
+  // Perpendicular 90° CCW from the line direction — offsets the baseline above
+  // the dim line in PDF Y-up space, matching the canvas `fillText(label, 0, -3)`
+  // that draws 3px "above" in a Y-down screen frame.
+  const perpX = -sin, perpY = cos;
+  const gap = 0.5 * PT_PER_MM;
+  // pdf-lib rotates around (x, y); after rotation text extends along local +x
+  // for `w` units. To centre the text on `anchorPdf`, step back half the width
+  // along the line direction before adding the perpendicular gap.
+  const x = anchorPdf.x - cos * (w / 2) + perpX * gap;
+  const y = anchorPdf.y - sin * (w / 2) + perpY * gap;
+  page.drawText(text, {
+    x, y,
+    size: heightPt,
+    font,
+    color,
+    rotate: degrees(ang * 180 / Math.PI),
+  });
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Entity drawing
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -342,6 +383,7 @@ function drawEntity(
   color: ReturnType<typeof rgb>,
   lineWidth: number,
   scaleDenom: number,
+  font: PDFFont,
 ): void {
   // Layer dash styles are intentionally dropped on PDF export for now —
   // pdf-lib's `drawLine` has no dash parameter, and emitting SVG paths for
@@ -455,7 +497,7 @@ function drawEntity(
       const lines = T.text.split(/\r?\n/);
       for (let i = 0; i < lines.length; i++) {
         const y = p.y + (lines.length - 1 - i) * heightPt * 1.2;
-        page.drawText(lines[i], { x: p.x, y, size: heightPt, color });
+        page.drawText(lines[i], { x: p.x, y, size: heightPt, color, font });
       }
       break;
     }
@@ -501,15 +543,22 @@ function drawEntity(
         const style: DimStyle = D.style ?? 'arrow';
         drawDimCapPdf(page, startS, nearStart, style, lineWidth, color);
         drawDimCapPdf(page, endS,   nearEnd,   style, lineWidth, color);
-        const aM = aS + sweep / 2;
+        // Label slide: 0.12 / 0.5 / 0.88 along the arc sweep, matching the
+        // canvas `textAlign` mapping (start / center / end).
+        const tArc = D.textAlign === 'start' ? 0.12
+                   : D.textAlign === 'end'   ? 0.88
+                                             : 0.5;
+        const aM = aS + sweep * tArc;
         const midS = xform(V.x + R * Math.cos(aM), V.y + R * Math.sin(aM));
         const heightPt = (D.textHeight / scaleDenom) * PT_PER_MM;
         const degLabel = `${(sweep * 180 / Math.PI).toFixed(1)}°`;
-        page.drawText(degLabel, {
-          x: midS.x - heightPt * 1.2,
-          y: midS.y + 0.5 * PT_PER_MM,
-          size: heightPt, color,
-        });
+        // Tangent to the arc at aM in PDF (Y-up) coords is perpendicular to
+        // the radius, rotated 90° CCW: (-sin aM, cos aM).
+        drawDimLabelPdf(
+          page, degLabel, midS,
+          { dx: -Math.sin(aM), dy: Math.cos(aM) },
+          heightPt, font, color,
+        );
         break;
       }
       if ((D.dimKind === 'radius' || D.dimKind === 'diameter') && D.vertex && D.ray1) {
@@ -542,11 +591,22 @@ function drawEntity(
         }
         const heightPt = (D.textHeight / scaleDenom) * PT_PER_MM;
         const label = isDia ? `Ø ${(2 * r).toFixed(2)}` : `R ${r.toFixed(2)}`;
-        page.drawText(label, {
-          x: anchorP.x - heightPt * 1.2,
-          y: anchorP.y + 0.5 * PT_PER_MM,
-          size: heightPt, color,
-        });
+        // textAlign drives label position along the leader: `end` (default)
+        // pins it at the anchor where the user pulled it, `center` halfway,
+        // `start` hugs the edge near the circle. `end` = 1.0 matches the
+        // canvas renderer which also uses `end` as the implicit default.
+        const tLead = D.textAlign === 'start'  ? 0.12
+                    : D.textAlign === 'center' ? 0.5
+                                               : 1.0;
+        const labelP = {
+          x: nearP.x + (anchorP.x - nearP.x) * tLead,
+          y: nearP.y + (anchorP.y - nearP.y) * tLead,
+        };
+        drawDimLabelPdf(
+          page, label, labelP,
+          { dx: anchorP.x - nearP.x, dy: anchorP.y - nearP.y },
+          heightPt, font, color,
+        );
         break;
       }
       // Decompose into dim line + 2 extension lines + end-caps + text. The
@@ -577,11 +637,21 @@ function drawEntity(
       drawDimCapPdf(page, A1, A2, style, lineWidth, color);  // cap at A1, pointing toward A2
       drawDimCapPdf(page, A2, A1, style, lineWidth, color);  // cap at A2, pointing toward A1
 
-      // Midpoint text — kept axis-aligned for phase 1 (rotation would need
-      // pdf-lib's `rotate` option; acceptable trade-off for a first pass).
-      const mx = (A1.x + A2.x) / 2, my = (A1.y + A2.y) / 2;
+      // Midpoint (or start/end biased) text rotated along the dim line so
+      // the PDF matches what the canvas shows.
+      const tLin = D.textAlign === 'start' ? 0.12
+                 : D.textAlign === 'end'   ? 0.88
+                                           : 0.5;
+      const labelP = {
+        x: A1.x + (A2.x - A1.x) * tLin,
+        y: A1.y + (A2.y - A1.y) * tLin,
+      };
       const heightPt = (D.textHeight / scaleDenom) * PT_PER_MM;
-      page.drawText(L.toFixed(2), { x: mx - heightPt * 1.2, y: my + 0.5 * PT_PER_MM, size: heightPt, color });
+      drawDimLabelPdf(
+        page, L.toFixed(2), labelP,
+        { dx: A2.x - A1.x, dy: A2.y - A1.y },
+        heightPt, font, color,
+      );
       break;
     }
     case 'xline':
@@ -630,6 +700,12 @@ export async function exportPdf(
 
   const xform = makeTransform(rt);
 
+  // Embed Helvetica once — used for plain text entities and rotated dim
+  // labels. pdf-lib's default font can't be fed to `drawText({ rotate })`
+  // without an explicit font reference; measuring the label width via
+  // `font.widthOfTextAtSize` also depends on this embed.
+  const helvetica = await doc.embedFont(StandardFonts.Helvetica);
+
   // Plot frame (5mm inset, black 0.5pt). `custom-1to1` skips this.
   if (def.drawPlotFrame) {
     drawPlotFrame(page, rt.paperMm);
@@ -640,7 +716,7 @@ export async function exportPdf(
     if (!isExportable(e, layers)) continue;
     const L = layers[e.layer];
     const color = parseHexColor(L?.color ?? '#000000');
-    drawEntity(page, e, xform, color, DEFAULT_LINE_WIDTH_PT, rt.scaleDenom);
+    drawEntity(page, e, xform, color, DEFAULT_LINE_WIDTH_PT, rt.scaleDenom, helvetica);
   }
 
   // Title block (phase 5 renderer; skipped for `custom-1to1`).

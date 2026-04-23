@@ -118,6 +118,15 @@ export const DEFAULT_LAYERS: Layer[] = [
 const PROJECT_META_STORAGE_KEY = 'hektikcad.projectMeta.v1';
 const LOGO_STORAGE_KEY         = 'hektikcad.logo.v1';
 const LAST_TEMPLATE_STORAGE_KEY = 'hektikcad.lastTemplate.v1';
+/**
+ * Running counter for auto-generated Zeichnungsnummern. Each new drawing
+ * ("Datei → Neu", first boot) consumes one value here and pre-fills the
+ * projectMeta.drawingNumber. Users can still override the field in the export
+ * dialog; the counter just removes the chore of typing a new number every time.
+ * Persisted as a decimal string so future format changes stay backwards-
+ * compatible (e.g. to switch to year-prefixed numbers later).
+ */
+const NEXT_DRAWING_NUMBER_STORAGE_KEY = 'hektikcad.nextDrawingNumber.v1';
 const DIM_STYLE_STORAGE_KEY    = 'hektikcad.dimStyle.v1';
 const DIM_MODE_STORAGE_KEY     = 'hektikcad.dimMode.v1';
 const RADIUS_MODE_STORAGE_KEY  = 'hektikcad.radiusMode.v1';
@@ -367,6 +376,45 @@ export function defaultProjectMeta(): ProjectMeta {
 }
 
 /**
+ * Format a drawing-number counter as a zero-padded 3-digit string (001, 002,
+ * …, 999, 1000). Matches the placeholder shown in the export dialog and the
+ * "ZEICHNUNGS-NR." convention used by the titleblock renderer.
+ */
+export function formatDrawingNumber(n: number): string {
+  if (!Number.isFinite(n) || n < 1) return '';
+  return String(Math.floor(n)).padStart(3, '0');
+}
+
+/** Peek the next auto-number without incrementing. Defaults to 1. */
+export function peekNextDrawingNumber(): number {
+  try {
+    const raw = localStorage.getItem(NEXT_DRAWING_NUMBER_STORAGE_KEY);
+    if (raw) {
+      const n = parseInt(raw, 10);
+      if (Number.isFinite(n) && n >= 1) return n;
+    }
+  } catch { /* ignore */ }
+  return 1;
+}
+
+/**
+ * Consume the next auto-number: returns it as a formatted string (e.g.
+ * "001") and persists the successor. Called from `clearAll` (new drawing)
+ * and on first boot when no drawingNumber has been set yet. If localStorage
+ * is unavailable, returns "" so the caller leaves the field blank rather
+ * than looping on the same number.
+ */
+export function consumeNextDrawingNumber(): string {
+  const n = peekNextDrawingNumber();
+  try {
+    localStorage.setItem(NEXT_DRAWING_NUMBER_STORAGE_KEY, String(n + 1));
+  } catch {
+    return '';
+  }
+  return formatDrawingNumber(n);
+}
+
+/**
  * Load persisted project metadata from localStorage. Logo and last-template
  * live under their own keys (cleaner versioning, easier to clear) and get
  * merged in here.
@@ -405,6 +453,18 @@ export function saveProjectMeta(meta: ProjectMeta): void {
   } catch { /* swallow */ }
 }
 
+function initialProjectMeta(): ProjectMeta {
+  const meta = loadProjectMeta();
+  // First boot or user cleared localStorage → pre-assign the next auto-number
+  // so the title-block field isn't stuck on em-dash until the user discovers
+  // the export dialog. Persists immediately so refreshes keep the same number.
+  if (!meta.drawingNumber) {
+    meta.drawingNumber = consumeNextDrawingNumber();
+    if (meta.drawingNumber) saveProjectMeta(meta);
+  }
+  return meta;
+}
+
 export const state: AppState = {
   view: { x: 0, y: 0, scale: 4 },
   entities: [],
@@ -419,7 +479,7 @@ export const state: AppState = {
   nextId: 1,
   parameters: [],
   features: [],
-  projectMeta: loadProjectMeta(),
+  projectMeta: initialProjectMeta(),
 };
 
 /** Mutable runtime data that doesn't belong to the persisted drawing. */

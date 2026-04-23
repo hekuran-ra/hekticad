@@ -185,6 +185,55 @@ export async function showConfirm(opts: ConfirmOpts): Promise<boolean> {
   return reason === 'ok';
 }
 
+/**
+ * Three-way choice for the "unsaved changes?" flow on app close. Returns:
+ *   - 'save'    → user asked to save, caller should run the save flow
+ *   - 'discard' → user asked to close without saving
+ *   - 'cancel'  → user dismissed the prompt, caller should NOT close
+ *
+ * `openModal` only knows about 'ok' and 'cancel' reasons, so we stash the
+ * outcome in a closure variable and always resolve with `'ok'` from the
+ * three non-cancel branches. `Escape` / backdrop-click still close with
+ * `'cancel'`, which we map to `'cancel'` here too.
+ */
+export type UnsavedChangesOpts = {
+  title: string;
+  message?: string;
+  saveText?: string;
+  discardText?: string;
+  cancelText?: string;
+};
+
+export async function showUnsavedChangesPrompt(
+  opts: UnsavedChangesOpts,
+): Promise<'save' | 'discard' | 'cancel'> {
+  let outcome: 'save' | 'discard' | 'cancel' = 'cancel';
+  const reason = await openModal((close) => {
+    const panel = document.createElement('div');
+    panel.appendChild(mkHead(opts.title, opts.message));
+
+    const actions = document.createElement('div');
+    actions.className = 'hk-modal-actions';
+    // Order (left → right): Cancel / Discard / Save. Save is the default /
+    // Enter-commits button because the safer default is "don't lose work".
+    const cancel = mkBtn(opts.cancelText ?? 'Abbrechen', 'secondary',
+      () => { outcome = 'cancel'; close('cancel'); });
+    const discard = mkBtn(opts.discardText ?? 'Verwerfen', 'danger',
+      () => { outcome = 'discard'; close('ok'); });
+    const save = mkBtn(opts.saveText ?? 'Speichern', 'primary',
+      () => { outcome = 'save'; close('ok'); });
+    actions.append(cancel, discard, save);
+    panel.appendChild(actions);
+
+    queueMicrotask(() => save.focus());
+    return panel;
+  });
+  // Backdrop-click / Escape routes through `close('cancel')` but doesn't
+  // mutate `outcome`, so the default 'cancel' still applies here.
+  if (reason === 'cancel') return 'cancel';
+  return outcome;
+}
+
 export type PromptOpts = {
   title: string;
   message?: string;

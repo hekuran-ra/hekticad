@@ -19,6 +19,11 @@ import {
   saveOrthoAutoLock, saveParametricMode, saveShowAxes, saveSnapDynamic,
 } from './state';
 import { applyLayoutSnapshot, snapshotLayout, type ToolLayout } from './tools';
+// Build-time bundled defaults — shipped with the app. Developer regenerates
+// this file via Einstellungen → "Aktuellen Zustand als Build-Standard…".
+// Schema matches `UserDefaults` below; `version: 0` means "none bundled, fall
+// through to the factory baseline".
+import bundledDefaultsRaw from './bundled-defaults.json';
 
 const USER_DEFAULTS_KEY = 'hekticad.userDefaults.v1';
 
@@ -162,4 +167,94 @@ export function applyUserDefaultsAtStartup(): boolean {
   }
 
   return true;
+}
+
+/**
+ * Apply the build-time bundled defaults whenever the user has no personal
+ * snapshot in localStorage.
+ *
+ * Intended flow: the developer captures their preferred configuration via
+ * `exportCurrentAsBundledDefaults()` and commits the resulting JSON over
+ * `src/bundled-defaults.json`. Every build then ships those defaults, and
+ * any user who hasn't saved a personal snapshot (fresh install, or after
+ * "Eigenen Standard zurücksetzen") sees them on launch.
+ *
+ * We apply the bundled snapshot directly into runtime/state — we do NOT
+ * copy it into `USER_DEFAULTS_KEY`, because that would make the bundled
+ * baseline act like a personal snapshot (survives across resets, ignores
+ * future shipped updates to `bundled-defaults.json`). Keeping it strictly
+ * build-time means the user's explicit save/reset actions still work the
+ * way `user-defaults-dialogs.ts` documents them.
+ *
+ * Returns true if a bundled snapshot was applied this launch.
+ */
+export function applyBundledDefaultsIfUnset(): boolean {
+  // User already has their own personal snapshot → applyUserDefaultsAtStartup
+  // handled it before we were called. Skip.
+  if (loadUserDefaults()) return false;
+  const bundled = bundledDefaultsRaw as Partial<UserDefaults>;
+  if (!bundled || bundled.version !== 1) return false;
+  if (!bundled.layout || !Array.isArray(bundled.layers) || !bundled.snap) return false;
+
+  const d = bundled as UserDefaults;
+  // Layout + layers + snap + toggles. Same mutations as the
+  // localStorage-backed `applyUserDefaultsAtStartup` — factored inline rather
+  // than extracting to a shared helper so both code paths stay auditable.
+  applyLayoutSnapshot(d.layout);
+  state.layers = deepClone(d.layers);
+  Object.assign(runtime.snapSettings, d.snap);
+  saveShowAxes(d.snap.showAxes);
+  saveSnapDynamic({
+    polar: d.snap.polar,
+    tracking: d.snap.tracking,
+    polarAngleDeg: d.snap.polarAngleDeg,
+  });
+  runtime.orthoAutoLock = d.orthoAutoLock;
+  saveOrthoAutoLock(d.orthoAutoLock);
+  runtime.parametricMode = d.parametricMode;
+  saveParametricMode(d.parametricMode);
+  if (d.drawing) {
+    state.features   = deepClone(d.drawing.features);
+    state.entities   = deepClone(d.drawing.entities);
+    state.parameters = deepClone(d.drawing.parameters);
+    state.nextId     = d.drawing.nextId;
+    const maxLayer = Math.max(0, state.layers.length - 1);
+    state.activeLayer = Math.min(Math.max(0, d.drawing.activeLayer), maxLayer);
+  }
+  return true;
+}
+
+/**
+ * Build a snapshot identical to what `saveCurrentAsUserDefaults()` writes to
+ * localStorage, but return it as a plain JSON string. The developer calls
+ * this via a menu command, drops the string into `src/bundled-defaults.json`,
+ * and commits — every future build then ships those defaults to new users.
+ */
+export function exportCurrentAsBundledDefaults(opts: { includeDrawing: boolean }): string {
+  const s = runtime.snapSettings;
+  const snap: SnapSnapshot = {
+    end: s.end, mid: s.mid, int: s.int, center: s.center, axis: s.axis,
+    grid: s.grid, tangent: s.tangent, perp: s.perp,
+    gridSize: s.gridSize, showGrid: s.showGrid, showAxes: s.showAxes,
+    polar: s.polar, tracking: s.tracking, polarAngleDeg: s.polarAngleDeg,
+  };
+  const snapshot: UserDefaults = {
+    version: 1,
+    savedAt: Date.now(),
+    layout: snapshotLayout(),
+    layers: deepClone(state.layers),
+    snap,
+    orthoAutoLock: runtime.orthoAutoLock,
+    parametricMode: runtime.parametricMode,
+  };
+  if (opts.includeDrawing) {
+    snapshot.drawing = {
+      features: deepClone(state.features),
+      entities: deepClone(state.entities),
+      parameters: deepClone(state.parameters),
+      nextId: state.nextId,
+      activeLayer: state.activeLayer,
+    };
+  }
+  return JSON.stringify(snapshot, null, 2);
 }

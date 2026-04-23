@@ -7,8 +7,10 @@
 import { openModal, showAlert, showConfirm } from '../modal';
 import { state } from '../state';
 import { toast } from '../ui';
+import { saveBlobViaDialog } from '../io';
 import {
-  clearUserDefaults, hasUserDefaults, saveCurrentAsUserDefaults,
+  clearUserDefaults, exportCurrentAsBundledDefaults,
+  hasUserDefaults, saveCurrentAsUserDefaults,
 } from '../user-defaults';
 
 type SaveChoice = 'with-drawing' | 'without-drawing' | 'cancel';
@@ -115,6 +117,33 @@ export async function saveCurrentAsDefaultFlow(): Promise<void> {
       title: 'Speichern fehlgeschlagen',
       message: 'Der aktuelle Zustand konnte nicht gespeichert werden. '
         + 'Möglicherweise ist der Speicher voll.',
+    });
+  }
+}
+
+/**
+ * Developer-only flow: capture the current state as build-time bundled defaults.
+ * The resulting JSON string is saved to disk via the standard save dialog —
+ * the developer commits it over `src/bundled-defaults.json` so every future
+ * build ships those defaults to new users who haven't saved a personal
+ * snapshot. Reuses `askIncludeDrawing` so the developer has the same
+ * with/without-drawing choice the regular save flow offers.
+ */
+export async function exportBundledDefaultsFlow(): Promise<void> {
+  const choice = await askIncludeDrawing();
+  if (choice === 'cancel') return;
+  try {
+    const json = exportCurrentAsBundledDefaults({
+      includeDrawing: choice === 'with-drawing',
+    });
+    const blob = new Blob([json], { type: 'application/json' });
+    const res = await saveBlobViaDialog(blob, 'bundled-defaults.json');
+    if (res.cancelled) return;
+    toast('Build-Standard exportiert — nach src/bundled-defaults.json kopieren und committen');
+  } catch {
+    await showAlert({
+      title: 'Export fehlgeschlagen',
+      message: 'Der Build-Standard konnte nicht exportiert werden.',
     });
   }
 }

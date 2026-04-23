@@ -28,7 +28,7 @@ import {
 } from './features';
 import { createParameter, findParamByName, parseExprInput } from './params';
 import { ensureParametricModeOn } from './parametric-mode';
-import { applyUserDefaultsAtStartup } from './user-defaults';
+import { applyBundledDefaultsIfUnset, applyUserDefaultsAtStartup } from './user-defaults';
 import { pushUndo, redo, undo } from './undo';
 import {
   renderLayers, renderParameters, toast, updatePosStatus, updateSelStatus,
@@ -40,6 +40,7 @@ import { initThemes } from './themes';
 import { isModalOpen, showPrompt } from './modal';
 import { checkForUpdatesOnStartup } from './updater';
 import { initTauriBridge } from './tauribridge';
+import { initDirtyIndicator } from './dirty';
 import {
   commitInlineTextIfOpen, isInlineTextOpen, showInlineTextEditor,
 } from './textinline';
@@ -979,10 +980,20 @@ window.addEventListener('keydown', (ev) => {
 
 // ----------------- Boot -----------------
 
-// If the user previously blessed a layout/layers/drawing as their personal
-// default, apply it now — BEFORE any render so the first paint reflects it.
-// No-op when no snapshot exists; the baked factory defaults apply as before.
-applyUserDefaultsAtStartup();
+// Defaults cascade, highest priority first:
+//   1. Personal user snapshot in localStorage (Einstellungen → „Als Standard
+//      speichern"). If present, applies and we stop.
+//   2. Build-time bundled defaults (`src/bundled-defaults.json`). Shipped by
+//      the developer so new installs see the preferred configuration
+//      immediately — no click needed. Version 0 in that file = no bundle.
+//   3. Factory baseline hard-coded in `state.ts` / `tools.ts`.
+// All three paths mutate runtime/state BEFORE the first render so the first
+// paint reflects whichever tier won. No side effects on localStorage if we
+// only land on tier 2 — the user can still save their own personal snapshot
+// and the bundled baseline stays an OS-level default.
+if (!applyUserDefaultsAtStartup()) {
+  applyBundledDefaultsIfUnset();
+}
 
 ensureAxisFeatures();
 evaluateTimeline();
@@ -990,6 +1001,11 @@ evaluateTimeline();
 window.addEventListener('resize', resize);
 initThemes();
 initMenuBar();
+// Dirty-flag DOM wiring: toggles `body.doc-is-dirty` whenever pushUndo / save
+// / load flip the flag, so the `.doc-dirty` bullet in the header follows the
+// actual "unsaved edits" state. Independent of Tauri — also works in the
+// plain-browser build.
+initDirtyIndicator();
 // Reflect the persisted "palettes locked" flag as a body class so CSS can
 // key off it (cursor: default on headers, etc.) without per-element state.
 if (runtime.panelsLocked) document.body.classList.add('panels-locked');
