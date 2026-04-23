@@ -690,6 +690,99 @@ export function applyDimTextAlign(align: DimTextAlign): void {
   requestRender();
 }
 
+// ── Dim text-height presets ──────────────────────────────────────────────
+//
+// Four canned sizes exposed as buttons in the dim properties panel (single
+// and multi-select). The first three are fixed mm values, tuned so the
+// rendered text reads well on typical architectural/mechanical drawings at
+// common zoom levels. `auto` is special: it derives a height from the drawing
+// bounding box so a 30 m floor plan gets bigger text than a 40 mm detail,
+// without the user having to think about it. The computed value is committed
+// as a literal Expr at click time — NOT stored as a live "auto" mode — so
+// subsequent edits to other geometry don't silently change the dim text size
+// behind the user's back. Re-clicking "Automatisch" refreshes it.
+
+type DimSizePresetId = 'xs' | 's' | 'm' | 'auto';
+export const DIM_TEXT_PRESET_MM: Record<Exclude<DimSizePresetId, 'auto'>, number> = {
+  xs: 2,
+  s:  3.5,
+  m:  5,
+};
+// Tolerance for "is the current dim height equal to preset X?" — dim heights
+// are stored as Expr so small float drift from repeated parse/eval rounds is
+// possible; 0.01 mm is well below anything a human would notice on screen.
+const DIM_PRESET_MATCH_EPS = 0.01;
+
+/**
+ * Compute a readable text height from the drawing's current bounding box.
+ * Formula: diagonal / 120, clamped to [2, 25] mm. Chosen so that a typical
+ * A4-sized drawing (~400 mm diagonal) lands at ~3.3 mm — close to our
+ * "Klein" preset — and scales linearly from there. We deliberately ignore
+ * dims themselves in the bbox: if we included them, text-height changes
+ * could shift the bbox (dims that live far from their ref points push the
+ * bbox out), which would shift the computed auto-size on the next click.
+ */
+export function computeAutoDimTextHeight(): number {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const e of state.entities) {
+    if (e.type === 'dim' || e.type === 'xline') continue;
+    const pts = entityPointsForBBox(e);
+    for (const p of pts) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+  }
+  if (!Number.isFinite(minX)) return DIM_TEXT_PRESET_MM.m; // empty drawing → fall back to "Mittel"
+  const diag = Math.hypot(maxX - minX, maxY - minY);
+  const raw = diag / 120;
+  const clamped = Math.max(2, Math.min(25, raw));
+  // Round to 0.5 mm so the committed value looks tidy in the input field
+  // ("3.5 mm", not "3.27418 mm").
+  return Math.round(clamped * 2) / 2;
+}
+
+// Small, dim-local bbox extractor. Pulls the same corner points `view.ts`
+// uses but inlined so we don't introduce a circular import (view.ts already
+// imports from ui.ts).
+function entityPointsForBBox(e: Entity): Array<{ x: number; y: number }> {
+  if (e.type === 'line')     return [{ x: e.x1, y: e.y1 }, { x: e.x2, y: e.y2 }];
+  if (e.type === 'rect')     return [{ x: e.x1, y: e.y1 }, { x: e.x2, y: e.y2 }];
+  if (e.type === 'circle')   return [{ x: e.cx - e.r, y: e.cy - e.r }, { x: e.cx + e.r, y: e.cy + e.r }];
+  if (e.type === 'arc')      return [{ x: e.cx - e.r, y: e.cy - e.r }, { x: e.cx + e.r, y: e.cy + e.r }];
+  if (e.type === 'ellipse') {
+    const m = Math.max(e.rx, e.ry);
+    return [{ x: e.cx - m, y: e.cy - m }, { x: e.cx + m, y: e.cy + m }];
+  }
+  if (e.type === 'spline')   return e.pts;
+  if (e.type === 'polyline') return e.pts;
+  if (e.type === 'text')     return [{ x: e.x, y: e.y }];
+  return [];
+}
+
+/**
+ * Resolve a preset id to its concrete mm value at this moment. `auto` is
+ * recomputed every time so successive clicks stay up to date with the
+ * current drawing bbox.
+ */
+function resolveDimPresetMm(id: DimSizePresetId): number {
+  if (id === 'auto') return computeAutoDimTextHeight();
+  return DIM_TEXT_PRESET_MM[id];
+}
+
+/**
+ * Which preset, if any, matches the supplied mm value? Returns null when the
+ * current height is a custom one (user typed "4.2 mm" directly). `auto` is
+ * never reported as "currently active" — by design, because once committed
+ * it's indistinguishable from the matching literal value, and we don't want
+ * the auto button to appear permanently active after one click.
+ */
+function matchDimPreset(mm: number): Exclude<DimSizePresetId, 'auto'> | null {
+  for (const id of ['xs', 's', 'm'] as const) {
+    if (Math.abs(mm - DIM_TEXT_PRESET_MM[id]) < DIM_PRESET_MATCH_EPS) return id;
+  }
+  return null;
+}
+
 /**
  * Status labels the draft-info strings may contain. Each token is shown in
  * dim, values/numbers shown bold. Keeping this centralized so the regex below
@@ -1771,6 +1864,19 @@ export function renderProperties(): void {
   }
   if (selIds.length > 1) {
     if (badge) badge.textContent = String(selIds.length);
+    // Homogeneous-dim shortcut: when every selected object is a Bemaßung,
+    // offer a compact panel that batch-edits text height (+ presets) and the
+    // style/align fields across the whole selection. Everything else still
+    // hits the "bitte einzeln auswählen" fallback — we haven't generalised
+    // multi-edit to other entity types yet.
+    const allDims = selIds.every(id => {
+      const ent = state.entities.find(e => e.id === id);
+      return ent?.type === 'dim';
+    });
+    if (allDims) {
+      el.appendChild(renderMultiDimEditor(selIds));
+      return;
+    }
     const multi = document.createElement('div');
     multi.className = 'panel-empty';
     multi.textContent = `${selIds.length} Objekte — bitte einzeln auswählen.`;
@@ -2276,6 +2382,37 @@ function renderTextEditor(fid: string): HTMLElement {
 // and adds the end-cap style dropdown so users don't have to dig into
 // Format → Bemaßungsstil to change a single dim.
 
+/**
+ * Shared dim-style + align + size-preset segmented controls. Used by both
+ * the single-dim editor and the multi-dim editor so the two panels stay
+ * visually consistent and there's only one copy of the click-handler wiring.
+ *
+ * `currentHeightMm` supplies the value the preset row highlights as active
+ * (null for a heterogeneous multi-selection). `applyHeight` commits a new
+ * height — single-dim flows go through `applyFeaturePatch` after a direct
+ * feature mutation, multi-dim flows call the shared `applyDimTextHeight`.
+ */
+const DIM_SIZE_PRESETS: ReadonlyArray<{ id: DimSizePresetId; label: string; title: string }> = [
+  { id: 'xs',   label: 'XS',  title: `Sehr klein (${DIM_TEXT_PRESET_MM.xs} mm)` },
+  { id: 's',    label: 'S',   title: `Klein (${DIM_TEXT_PRESET_MM.s} mm)` },
+  { id: 'm',    label: 'M',   title: `Mittel (${DIM_TEXT_PRESET_MM.m} mm)` },
+  { id: 'auto', label: 'Auto', title: 'Automatisch – an Zeichnungsgröße anpassen' },
+];
+
+function mkDimSizePresetRow(
+  currentHeightMm: number | null,
+  applyHeight: (mm: number) => void,
+): HTMLElement {
+  const activeId = currentHeightMm !== null ? matchDimPreset(currentHeightMm) : null;
+  // mkSegControl expects a non-null active id; pass a sentinel that won't
+  // match any preset so nothing is highlighted when we're in a custom or
+  // mixed state.
+  const current: DimSizePresetId = (activeId ?? '__none__') as DimSizePresetId;
+  return mkPropsRow('Größe',
+    mkSegControl(DIM_SIZE_PRESETS, current, (id) => applyHeight(resolveDimPresetMm(id))),
+  );
+}
+
 function renderDimEditor(fid: string, ent: Entity): HTMLElement {
   const root = document.createElement('div');
   root.className = 'props-body';
@@ -2286,6 +2423,18 @@ function renderDimEditor(fid: string, ent: Entity): HTMLElement {
   };
   const f0 = getF();
   if (!f0) return root;
+
+  // Size presets first — most users don't want to type a number, they want
+  // to pick "klein" and move on. The raw Textgröße input below stays for
+  // anyone who needs a precise value or a parametric expression.
+  root.appendChild(mkDimSizePresetRow(
+    exprN(f0.textHeight),
+    (mm) => {
+      pushUndo();
+      const f = getF(); if (f) f.textHeight = numExpr(mm);
+      applyFeaturePatch();
+    },
+  ));
 
   root.appendChild(mkPropsRow('Textgröße',
     ...mkExprInput(
@@ -2328,5 +2477,119 @@ function renderDimEditor(fid: string, ent: Entity): HTMLElement {
   // Readout
   const L = Math.hypot(ent.p2.x - ent.p1.x, ent.p2.y - ent.p1.y);
   root.appendChild(mkInfo(`Abstand ${fmtN(L)} mm`));
+  return root;
+}
+
+/**
+ * Properties panel for a homogeneous multi-selection of dims. Exposes the
+ * same controls as the single-dim editor — size presets, text height, style,
+ * align — but writes through the existing `applyDim*` helpers that iterate
+ * the selection and push a single undo frame.
+ *
+ * Heterogeneous fields (e.g. some dims are 3 mm, others 5 mm) render with
+ * no active preset and a placeholder-style text height input. Typing a value
+ * or clicking a preset unifies the batch.
+ */
+function renderMultiDimEditor(selIds: number[]): HTMLElement {
+  const root = document.createElement('div');
+  root.className = 'props-body';
+
+  // Summary header — so the user knows the panel applies to the whole batch,
+  // not just one item (the single-select panel's title is identical otherwise).
+  const header = document.createElement('div');
+  header.className = 'props-header';
+  const title = document.createElement('div');
+  title.className = 'props-title';
+  title.textContent = `${selIds.length} Bemaßungen`;
+  header.appendChild(title);
+  root.appendChild(header);
+
+  // Collect current values so we can show a unified state when the batch
+  // happens to agree, and an "indeterminate" state when they don't.
+  const heights: number[] = [];
+  const styles = new Set<DimStyle>();
+  const aligns = new Set<DimTextAlign>();
+  for (const id of selIds) {
+    const feat = featureForEntity(id);
+    if (feat?.kind !== 'dim') continue;
+    heights.push(evalExpr(feat.textHeight));
+    styles.add(feat.style ?? runtime.dimStyle);
+    aligns.add(feat.textAlign ?? 'center');
+  }
+  const uniformHeight = heights.length > 0 && heights.every(h => Math.abs(h - heights[0]) < DIM_PRESET_MATCH_EPS)
+    ? heights[0] : null;
+  const uniformStyle  = styles.size === 1  ? [...styles][0]  : null;
+  const uniformAlign  = aligns.size === 1  ? [...aligns][0]  : null;
+
+  root.appendChild(mkDimSizePresetRow(uniformHeight, (mm) => applyDimTextHeight(mm)));
+
+  // Raw mm input — plain number rather than Expr so we don't have to guess
+  // which feature's expression to seed the field with. Empty / invalid input
+  // reverts silently, matching the single-dim editor's UX.
+  const heightInp = document.createElement('input');
+  heightInp.type = 'text';
+  heightInp.className = 'props-num';
+  heightInp.value = uniformHeight !== null ? fmtN(uniformHeight) : '';
+  heightInp.placeholder = uniformHeight === null ? 'gemischt' : '';
+  const commitHeight = (): void => {
+    const raw = heightInp.value.replace(',', '.').trim();
+    if (!raw) { heightInp.value = uniformHeight !== null ? fmtN(uniformHeight) : ''; return; }
+    const v = parseFloat(raw);
+    if (!Number.isFinite(v) || v < 0.1) {
+      toast('Wert muss ≥ 0.1 sein');
+      heightInp.value = uniformHeight !== null ? fmtN(uniformHeight) : '';
+      return;
+    }
+    applyDimTextHeight(v);
+  };
+  heightInp.addEventListener('change', commitHeight);
+  heightInp.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter')       { ev.preventDefault(); heightInp.blur(); }
+    else if (ev.key === 'Escape') { heightInp.blur(); }
+  });
+  root.appendChild(mkPropsRow('Textgröße', heightInp, mkUnit('mm')));
+
+  const STYLES: ReadonlyArray<{ id: DimStyle; label: string; title: string }> = [
+    { id: 'arrow', label: '→',  title: 'Pfeilspitze' },
+    { id: 'open',  label: '⟩',  title: 'Offener Pfeil' },
+    { id: 'tick',  label: '╱',  title: 'Architekturstrich' },
+    { id: 'arch',  label: '⌒',  title: 'Bogen' },
+  ];
+  // When the selection is mixed we still need to pass an id; use a sentinel
+  // that won't match so nothing is highlighted. Same trick as mkDimSizePresetRow.
+  const curStyle: DimStyle = (uniformStyle ?? '__none__') as DimStyle;
+  root.appendChild(mkPropsRow('Endpunkt',
+    mkSegControl(STYLES, curStyle, (styleId) => {
+      // Match the single-dim editor's pattern: pushUndo first, mutate every
+      // selected dim's feature, then let applyFeaturePatch refresh panel +
+      // canvas. We don't go through `applyDimStyle` here because that helper
+      // also rewrites `runtime.dimStyle` (the global default for new dims),
+      // which is a side-effect the single-dim editor avoids and we want
+      // parity between the two panels.
+      pushUndo();
+      for (const id of selIds) {
+        const f = featureForEntity(id);
+        if (f?.kind === 'dim') f.style = styleId;
+      }
+      applyFeaturePatch();
+    }),
+  ));
+
+  const ALIGNS: ReadonlyArray<{ id: DimTextAlign; label: string; title: string }> = [
+    { id: 'start',  label: '├', title: 'Am ersten Endpunkt' },
+    { id: 'center', label: '┼', title: 'Mittig' },
+    { id: 'end',    label: '┤', title: 'Am zweiten Endpunkt' },
+  ];
+  const curAlign: DimTextAlign = (uniformAlign ?? '__none__') as DimTextAlign;
+  root.appendChild(mkPropsRow('Textlage',
+    mkSegControl(ALIGNS, curAlign, (id) => applyDimTextAlign(id)),
+  ));
+
+  // Summary footer — quick sanity check that mirrors the single-dim readout.
+  if (uniformHeight !== null) {
+    root.appendChild(mkInfo(`${selIds.length} Bemaßungen · Texthöhe ${fmtN(uniformHeight)} mm`));
+  } else {
+    root.appendChild(mkInfo(`${selIds.length} Bemaßungen · gemischte Texthöhen`));
+  }
   return root;
 }

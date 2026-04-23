@@ -39,7 +39,16 @@
     "category": "Productivity",
     "shortDescription": "Parametric 2D CAD",
     "longDescription": "HektikCad — a parametric 2D CAD sketchpad.",
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "fileAssociations": [
+      {
+        "ext": ["hcad"],
+        "name": "HektikCad Drawing",
+        "description": "HektikCad Zeichnung",
+        "role": "Editor",
+        "mimeType": "application/x-hektikcad"
+      }
+    ]
   },
   "plugins": {
     "updater": {

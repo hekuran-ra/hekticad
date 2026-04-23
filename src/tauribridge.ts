@@ -20,8 +20,11 @@ import { runMenuCommand } from './ui/menu-bar';
 import { checkForUpdatesManually } from './updater';
 import { showAboutDialog } from './ui/help-dialogs';
 import { isDirty } from './dirty';
-import { saveJsonInteractive } from './io';
+import { applyLoadedDrawing, saveJsonInteractive } from './io';
+import { setCurrentFilePath } from './docfile';
 import { showUnsavedChangesPrompt } from './modal';
+import { toast } from './ui';
+import { getPanelsLocked, onPanelsLockedChange } from './tools';
 
 async function isTauriEnv(): Promise<boolean> {
   try {
@@ -66,7 +69,98 @@ export async function initTauriBridge(): Promise<void> {
     console.warn('[tauri-bridge] failed to subscribe to menu events:', err);
   }
 
+  await installFileOpenHandler();
   await installCloseGuard();
+  await installNativeMenuStateSync();
+}
+
+/**
+ * Keep the native menu's toggle items (currently just `settings:lock-panels`)
+ * in sync with the frontend's runtime state. Two triggers:
+ *
+ *   1. Startup — push the current `getPanelsLocked()` so the native ✓ reflects
+ *      whatever we loaded from user-defaults / localStorage. Without this the
+ *      CheckMenuItem's hardcoded initial `checked(false)` wins on Windows and
+ *      the check ends up inverted vs. the real state after the first load.
+ *   2. Toggle — `setPanelsLocked` fires our change listener, which forwards
+ *      the new state to the Rust `set_menu_check` command. macOS auto-toggles
+ *      the check correctly on click (NSMenuItem behaviour), but Windows muda
+ *      doesn't, so a manual sync is the cross-platform safe path.
+ *
+ * If the command errors we log but don't toast — a misaligned native check
+ * isn't worth interrupting the user for.
+ */
+async function installNativeMenuStateSync(): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const push = (checked: boolean): void => {
+      void invoke('set_menu_check', { id: 'settings:lock-panels', checked }).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.warn('[tauri-bridge] set_menu_check failed:', err);
+      });
+    };
+    push(getPanelsLocked());
+    onPanelsLockedChange(push);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[tauri-bridge] failed to install native menu state sync:', err);
+  }
+}
+
+/**
+ * Wire the OS "open with HektikCad" flow:
+ *
+ *   1. Subscribe to the `file-open-request` event Rust emits whenever the
+ *      OS hands us a .hcad path (macOS Apple Events, Windows / Linux argv
+ *      forwarded via single-instance).
+ *   2. Drain any paths Rust already queued before we were ready — on a
+ *      cold macOS launch-to-open, the Apple Event fires before the
+ *      webview's JS boots, so the first path sits in the Rust-side buffer.
+ *
+ * Each path is read via the narrow `read_file_text` command (so we don't
+ * have to grant broad fs:read capability) and then applied through the
+ * shared `applyLoadedDrawing` helper — same code path as Datei → Öffnen.
+ */
+async function installFileOpenHandler(): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const { listen } = await import('@tauri-apps/api/event');
+
+    const openPath = async (path: string): Promise<void> => {
+      try {
+        const text = await invoke<string>('read_file_text', { path });
+        if (!applyLoadedDrawing(text)) {
+          toast(`Fehler beim Laden: ${path}`);
+          return;
+        }
+        // Bind the drawing to this path so the next Ctrl+S writes straight
+        // back without a dialog. Also updates the title bar span + native
+        // window title to the opened file's basename.
+        setCurrentFilePath(path);
+        toast(`Geladen: ${path}`);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[tauri-bridge] read_file_text failed:', err);
+        const msg = err instanceof Error ? err.message : String(err);
+        toast(`Fehler beim Öffnen: ${msg}`);
+      }
+    };
+
+    await listen<string>('file-open-request', (ev) => {
+      if (typeof ev.payload === 'string') void openPath(ev.payload);
+    });
+
+    const pending = await invoke<string[]>('get_pending_opens');
+    // Multiple pending paths would be unusual, but if the OS did hand us
+    // several we just open them in order — the last one wins as the
+    // active drawing. Matches how most editors handle multi-file launches.
+    for (const p of pending) {
+      await openPath(p);
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[tauri-bridge] failed to install file-open handler:', err);
+  }
 }
 
 /**

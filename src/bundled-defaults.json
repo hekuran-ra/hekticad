@@ -1,4 +1,132 @@
 {
-  "version": 0,
-  "_comment": "Build-time user defaults. Shipped with the app and applied at first launch when the user has no personal snapshot in localStorage. Regenerate via Einstellungen → 'Aktuellen Zustand als Build-Standard exportieren' and commit the resulting file over this one. A version of 0 means 'no bundled defaults, fall through to factory baseline'."
+  "version": 1,
+  "savedAt": 1776943332807,
+  "layout": {
+    "panels": [
+      {
+        "id": "guide",
+        "label": "Hilfen",
+        "accent": "neutral",
+        "orientation": "vertical",
+        "tools": [
+          "select",
+          "select_similar",
+          "pan"
+        ],
+        "docked": true,
+        "dockColumn": 0,
+        "x": 0,
+        "y": 12,
+        "customColor": "#aaaaaa"
+      },
+      {
+        "id": "modify",
+        "label": "Ändern",
+        "accent": "modify",
+        "orientation": "vertical",
+        "tools": [
+          "move",
+          "copy",
+          "rotate",
+          "scale",
+          "mirror",
+          "cross_mirror",
+          "trim",
+          "extend",
+          "fillet",
+          "chamfer",
+          "offset",
+          "stretch",
+          "delete",
+          "extend_to"
+        ],
+        "docked": true,
+        "dockColumn": 0,
+        "x": 0,
+        "y": 12
+      },
+      {
+        "id": "construct",
+        "label": "Zeichnen",
+        "accent": "draw",
+        "orientation": "vertical",
+        "tools": [
+          "xline",
+          "ref_circle",
+          "line",
+          "polyline",
+          "divide_xline",
+          "line_offset",
+          "rect",
+          "circle",
+          "arc3",
+          "ellipse",
+          "spline"
+        ],
+        "docked": true,
+        "dockColumn": 1,
+        "x": 0,
+        "y": 12
+      },
+      {
+        "id": "annot",
+        "label": "Beschriftung",
+        "accent": "accent",
+        "orientation": "vertical",
+        "tools": [
+          "dim",
+          "radius",
+          "angle",
+          "text",
+          "hatch",
+          "fill"
+        ],
+        "docked": true,
+        "dockColumn": 1,
+        "x": 0,
+        "y": 142
+      }
+    ]
+  },
+  "layers": [
+    {
+      "name": "Standard Linie",
+      "color": "#ffffff",
+      "visible": true
+    },
+    {
+      "name": "Kontur",
+      "color": "#e06767",
+      "visible": true
+    },
+    {
+      "name": "Hilfslinie",
+      "color": "#8891a0",
+      "visible": true,
+      "style": "guide"
+    },
+    {
+      "name": "Bemaßung",
+      "color": "#67c1ff",
+      "visible": true
+    }
+  ],
+  "snap": {
+    "end": true,
+    "mid": true,
+    "int": true,
+    "center": true,
+    "axis": true,
+    "grid": false,
+    "tangent": true,
+    "perp": true,
+    "gridSize": 10,
+    "showGrid": true,
+    "showAxes": true,
+    "polar": false,
+    "tracking": true,
+    "polarAngleDeg": 45
+  },
+  "orthoAutoLock": false,
+  "parametricMode": false
 }

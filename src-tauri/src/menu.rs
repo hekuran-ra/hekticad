@@ -16,8 +16,8 @@
 //! event carrying the item id. See `src/tauribridge.ts` for the listener.
 
 use tauri::menu::{
-    AboutMetadataBuilder, CheckMenuItemBuilder, Menu, MenuItemBuilder, PredefinedMenuItem,
-    SubmenuBuilder,
+    AboutMetadataBuilder, CheckMenuItemBuilder, Menu, MenuItemBuilder, MenuItemKind,
+    PredefinedMenuItem, SubmenuBuilder,
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
@@ -134,9 +134,12 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         )
         .build()?;
 
-    // ── Einfügen (Werkzeug-Shortcuts sind Single-Key (L/Y/R/…). Keine
+    // ── Einfügen (Werkzeug-Shortcuts sind Single-Key (L/P/R/…). Keine
     //    Accelerators — die Frontend-keydown-Handler respektieren Text-Input-
-    //    Fokus; ein OS-Accelerator würde mitten beim Tippen feuern.)
+    //    Fokus; ein OS-Accelerator würde mitten beim Tippen feuern. Die im
+    //    in-app-Dropdown rechts angezeigten Buchstaben kommen aus der
+    //    Tool-Tabelle via `toolShortcutLabel` und halten sich damit automatisch
+    //    mit Benutzer-Overrides und künftigen Remaps in Sync.)
     let insert_submenu = SubmenuBuilder::new(app, "Einfügen")
         .item(&MenuItemBuilder::with_id("insert:line", "Linie").build(app)?)
         .item(&MenuItemBuilder::with_id("insert:polyline", "Polylinie").build(app)?)
@@ -148,7 +151,18 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .build()?;
 
     // ── Einstellungen
-    let settings_submenu = SubmenuBuilder::new(app, "Einstellungen")
+    //
+    // Windows-Workaround: muda (0.17.2) misst die Breite der Top-Level-Menü-
+    // Titel mit dem Font, der bei `AppendMenuW` aktiv ist — das passiert im
+    // Tauri-setup BEVOR das Fenster DPI-aware ist, und der längste Titel wird
+    // dann am Paint-Zeitpunkt um ein paar Pixel geclippt ("Einstellungen"
+    // → "Einstellun"). Ein Trailing-Space gibt dem Labelslot genug Slack.
+    // Auf macOS passiert die Messung korrekt, deshalb ohne Leerzeichen.
+    #[cfg(target_os = "windows")]
+    let settings_title = "Einstellungen ";
+    #[cfg(not(target_os = "windows"))]
+    let settings_title = "Einstellungen";
+    let settings_submenu = SubmenuBuilder::new(app, settings_title)
         .item(&MenuItemBuilder::with_id("settings:theme", "Design…").build(app)?)
         .separator()
         .item(&MenuItemBuilder::with_id("settings:company", "Firmeneinstellungen…").build(app)?)
@@ -169,18 +183,17 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &MenuItemBuilder::with_id("settings:reset-default", "Eigenen Standard zurücksetzen")
                 .build(app)?,
         )
+        .separator()
         .item(
-            &MenuItemBuilder::with_id(
-                "settings:export-bundled-default",
-                "Aktuellen Zustand als Build-Standard exportieren…",
-            )
-            .build(app)?,
+            &MenuItemBuilder::with_id("settings:shortcuts", "Tastenkürzel…")
+                .build(app)?,
         )
         .build()?;
 
     // ── Hilfe
+    //    Tastenkürzel-Eintrag ist in die Einstellungen gewandert (dort lassen
+    //    sich Werkzeug-Shortcuts auch anpassen), daher hier nur noch Über.
     let help_submenu = SubmenuBuilder::new(app, "Hilfe")
-        .item(&MenuItemBuilder::with_id("help:shortcuts", "Tastenkürzel-Übersicht").build(app)?)
         .item(&MenuItemBuilder::with_id("help:about", "Über HektikCad").build(app)?)
         .build()?;
 
@@ -210,4 +223,28 @@ pub fn on_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
     if let Err(err) = app.emit("app-menu-command", id.clone()) {
         log::warn!("failed to emit app-menu-command for {id}: {err}");
     }
+}
+
+/// Walk the native menu tree and update a CheckMenuItem's checked state by id.
+/// Used by the frontend to keep Windows' native menu in sync with toggles
+/// that live in JS (e.g. `settings:lock-panels`) — muda on Windows doesn't
+/// auto-sync from the frontend state, so without this the ✓ flips independently
+/// of the actual app state and ends up inverted after a reload that restores
+/// a non-default value from user-defaults.
+#[tauri::command]
+pub fn set_menu_check<R: Runtime>(app: AppHandle<R>, id: String, checked: bool) -> Result<(), String> {
+    let Some(menu) = app.menu() else { return Err("no menu installed".into()) };
+    for item in menu.items().map_err(|e| e.to_string())? {
+        if let MenuItemKind::Submenu(sub) = item {
+            for child in sub.items().map_err(|e| e.to_string())? {
+                if let MenuItemKind::Check(check) = child {
+                    if check.id().as_ref() == id {
+                        check.set_checked(checked).map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    Err(format!("no CheckMenuItem with id '{id}'"))
 }

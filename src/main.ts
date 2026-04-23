@@ -41,6 +41,8 @@ import { isModalOpen, showPrompt } from './modal';
 import { checkForUpdatesOnStartup } from './updater';
 import { initTauriBridge } from './tauribridge';
 import { initDirtyIndicator } from './dirty';
+import { refreshDocumentTitle } from './docfile';
+import { getShortcutKey } from './shortcuts';
 import {
   commitInlineTextIfOpen, isInlineTextOpen, showInlineTextEditor,
 } from './textinline';
@@ -865,7 +867,9 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     return;
   }
-  const shortcut = TOOLS.find(t => t.key.toLowerCase() === e.key.toLowerCase() && !t.action);
+  // Key resolution goes through `getShortcutKey` so user overrides from
+  // Einstellungen → Tastenkürzel win over the built-in defaults.
+  const shortcut = TOOLS.find(t => getShortcutKey(String(t.id), t.key).toLowerCase() === e.key.toLowerCase() && !t.action);
   if (shortcut) {
     // Same gating as the rail click handler: selection-required tools refuse
     // to activate when nothing is selected. Keyboard shortcuts must enforce
@@ -1020,6 +1024,11 @@ resize();
 // background update check. Both are no-ops in the plain-browser build.
 void initTauriBridge();
 void checkForUpdatesOnStartup();
+
+// Paint the initial document name in the title bar. At boot there's no file
+// binding yet, so this renders the numbered default (`${drawingNumber}_zeichnung.hcad`)
+// — matching what the Save-As dialog will pre-fill on the first save.
+refreshDocumentTitle();
 
 // ----------------- Sidebar collapsible sections -----------------
 

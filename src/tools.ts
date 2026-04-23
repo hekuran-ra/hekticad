@@ -1,4 +1,4 @@
-import type { CrossMirrorMode, Entity, EntityInit, EntityShape, Expr, Feature, FeatureEdgeRef, LineEntity, LineFeature, PointRef, Pt, RadiusMode, RectEntity, SnapPoint, ToolCtx, ToolId } from './types';
+import type { ArcEntity, CircleEntity, CrossMirrorMode, EllipseEntity, Entity, EntityInit, EntityShape, Expr, Feature, FeatureEdgeRef, LineEntity, LineFeature, PointRef, Pt, RadiusMode, RectEntity, SnapPoint, ToolCtx, ToolId } from './types';
 import { state, runtime, savePanelsLocked } from './state';
 import {
   add, dist, dot, len, norm, orthoSnap, perp, perpOffset, scale, sub,
@@ -19,6 +19,13 @@ import {
 import { showConfirm } from './modal';
 import { layoutText } from './textlayout';
 import { showInlineTextEditor } from './textinline';
+import { getShortcutKey, onShortcutsChange } from './shortcuts';
+
+// When user shortcuts change (via Einstellungen → Tastenkürzel), re-render
+// the tool rail so each button's tooltip/data-key reflects the new binding.
+// The rail won't exist yet when this module first evaluates, so the listener
+// is stashed and only takes effect on the next render cycle.
+onShortcutsChange(() => renderToolsPanel());
 
 const numE = (v: number): Expr => ({ kind: 'num', value: v });
 
@@ -393,7 +400,10 @@ export const TOOLS: ToolDef[] = [
   // ── Pointer ──
   { id: 'select', label: 'Auswahl', key: 'Esc', group: 'pointer',
     icon: '<path d="M4 2 L4 16 L7.5 12.5 L10 18.5 L12 17.5 L9.5 11.5 L14 11.5 Z" fill="currentColor" stroke="none"/>' },
-  { id: 'select_similar', label: 'Ähnliche auswählen', key: 'Q', group: 'pointer',
+  // Was on 'Q' but that clashed with Strecken ('stretch') — Strecken is a
+  // primary modify action that deserves a letter, Ähnliche-auswählen is a
+  // selection helper and moves to a free digit.
+  { id: 'select_similar', label: 'Ähnliche auswählen', key: '3', group: 'pointer',
     icon: '<path d="M3 2 L3 14 L6 11.5 L8 16 L9.5 15.3 L7.6 11 L11 11 Z" fill="currentColor" stroke="none"/><path d="M12 9 L12 19 L14.5 17 L16 20 L17 19.5 L15.6 17 L18.5 17 Z" fill="currentColor" stroke="none" opacity="0.45"/>' },
   { id: 'pan',    label: 'Canvas verschieben', key: 'Z', group: 'pointer',
     icon: '<path d="M9 11 L9 4.5 Q9 3.3 10 3.3 Q11 3.3 11 4.5 L11 10 M11 10 L11 3.5 Q11 2.3 12 2.3 Q13 2.3 13 3.5 L13 10 M13 10 L13 4 Q13 2.8 14 2.8 Q15 2.8 15 4 L15 11 M15 11 L15 6 Q15 5 16 5 Q17 5 17 6 L17 13 Q17 18 13 19.5 L10 19.5 Q7 18.5 6.5 16 L4.5 13 Q4 11.5 5 11 Q6 10.5 7 12 L9 14 Z"/>' },
@@ -407,13 +417,19 @@ export const TOOLS: ToolDef[] = [
     icon: '<circle cx="11" cy="11" r="7" stroke-dasharray="3 2"/><path d="M11 4.5 L11 17.5 M4.5 11 L17.5 11" stroke-width="0.8" opacity="0.45" stroke-dasharray="1 1.5"/><circle cx="11" cy="11" r="1" fill="currentColor" stroke="none"/>' },
   { id: 'angle',      label: 'Winkel bemaßen', key: 'W', group: 'guide',
     icon: '<path d="M4 18 L4 4 M4 18 L18 18"/><path d="M4 12 A 6 6 0 0 1 10 18" stroke-dasharray="2 1.8"/><circle cx="4" cy="18" r="1.2" fill="currentColor" stroke="none"/>' },
-  { id: 'radius',     label: 'Radius/Ø',       key: 'U', group: 'guide',
+  // Was on 'U' but that clashed with Versatz ('offset') — Versatz is used
+  // far more often in normal workflow, so the dim variant yields the letter
+  // and moves to a free digit (alongside the other dim shortcuts W/D).
+  { id: 'radius',     label: 'Radius/Ø',       key: '4', group: 'guide',
     icon: '<circle cx="11" cy="11" r="7"/><path d="M11 11 L18 6"/><path d="M16 4 L18 6 L16 8" fill="none"/><circle cx="11" cy="11" r="0.9" fill="currentColor" stroke="none"/>' },
 
   // ── Zeichnen ──
   { id: 'line',     label: 'Linie',     key: 'L', group: 'construct',
     icon: '<line x1="4" y1="18" x2="18" y2="4"/><circle cx="4" cy="18" r="1.4" fill="currentColor"/><circle cx="18" cy="4" r="1.4" fill="currentColor"/>' },
-  { id: 'polyline', label: 'Polylinie', key: 'Y', group: 'construct',
+  // Moved Y → P: P is the natural mnemonic for Polylinie, and leaving Y
+  // free lets Bis-Linie (extend-to) keep Y without conflict. Knock-on
+  // change: Symmetrie (cross_mirror) loses P and moves to a digit.
+  { id: 'polyline', label: 'Polylinie', key: 'P', group: 'construct',
     icon: '<polyline points="3,17 7,9 12,13 16,5 19,9"/><circle cx="3" cy="17" r="1.2" fill="currentColor"/><circle cx="19" cy="9" r="1.2" fill="currentColor"/>' },
   { id: 'rect',     label: 'Rechteck',  key: 'R', group: 'construct',
     icon: '<rect x="4" y="6" width="14" height="10"/>' },
@@ -448,7 +464,11 @@ export const TOOLS: ToolDef[] = [
     icon: '<rect x="4" y="4" width="6" height="6"/><rect x="4" y="4" width="14" height="14" stroke-dasharray="2.2 1.8" opacity="0.55"/><path d="M10 10 L17 17" stroke-linecap="round"/><path d="M14.5 17 L17 17 L17 14.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>' },
   { id: 'mirror', label: 'Spiegeln',    key: 'M', group: 'modify',
     icon: '<line x1="11" y1="2.5" x2="11" y2="19.5" stroke-dasharray="2 1.8"/><path d="M3 17 L9 5 L9 17 Z"/><path d="M19 17 L13 5 L13 17 Z" opacity="0.35"/>' },
-  { id: 'cross_mirror', label: 'Symmetrie', key: 'P', group: 'modify',
+  // Symmetrie lost P to Polylinie (P is the natural mnemonic there). Moved
+  // to '2' — cross-mirror is a niche symmetry helper, not a primary
+  // modify, so a digit is acceptable for the default. Users who prefer a
+  // letter can remap via Einstellungen → Tastenkürzel.
+  { id: 'cross_mirror', label: 'Symmetrie', key: '2', group: 'modify',
     icon: '<line x1="2.5" y1="11" x2="19.5" y2="11" stroke-dasharray="2 1.8"/><line x1="11" y1="2.5" x2="11" y2="19.5" stroke-dasharray="2 1.8"/><path d="M3 9 L9 3 L9 9 Z"/><path d="M19 9 L13 3 L13 9 Z" opacity="0.5"/><path d="M3 13 L9 19 L9 13 Z" opacity="0.5"/><path d="M19 13 L13 19 L13 13 Z" opacity="0.35"/><circle cx="11" cy="11" r="1.1" fill="currentColor" stroke="none"/>' },
   { id: 'trim',   label: 'Stutzen',     key: 'B', group: 'modify',
     icon: '<path d="M3 11 L8 11 M14 11 L19 11"/><path d="M11 3 L11 19" stroke-dasharray="2 1.8" opacity="0.6"/><path d="M8 8 L14 14 M14 8 L8 14"/>' },
@@ -1053,9 +1073,13 @@ function mkToolBtn(t: ToolDef): HTMLButtonElement {
   b.className = 'tool-btn';
   b.dataset.tool = String(t.id);
   b.dataset.label = t.label;
-  b.dataset.key = t.key;
+  // Display the effective shortcut (override or default) so a user who
+  // remapped in Einstellungen → Tastenkürzel sees their custom key in the
+  // tooltip, not the stale built-in.
+  const effectiveKey = getShortcutKey(String(t.id), t.key);
+  b.dataset.key = effectiveKey;
   if (t.action) b.dataset.action = t.action;
-  b.title = `${t.label}  [${t.key}]  — ziehen zum Umsortieren`;
+  b.title = `${t.label}  [${effectiveKey}]  — ziehen zum Umsortieren`;
   b.innerHTML = `<svg viewBox="0 0 22 22">${t.icon}</svg>`;
   // `draggable` is toggled in `renderToolsPanel` based on `runtime.panelsLocked`
   // — set the initial value to the opposite of the lock so locked layouts
@@ -1800,6 +1824,27 @@ export function setPanelsLocked(locked: boolean): void {
   document.body.classList.toggle('panels-locked', locked);
   renderToolsPanel();
   restoreActiveHighlight();
+  // Keep the native (Tauri) menu's ✓ state aligned. Under a plain browser
+  // build this listener is never registered, so the fire-and-forget is a
+  // harmless no-op there. Under Tauri the listener lives in tauribridge.ts
+  // and forwards into a Rust command that updates the CheckMenuItem — without
+  // this, the native check can drift from the actual state (Windows muda
+  // doesn't sync back from JS on its own).
+  for (const fn of panelsLockedListeners) {
+    try { fn(locked); } catch { /* ignore listener errors */ }
+  }
+}
+
+type PanelsLockedListener = (locked: boolean) => void;
+const panelsLockedListeners: PanelsLockedListener[] = [];
+/**
+ * Register a callback that fires whenever `setPanelsLocked` flips the state.
+ * Used by `tauribridge.ts` to push updates into the native menu check item.
+ * Callbacks run synchronously after the app state has been updated and the
+ * DOM re-rendered.
+ */
+export function onPanelsLockedChange(fn: PanelsLockedListener): void {
+  panelsLockedListeners.push(fn);
 }
 
 /** Read accessor so menu code can render a ✓ prefix without importing runtime. */
@@ -1905,7 +1950,7 @@ export function setTool(id: ToolId): void {
     // commits the new value and stays at 'pick'. Pressing Enter on an empty
     // cmdbar also refocuses the count field (via promptDivideCount).
     runtime.toolCtx = { step: 'pick', radius: lastDivideCount };
-    setPrompt(`Linie wählen (N=${lastDivideCount}) · Enter = Anzahl ändern`);
+    setPrompt(`Objekt wählen (N=${lastDivideCount}) · Enter = Anzahl ändern`);
   } else if (id === 'fillet') {
     runtime.toolCtx = { step: 'pick1' };
     setPrompt('Erste Linie wählen');
@@ -3954,13 +3999,14 @@ function handleDivideXLineClick(worldPt: Pt): void {
   }
   if (tc.step === 'pick') {
     const hit = hitTest(worldPt);
-    if (!hit || hit.type !== 'line') {
-      toast('Bitte eine Linie anklicken');
-      return;
-    }
+    if (!hit) { toast('Bitte eine Linie, Kreis, Ellipse oder Bogen anklicken'); return; }
     const n = tc.radius != null ? tc.radius : 0;  // reusing numeric slot for count
     if (!Number.isInteger(n) || n < 2) { toast('Anzahl nicht gesetzt'); return; }
-    applyDivideXLine(hit, n);
+    if (hit.type === 'line')         applyDivideXLine(hit, n);
+    else if (hit.type === 'circle')  applyDivideCircleXLines(hit, n);
+    else if (hit.type === 'arc')     applyDivideArcXLines(hit, n);
+    else if (hit.type === 'ellipse') applyDivideEllipseXLines(hit, n);
+    else toast('Nur Linie, Kreis, Ellipse oder Bogen teilbar');
     return;
   }
 }
@@ -4004,6 +4050,115 @@ function applyDivideXLine(l: LineEntity, n: number): void {
 }
 
 /**
+ * Emit N radial xlines around a full circle at equal angular intervals. The
+ * xlines pass through the circle centre and a division point on the circle
+ * (so each one marks a pie-slice boundary). Unlike the line case there's no
+ * "internal" vs "endpoint" distinction on a closed curve — all N points
+ * contribute an xline. Note that diametrically opposite points produce the
+ * same xline (an xline extends both ways), so for even N the user gets N/2
+ * distinct lines; we still emit N entries because the duplicates are cheap
+ * and deleting half would surprise on odd N where they're all distinct.
+ */
+function applyDivideCircleXLines(c: CircleEntity, n: number): void {
+  if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
+  lastDivideCount = n;
+  if (c.r < 1e-9) { toast('Kreis zu klein'); return; }
+  const layer = hilfslinieLayer();
+  pushUndo();
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    const dx = Math.cos(a), dy = Math.sin(a);
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'xline',
+      layer,
+      // Anchor at the centre — the xline then points through the i-th division
+      // point on the circumference along (dx, dy).
+      p: { kind: 'abs', x: numE(c.cx), y: numE(c.cy) },
+      dx: numE(dx),
+      dy: numE(dy),
+    });
+  }
+  evaluateTimeline();
+  updateStats();
+  render();
+}
+
+/**
+ * Emit N-1 radial xlines that divide an arc into N equal-angle segments.
+ * Arcs have endpoints (a1, a2), so like the line case we emit only the
+ * internal division points — the endpoints are already on screen. Direction
+ * respects the arc's sweep (a1 → a2 in its stored order; handled by
+ * normalising the sweep to [0, 2π)).
+ */
+function applyDivideArcXLines(a: ArcEntity, n: number): void {
+  if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
+  lastDivideCount = n;
+  if (a.r < 1e-9) { toast('Bogen zu klein'); return; }
+  // Canonicalise sweep as in rendering: go CCW from a1, wrap to +2π when a2
+  // lies on the other side. Matches how ArcEntity arcs are drawn throughout.
+  let sweep = a.a2 - a.a1;
+  while (sweep <= 0) sweep += Math.PI * 2;
+  if (sweep > Math.PI * 2) sweep -= Math.PI * 2;
+  const layer = hilfslinieLayer();
+  pushUndo();
+  for (let i = 1; i < n; i++) {
+    const t = i / n;
+    const ang = a.a1 + sweep * t;
+    const dx = Math.cos(ang), dy = Math.sin(ang);
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'xline',
+      layer,
+      p: { kind: 'abs', x: numE(a.cx), y: numE(a.cy) },
+      dx: numE(dx),
+      dy: numE(dy),
+    });
+  }
+  evaluateTimeline();
+  updateStats();
+  render();
+}
+
+/**
+ * Emit N radial xlines around an ellipse. Division is in parameter space
+ * (equal Δt of 2π/N), not arc length — matching typical CAD "equal division"
+ * behaviour on ellipses. Each xline anchors at the ellipse centre and points
+ * toward the i-th parametric point, so it's effectively a radial construction
+ * line through the centre (rotated by the ellipse's own `rot`).
+ */
+function applyDivideEllipseXLines(e: EllipseEntity, n: number): void {
+  if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
+  lastDivideCount = n;
+  if (e.rx < 1e-9 || e.ry < 1e-9) { toast('Ellipse zu klein'); return; }
+  const cos = Math.cos(e.rot), sin = Math.sin(e.rot);
+  const layer = hilfslinieLayer();
+  pushUndo();
+  for (let i = 0; i < n; i++) {
+    const t = (i / n) * Math.PI * 2;
+    // Local ellipse point, then rotate into world frame. Anchor on centre so
+    // the xline direction is from centre toward the division point.
+    const lx = Math.cos(t) * e.rx;
+    const ly = Math.sin(t) * e.ry;
+    const dx = lx * cos - ly * sin;
+    const dy = lx * sin + ly * cos;
+    const L = Math.hypot(dx, dy);
+    if (L < 1e-9) continue;
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'xline',
+      layer,
+      p: { kind: 'abs', x: numE(e.cx), y: numE(e.cy) },
+      dx: numE(dx / L),
+      dy: numE(dy / L),
+    });
+  }
+  evaluateTimeline();
+  updateStats();
+  render();
+}
+
+/**
  * cmdbar entry: stash the count in toolCtx and advance to 'pick'. The count
  * is stored in `tc.radius` (the generic numeric slot on ToolCtx — we reuse it
  * here to avoid bloating the context type with a one-off field).
@@ -4012,7 +4167,7 @@ export function commitDivideXLine(_tc: ToolCtx, n: number): number {
   if (!Number.isInteger(n) || n < 2) { toast('Anzahl ≥ 2'); return 0; }
   lastDivideCount = n;
   runtime.toolCtx = { step: 'pick', radius: n };
-  setPrompt(`Linie wählen (N=${n}) · Enter = Anzahl ändern`);
+  setPrompt(`Objekt wählen (N=${n}) · Enter = Anzahl ändern`);
   toast(`N = ${n}`);
   render();
   return n;
@@ -4033,7 +4188,7 @@ export function promptDivideCount(): void {
   if (!runtime.toolCtx || runtime.toolCtx.step !== 'count') {
     const carry = runtime.toolCtx?.radius ?? lastDivideCount;
     runtime.toolCtx = { step: 'count', radius: carry };
-    setPrompt('Anzahl Teile eingeben (oben) · dann Linie anklicken');
+    setPrompt('Anzahl Teile eingeben (oben) · dann Objekt anklicken');
   }
   // Defer focus to the next frame — the picker unhides via syncDividePicker
   // on state change, and focusing a hidden input silently no-ops.
@@ -5805,28 +5960,61 @@ export function updatePreview(): void {
     tc.preview = { type: 'group', entities: previews };
     setTip(`Δ ${delta.x.toFixed(2)}, ${delta.y.toFixed(2)}`);
   } else if (state.tool === 'divide_xline' && tc.step === 'pick' && tc.radius != null) {
-    // Hover over a line → preview the N-1 xlines that would be emitted.
+    // Hover over a line/circle/arc/ellipse → preview the xlines that would
+    // be emitted. Same geometry as the commit paths above, just into a
+    // preview group instead of state.features.
     const hit = hitTest(p);
     const n = tc.radius;
-    if (hit && hit.type === 'line' && Number.isInteger(n) && n >= 2) {
-      const l = hit;
-      const dx = l.x2 - l.x1, dy = l.y2 - l.y1;
-      const L = Math.hypot(dx, dy);
-      if (L > 1e-9) {
-        const nx = -dy / L, ny = dx / L;
-        const previews: EntityShape[] = [];
-        for (let i = 1; i < n; i++) {
-          const t = i / n;
-          const px = l.x1 + dx * t;
-          const py = l.y1 + dy * t;
-          previews.push({ type: 'xline', x1: px, y1: py, dx: nx, dy: ny });
+    const previews: EntityShape[] = [];
+    let count = 0;
+    if (hit && Number.isInteger(n) && n >= 2) {
+      if (hit.type === 'line') {
+        const l = hit;
+        const dx = l.x2 - l.x1, dy = l.y2 - l.y1;
+        const L = Math.hypot(dx, dy);
+        if (L > 1e-9) {
+          const nx = -dy / L, ny = dx / L;
+          for (let i = 1; i < n; i++) {
+            const t = i / n;
+            const px = l.x1 + dx * t;
+            const py = l.y1 + dy * t;
+            previews.push({ type: 'xline', x1: px, y1: py, dx: nx, dy: ny });
+          }
+          count = n - 1;
         }
-        tc.preview = { type: 'group', entities: previews };
-        setTip(`N=${n} → ${n - 1} Hilfslinien`);
+      } else if (hit.type === 'circle' && hit.r > 1e-9) {
+        for (let i = 0; i < n; i++) {
+          const a = (i / n) * Math.PI * 2;
+          previews.push({ type: 'xline', x1: hit.cx, y1: hit.cy, dx: Math.cos(a), dy: Math.sin(a) });
+        }
+        count = n;
+      } else if (hit.type === 'arc' && hit.r > 1e-9) {
+        let sweep = hit.a2 - hit.a1;
+        while (sweep <= 0) sweep += Math.PI * 2;
+        if (sweep > Math.PI * 2) sweep -= Math.PI * 2;
+        for (let i = 1; i < n; i++) {
+          const ang = hit.a1 + sweep * (i / n);
+          previews.push({ type: 'xline', x1: hit.cx, y1: hit.cy, dx: Math.cos(ang), dy: Math.sin(ang) });
+        }
+        count = n - 1;
+      } else if (hit.type === 'ellipse' && hit.rx > 1e-9 && hit.ry > 1e-9) {
+        const cos = Math.cos(hit.rot), sin = Math.sin(hit.rot);
+        for (let i = 0; i < n; i++) {
+          const t = (i / n) * Math.PI * 2;
+          const lx = Math.cos(t) * hit.rx, ly = Math.sin(t) * hit.ry;
+          const ex = lx * cos - ly * sin, ey = lx * sin + ly * cos;
+          const L = Math.hypot(ex, ey);
+          if (L > 1e-9) previews.push({ type: 'xline', x1: hit.cx, y1: hit.cy, dx: ex / L, dy: ey / L });
+        }
+        count = previews.length;
       }
+    }
+    if (previews.length > 0) {
+      tc.preview = { type: 'group', entities: previews };
+      setTip(`N=${n} → ${count} Hilfslinien`);
     } else {
       tc.preview = null;
-      setTip(`N=${n} · Linie wählen`);
+      setTip(`N=${n} · Linie/Kreis/Ellipse/Bogen wählen`);
     }
   } else if (state.tool === 'polygon' && tc.step === 'radius' && tc.cx != null && tc.cy != null) {
     const r = dist(p, { x: tc.cx, y: tc.cy });
@@ -6680,12 +6868,29 @@ function handleExtendToClick(worldPt: Pt): void {
     const src = tc.entity1;
     const clk = tc.click1;
     if (!src || src.type !== 'line' || !clk) { toast('Erst Quelllinie wählen'); return; }
-    const tgt = pickFilletLine(worldPt);
+    // Target can be a regular line, an exploded-rect edge, or an infinite
+    // xline (Hilfslinie). `pickFilletLine` handles the first two (it also
+    // explodes a hit rect into line features), so we only need to take the
+    // xline case directly off `hitTest`.
+    const directHit = hitTest(worldPt);
+    let tgt: Entity | null = null;
+    if (directHit && directHit.type === 'xline') {
+      tgt = directHit;
+    } else {
+      tgt = pickFilletLine(worldPt);
+    }
     if (!tgt) return;
     if (tgt.id === src.id) { toast('Andere Linie wählen'); return; }
-    if (tgt.type !== 'line') { toast('Ziel muss eine Linie sein'); return; }
+    if (tgt.type !== 'line' && tgt.type !== 'xline') {
+      toast('Ziel muss eine Linie oder Hilfslinie sein'); return;
+    }
 
-    const ip = lineIntersectionInfinite(src, tgt);
+    // `lineIntersectionInfinite` wants two endpoints; an xline is stored as
+    // point + direction, so synthesize a second point along its direction.
+    const tgtSeg = tgt.type === 'xline'
+      ? { x1: tgt.x1, y1: tgt.y1, x2: tgt.x1 + tgt.dx, y2: tgt.y1 + tgt.dy }
+      : { x1: tgt.x1, y1: tgt.y1, x2: tgt.x2, y2: tgt.y2 };
+    const ip = lineIntersectionInfinite(src, tgtSeg);
     if (!ip) { toast('Linien sind parallel'); return; }
 
     const a: Pt = { x: src.x1, y: src.y1 };
@@ -7328,7 +7533,9 @@ function trimCutterTs(target: LineEntity): { t: number; entityId: number }[] {
 function handleTrimClick(worldPt: Pt): void {
   const hit = hitTest(worldPt);
   if (!hit) { toast('Nichts getroffen'); return; }
-  if (hit.type !== 'line') { toast('Nur Linien können gestutzt werden'); return; }
+  if (hit.type === 'circle') { handleTrimCircleClick(hit, worldPt); return; }
+  if (hit.type === 'arc')    { handleTrimArcClick(hit, worldPt); return; }
+  if (hit.type !== 'line') { toast('Nur Linien, Kreise und Bögen können gestutzt werden'); return; }
   const a: Pt = { x: hit.x1, y: hit.y1 };
   const b: Pt = { x: hit.x2, y: hit.y2 };
   const abX = b.x - a.x, abY = b.y - a.y;
@@ -7423,6 +7630,282 @@ function handleTrimClick(worldPt: Pt): void {
     }
     for (let i = 1; i < pieces.length; i++) {
       state.features.push(featureFromEntityInit(pieces[i]));
+    }
+  }
+  evaluateTimeline();
+  updateStats();
+  updateSelStatus();
+  render();
+}
+
+/**
+ * Intersection points between two circles, expressed as angles (radians) on
+ * the TARGET circle from its centre. Up to two results per pair. Tangent and
+ * non-intersecting configurations return [].
+ */
+function circleCircleAngles(
+  target: { cx: number; cy: number; r: number },
+  cutter: { cx: number; cy: number; r: number },
+): number[] {
+  const dx = cutter.cx - target.cx, dy = cutter.cy - target.cy;
+  const d = Math.hypot(dx, dy);
+  // Coincident or totally separate / one-inside-the-other.
+  if (d < 1e-9) return [];
+  if (d > target.r + cutter.r + 1e-9) return [];
+  if (d < Math.abs(target.r - cutter.r) - 1e-9) return [];
+  const a = (d * d - cutter.r * cutter.r + target.r * target.r) / (2 * d);
+  const h2 = target.r * target.r - a * a;
+  const h = h2 > 0 ? Math.sqrt(h2) : 0;
+  const ux = dx / d, uy = dy / d;
+  const mx = target.cx + ux * a, my = target.cy + uy * a;
+  // Two perpendicular offsets. Tangent (h≈0) collapses to a single point; we
+  // still emit both so the caller can dedupe — cheap and simpler than the
+  // alternative branching here.
+  const p1x = mx + (-uy) * h, p1y = my + ux * h;
+  const p2x = mx -  (-uy) * h, p2y = my -  ux * h;
+  const ang = (px: number, py: number) => Math.atan2(py - target.cy, px - target.cx);
+  const out: number[] = [ang(p1x, p1y)];
+  if (h > 1e-9) out.push(ang(p2x, p2y));
+  return out;
+}
+
+/**
+ * Return every angle on the given circle (or full circle of an arc) where a
+ * visible cutter entity crosses it, paired with that cutter's id. Angles are
+ * in the native atan2 range (−π, π]. Used by the trim tool on circles/arcs.
+ */
+function trimCircleCutterAngles(
+  target: { id: number; cx: number; cy: number; r: number },
+): { angle: number; entityId: number }[] {
+  const out: { angle: number; entityId: number }[] = [];
+  const push = (ang: number, id: number) => out.push({ angle: ang, entityId: id });
+  for (const e of state.entities) {
+    if (e.id === target.id) continue;
+    const layer = state.layers[e.layer];
+    if (!layer || !layer.visible) continue;
+    if (e.type === 'line' || e.type === 'xline') {
+      const a: Pt = e.type === 'line' ? { x: e.x1, y: e.y1 } : { x: e.x1, y: e.y1 };
+      const b: Pt = e.type === 'line'
+        ? { x: e.x2, y: e.y2 }
+        : { x: e.x1 + e.dx, y: e.y1 + e.dy };
+      // Parametric t on the (infinite for xline, bounded for line) cutter.
+      const dX = b.x - a.x, dY = b.y - a.y;
+      const fX = a.x - target.cx, fY = a.y - target.cy;
+      const A = dX * dX + dY * dY;
+      const B = 2 * (fX * dX + fY * dY);
+      const C = fX * fX + fY * fY - target.r * target.r;
+      let disc = B * B - 4 * A * C;
+      if (disc < 0 || A < 1e-12) continue;
+      disc = Math.sqrt(disc);
+      const ts = [(-B - disc) / (2 * A), (-B + disc) / (2 * A)];
+      for (const t of ts) {
+        if (e.type === 'line' && (t < -1e-9 || t > 1 + 1e-9)) continue;
+        const px = a.x + dX * t, py = a.y + dY * t;
+        push(Math.atan2(py - target.cy, px - target.cx), e.id);
+      }
+    } else if (e.type === 'circle') {
+      for (const ang of circleCircleAngles(target, { cx: e.cx, cy: e.cy, r: e.r })) push(ang, e.id);
+    } else if (e.type === 'arc') {
+      // Cutter arc must hit the target circle in its own sweep — otherwise the
+      // visible arc doesn't actually touch and would be a phantom intersection.
+      for (const ang of circleCircleAngles(target, { cx: e.cx, cy: e.cy, r: e.r })) {
+        const px = target.cx + Math.cos(ang) * target.r;
+        const py = target.cy + Math.sin(ang) * target.r;
+        const angOnCutter = Math.atan2(py - e.cy, px - e.cx);
+        if (angleInSweep(angOnCutter, e.a1, e.a2)) push(ang, e.id);
+      }
+    } else if (e.type === 'rect') {
+      const xl = Math.min(e.x1, e.x2), xr = Math.max(e.x1, e.x2);
+      const yb = Math.min(e.y1, e.y2), yt = Math.max(e.y1, e.y2);
+      const edges: [Pt, Pt][] = [
+        [{ x: xl, y: yb }, { x: xr, y: yb }],
+        [{ x: xr, y: yb }, { x: xr, y: yt }],
+        [{ x: xr, y: yt }, { x: xl, y: yt }],
+        [{ x: xl, y: yt }, { x: xl, y: yb }],
+      ];
+      for (const [p1, p2] of edges) {
+        for (const t of lineCircleT(p1, p2, { x: target.cx, y: target.cy }, target.r)) {
+          const px = p1.x + (p2.x - p1.x) * t, py = p1.y + (p2.y - p1.y) * t;
+          push(Math.atan2(py - target.cy, px - target.cx), e.id);
+        }
+      }
+    } else if (e.type === 'polyline') {
+      for (let i = 0; i < e.pts.length - 1; i++) {
+        const p1 = e.pts[i], p2 = e.pts[i + 1];
+        for (const t of lineCircleT(p1, p2, { x: target.cx, y: target.cy }, target.r)) {
+          const px = p1.x + (p2.x - p1.x) * t, py = p1.y + (p2.y - p1.y) * t;
+          push(Math.atan2(py - target.cy, px - target.cx), e.id);
+        }
+      }
+      if (e.closed && e.pts.length >= 2) {
+        const p1 = e.pts[e.pts.length - 1], p2 = e.pts[0];
+        for (const t of lineCircleT(p1, p2, { x: target.cx, y: target.cy }, target.r)) {
+          const px = p1.x + (p2.x - p1.x) * t, py = p1.y + (p2.y - p1.y) * t;
+          push(Math.atan2(py - target.cy, px - target.cx), e.id);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Trim a circle at the clicked arc segment. Finds the two intersection angles
+ * that bracket the click (walking CW and CCW from it around the circle); the
+ * segment between them — the one the user clicked — is removed and the
+ * complement survives as an arc that sweeps CCW from the CCW-neighbour to the
+ * CW-neighbour (the long way around).
+ *
+ * With no intersections the whole circle is deleted, mirroring the line-trim
+ * fallback ("click what you want gone"). With exactly one intersection the
+ * tool refuses: splitting a closed curve at a single point leaves the circle
+ * shape intact, so there's nothing sensible to remove.
+ *
+ * The resulting arc inherits the source circle's parametric centre and radius
+ * so `Radius` as a variable, `axisProject` centres, etc. still drive it.
+ * Endpoint angles are baked as numeric exprs — the two cut points don't have
+ * a parametric anchor we can name yet; keeping them parametric would require
+ * an `arcOfCircle × intersection-with-cutter` ref kind we haven't built.
+ */
+function handleTrimCircleClick(hit: CircleEntity, worldPt: Pt): void {
+  const fid = featureForEntity(hit.id)?.id;
+  if (!fid) return;
+  const cuts = trimCircleCutterAngles({ id: hit.id, cx: hit.cx, cy: hit.cy, r: hit.r });
+  // Deduplicate near-equal angles (two entities meeting at the same point).
+  const norm = (a: number) => ((a % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+  const uniq: number[] = [];
+  for (const c of cuts) {
+    const a = norm(c.angle);
+    if (!uniq.some(u => Math.abs(u - a) < 1e-6)) uniq.push(a);
+  }
+  uniq.sort((x, y) => x - y);
+  if (uniq.length === 0) {
+    pushUndo();
+    deleteFeatures([fid]);
+    state.selection.delete(hit.id);
+    evaluateTimeline();
+    updateStats();
+    updateSelStatus();
+    toast('Kreis entfernt');
+    render();
+    return;
+  }
+  if (uniq.length === 1) {
+    toast('Ein Schnittpunkt reicht nicht — Kreis unverändert');
+    return;
+  }
+  const clickAng = norm(Math.atan2(worldPt.y - hit.cy, worldPt.x - hit.cx));
+  // Find the arc gap (CCW from uniq[i] to uniq[i+1], wrapping) that contains
+  // the click. That gap is what we remove; the arc covering the rest of the
+  // circle is what survives.
+  let gapStart = uniq[uniq.length - 1], gapEnd = uniq[0]; // default: wrap gap
+  for (let i = 0; i < uniq.length - 1; i++) {
+    if (clickAng >= uniq[i] && clickAng <= uniq[i + 1]) {
+      gapStart = uniq[i];
+      gapEnd = uniq[i + 1];
+      break;
+    }
+  }
+  // Surviving arc: CCW from gapEnd → gapStart (the long way around, skipping
+  // the click gap).
+  pushUndo();
+  const srcFeat = state.features.find(f => f.id === fid);
+  const newArc: Feature = (srcFeat && srcFeat.kind === 'circle')
+    ? { id: fid, kind: 'arc', layer: hit.layer, center: srcFeat.center, radius: srcFeat.radius,
+        a1: numE(gapEnd), a2: numE(gapStart) }
+    : featureFromEntityInit({
+        type: 'arc', layer: hit.layer, cx: hit.cx, cy: hit.cy, r: hit.r,
+        a1: gapEnd, a2: gapStart,
+      }, fid);
+  const idx = state.features.findIndex(f => f.id === fid);
+  if (idx >= 0) state.features[idx] = newArc;
+  evaluateTimeline();
+  updateStats();
+  updateSelStatus();
+  render();
+}
+
+/**
+ * Trim an existing arc at the clicked segment. Same bracketing logic as the
+ * line trim (walk along the sweep, find the cutter just before and just after
+ * the click, remove that span, keep what's left) — just parametrised by angle
+ * through the arc's CCW-normalised sweep instead of linear t.
+ *
+ * May yield 0 (click gap reaches both endpoints), 1 (click gap touches one
+ * endpoint), or 2 (click gap sits strictly inside the sweep) surviving arcs.
+ * The source feature is reused for the first survivor to preserve its id and
+ * its centre/radius parametric refs.
+ */
+function handleTrimArcClick(hit: ArcEntity, worldPt: Pt): void {
+  const fid = featureForEntity(hit.id)?.id;
+  if (!fid) return;
+  // Normalised total sweep of the arc in [0, 2π).
+  const twoPi = Math.PI * 2;
+  let sweep = hit.a2 - hit.a1;
+  while (sweep <= 0) sweep += twoPi;
+  if (sweep > twoPi) sweep -= twoPi;
+  if (sweep < 1e-9) { toast('Bogen zu klein'); return; }
+  // Map an angle to t ∈ [0, 1] along the sweep (CCW from a1).
+  const sweepT = (ang: number): number => {
+    let d = ang - hit.a1;
+    while (d < 0) d += twoPi;
+    while (d > twoPi) d -= twoPi;
+    return d / sweep;
+  };
+  // Gather cutters and keep only those inside the sweep. Points exactly at
+  // the endpoints (t=0 or 1) are dropped — they're the arc's own endpoints,
+  // not an interior cut.
+  const rawCuts = trimCircleCutterAngles({ id: hit.id, cx: hit.cx, cy: hit.cy, r: hit.r });
+  const cuts: { t: number; entityId: number }[] = [];
+  for (const c of rawCuts) {
+    if (!angleInSweep(c.angle, hit.a1, hit.a2)) continue;
+    const t = sweepT(c.angle);
+    if (t > 1e-6 && t < 1 - 1e-6) cuts.push({ t, entityId: c.entityId });
+  }
+  const tClick = sweepT(Math.atan2(worldPt.y - hit.cy, worldPt.x - hit.cx));
+  let tLow = 0, tHigh = 1, hasLow = false, hasHigh = false;
+  for (const c of cuts) {
+    if (c.t < tClick) {
+      if (c.t > tLow) { tLow = c.t; hasLow = true; }
+    } else {
+      if (c.t < tHigh) { tHigh = c.t; hasHigh = true; }
+    }
+  }
+  if (!hasLow && !hasHigh) {
+    pushUndo();
+    deleteFeatures([fid]);
+    state.selection.delete(hit.id);
+    evaluateTimeline();
+    updateStats();
+    updateSelStatus();
+    toast('Bogen entfernt');
+    render();
+    return;
+  }
+  pushUndo();
+  const srcFeat = state.features.find(f => f.id === fid);
+  const tToAngle = (t: number) => hit.a1 + sweep * t;
+  const mkArc = (t0: number, t1: number, reuseId: string | null): Feature => {
+    const a1 = tToAngle(t0), a2 = tToAngle(t1);
+    if (reuseId && srcFeat && srcFeat.kind === 'arc') {
+      return { id: reuseId, kind: 'arc', layer: hit.layer, center: srcFeat.center, radius: srcFeat.radius,
+               a1: numE(a1), a2: numE(a2) };
+    }
+    return featureFromEntityInit({
+      type: 'arc', layer: hit.layer, cx: hit.cx, cy: hit.cy, r: hit.r, a1, a2,
+    }, reuseId ?? newFeatureId());
+  };
+  const pieces: { t0: number; t1: number }[] = [];
+  if (hasLow)  pieces.push({ t0: 0,     t1: tLow  });
+  if (hasHigh) pieces.push({ t0: tHigh, t1: 1     });
+  if (!pieces.length) {
+    state.features = state.features.filter(f => f.id !== fid);
+    state.selection.delete(hit.id);
+  } else {
+    const idx = state.features.findIndex(f => f.id === fid);
+    if (idx >= 0) state.features[idx] = mkArc(pieces[0].t0, pieces[0].t1, fid);
+    for (let i = 1; i < pieces.length; i++) {
+      state.features.push(mkArc(pieces[i].t0, pieces[i].t1, null));
     }
   }
   evaluateTimeline();

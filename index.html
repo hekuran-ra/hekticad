@@ -39,7 +39,9 @@
       </div>
 
       <div class="brand-doc">
-        <span>zeichnung.hcad</span>
+        <!-- data-doc-name is our stable hook for docfile.ts; the visible text
+             is updated at runtime (never rely on this fallback in production). -->
+        <span data-doc-name>zeichnung.hcad</span>
         <span class="doc-dirty">•</span>
       </div>
 
@@ -223,12 +225,15 @@
     <aside id="sidebar">
 
       <!-- Collapse handle — toggles the whole sidebar between full width and a
-           narrow rail. Lives absolutely positioned on the sidebar's left edge
-           so the click target is equally reachable in both states; the CSS
-           rotates the chevron (‹ / ›) according to body.sidebar-collapsed. -->
+           narrow rail. Fixed-positioned just OUTSIDE the sidebar's left edge
+           (offset from the viewport's right by `--sidebar-w`) so the click
+           target never overlaps the panel's inputs and tracks the sidebar
+           width automatically via the same CSS variable. The chevron points
+           into the sidebar when expanded (→ = collapse) and outward when
+           collapsed (← = expand); CSS flips it via body.sidebar-collapsed. -->
       <button class="sidebar-collapse" id="sidebar-collapse-btn" title="Seitenleiste ein-/ausklappen (F4)" aria-label="Seitenleiste umschalten">
         <svg class="sidebar-collapse-chev" viewBox="0 0 12 12" width="10" height="10" aria-hidden="true">
-          <path d="M7.5 3 L4.5 6 L7.5 9" stroke="currentColor" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4.5 3 L7.5 6 L4.5 9" stroke="currentColor" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       </button>
 

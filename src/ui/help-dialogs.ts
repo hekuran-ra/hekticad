@@ -1,10 +1,14 @@
 /**
- * Hilfe menu dialogs — Tastenkürzel-Übersicht and Über HektikCad.
+ * Hilfe menu dialogs — "Über HektikCad" only.
  *
- * Both reuse `openModal()` from modal.ts so they inherit backdrop/Escape/
- * queue behaviour. Shortcut table is curated here (not auto-generated from
- * TOOLS) so we can group logically and include keystrokes that don't live on
- * a tool definition (Esc, Home, Strg+Z, …).
+ * The Tastenkürzel-Übersicht moved to Einstellungen → Tastenkürzel… where
+ * the user can now also remap tool keys (see `ui/shortcuts-settings.ts`).
+ * The old read-only dialog and its static `SHORTCUT_GROUPS` list are kept
+ * below but are NOT wired into any menu — left in place as a reference for
+ * the system-shortcut portion (now lives in `SYSTEM_GROUPS` of the new
+ * dialog) so a diff-y comparison stays easy during the transition. If we
+ * confirm the new dialog fully replaces this one by the next release, the
+ * `showShortcutsDialog` export and `SHORTCUT_GROUPS` can be deleted.
  */
 
 import { openModal } from '../modal';

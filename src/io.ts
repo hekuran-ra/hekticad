@@ -11,6 +11,9 @@ import { showConfirm } from './modal';
 import { exportDxf } from './io/export-dxf';
 import { exportEps } from './io/export-eps';
 import { exportPdf } from './io/export-pdf';
+import {
+  getCurrentFilePath, getDefaultSaveFilename, setCurrentFilePath,
+} from './docfile';
 
 /**
  * Result of `saveBlobViaDialog`: `path` is set when the user committed to a
@@ -122,23 +125,79 @@ export async function exportDrawing(opts: ExportOptions): Promise<void> {
   }
 }
 
+/**
+ * Build the `.hcad` JSON blob from live state. Shared between the three save
+ * entry points (`saveJson`, `saveJsonInteractive`, direct-write path) so the
+ * on-disk shape never drifts between them.
+ */
+function buildSaveBlob(): Blob {
+  const data: SaveFormat = {
+    entities: state.entities,
+    layers: state.layers,
+    nextId: state.nextId,
+    parameters: state.parameters,
+    features: state.features,
+  };
+  return new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+}
+
+/**
+ * Write blob bytes directly to an already-known path via the Rust-side
+ * `write_file_bytes` command. Returns true on success, false on any failure
+ * (permissions, path gone, not running in Tauri). Callers fall back to the
+ * Save-As dialog on false so the user still has an escape hatch.
+ */
+async function writeBlobToPath(blob: Blob, path: string): Promise<boolean> {
+  try {
+    const core = await import('@tauri-apps/api/core');
+    if (!core.isTauri()) return false;
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    // `Array.from(buf)` matches the marshaling shape save_bytes_dialog uses;
+    // Tauri IPC turns the JS number array into Rust `Vec<u8>` on the other side.
+    await core.invoke<void>('write_file_bytes', { path, data: Array.from(buf) });
+    return true;
+  } catch (err) {
+    console.warn('[writeBlobToPath]', err);
+    return false;
+  }
+}
+
+/**
+ * Primary save entry. Behavior depends on whether the drawing has a bound
+ * file (set by a prior Save-As or Open):
+ *
+ *   • Bound path present → direct write to that path, no dialog. Matches
+ *     what every other editor does on Ctrl+S.
+ *   • No bound path      → Save-As dialog, pre-filled with the numbered
+ *     default (`${drawingNumber}_zeichnung.hcad`), then bind on success.
+ *   • Direct write fails → fall back to the dialog so the user can pick a
+ *     new location. Happens rarely (permissions, path moved), but the
+ *     toast is explicit about why the dialog appeared.
+ */
 export async function saveJson(): Promise<void> {
   try {
-    const data: SaveFormat = {
-      entities: state.entities,
-      layers: state.layers,
-      nextId: state.nextId,
-      parameters: state.parameters,
-      features: state.features,
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const blob = buildSaveBlob();
+    const bound = getCurrentFilePath();
+
+    if (bound) {
+      const ok = await writeBlobToPath(blob, bound);
+      if (ok) {
+        markClean();
+        toast(`Gespeichert: ${bound}`);
+        return;
+      }
+      // Fall through to Save-As with a toast explaining why.
+      toast('Direkt speichern fehlgeschlagen — wähle neuen Ort');
+    }
+
     // `.hcad` = proprietary HektikCad save; JSON-encoded internally but the
     // extension communicates "this is a CAD file" rather than "some random JSON".
-    const res = await saveBlobViaDialog(blob, 'zeichnung.hcad');
+    const res = await saveBlobViaDialog(blob, getDefaultSaveFilename());
     if (res.cancelled) return;
-    // The drawing as it stands on disk now matches state — drop the dirty
-    // flag so the "•" indicator vanishes and the close-guard doesn't
-    // re-prompt for the same unchanged drawing.
+    // Remember the chosen path so the next save goes direct — only meaningful
+    // inside Tauri, where `res.path` is a real filesystem path. The browser
+    // fallback synthesizes a filename and has no way to write back later.
+    await rememberSavedPathIfTauri(res.path);
     markClean();
     toast(`Gespeichert: ${res.path}`);
   } catch (err) {
@@ -150,22 +209,27 @@ export async function saveJson(): Promise<void> {
 
 /**
  * Programmatic save that reports whether the user completed the save or
- * cancelled the dialog. Distinct from `saveJson()` which has a `void` return
- * — the close-guard handler needs to know whether it should proceed with the
- * close (save succeeded) or stay open (user cancelled the save dialog).
+ * cancelled the dialog. Mirrors `saveJson`'s direct-vs-dialog logic so the
+ * close-guard gets the same "silent save to bound path" fast path.
  */
 export async function saveJsonInteractive(): Promise<'saved' | 'cancelled' | 'error'> {
   try {
-    const data: SaveFormat = {
-      entities: state.entities,
-      layers: state.layers,
-      nextId: state.nextId,
-      parameters: state.parameters,
-      features: state.features,
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const res = await saveBlobViaDialog(blob, 'zeichnung.hcad');
+    const blob = buildSaveBlob();
+    const bound = getCurrentFilePath();
+
+    if (bound) {
+      const ok = await writeBlobToPath(blob, bound);
+      if (ok) {
+        markClean();
+        toast(`Gespeichert: ${bound}`);
+        return 'saved';
+      }
+      toast('Direkt speichern fehlgeschlagen — wähle neuen Ort');
+    }
+
+    const res = await saveBlobViaDialog(blob, getDefaultSaveFilename());
     if (res.cancelled) return 'cancelled';
+    await rememberSavedPathIfTauri(res.path);
     markClean();
     toast(`Gespeichert: ${res.path}`);
     return 'saved';
@@ -177,7 +241,100 @@ export async function saveJsonInteractive(): Promise<'saved' | 'cancelled' | 'er
   }
 }
 
-export function loadJson(): void {
+/**
+ * Only bind `currentFilePath` when we're actually running inside Tauri — the
+ * browser fallback in `saveBlobViaDialog` returns the suggested filename as
+ * `res.path`, which is useful for the toast but NOT a real filesystem path
+ * we could write back to. Silent no-op on browser builds.
+ */
+async function rememberSavedPathIfTauri(path: string): Promise<void> {
+  try {
+    const core = await import('@tauri-apps/api/core');
+    if (core.isTauri()) setCurrentFilePath(path);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Apply a loaded drawing JSON to the live state. Shared by the browser-file
+ * picker flow (`loadJson`) and the OS file-association flow (`loadJsonFromPath`
+ * in `tauribridge.ts`) so both paths go through the same migration,
+ * timeline-evaluate and dirty-reset sequence.
+ */
+export function applyLoadedDrawing(jsonText: string): boolean {
+  try {
+    const data = JSON.parse(jsonText) as SaveFormat;
+    if (data.layers) {
+      // Migrate legacy `style: 'dash'` (pre-linetype-expansion) to the new
+      // `'dashed'` preset so every save cycle produces type-valid JSON.
+      for (const L of data.layers) {
+        if ((L.style as unknown) === 'dash') L.style = 'dashed';
+      }
+      state.layers = data.layers;
+    }
+    state.nextId = data.nextId ?? 1;
+    state.parameters = data.parameters ?? [];
+    state.features = data.features ?? [];
+    state.selection.clear();
+    // Guarantee locked origin axes are present (may be missing in old files).
+    ensureAxisFeatures();
+    // Features are authoritative — rebuild entities from the timeline.
+    // Legacy saves without features fall back to persisted entities as-is.
+    if (state.features.length) {
+      evaluateTimeline();
+    } else {
+      state.entities = data.entities ?? [];
+    }
+    resetHistory();
+    // A freshly loaded drawing has no unsaved edits by definition.
+    markClean();
+    renderLayers();
+    updateStats();
+    updateSelStatus();
+    render();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function loadJson(): Promise<void> {
+  // Tauri runtime: native open dialog + `read_file_text`. Gives us the real
+  // filesystem path so subsequent Ctrl+S writes can go straight back to it
+  // and the title bar can show the opened file's name. The dialog plugin
+  // needs `dialog:allow-open` in the capabilities manifest.
+  try {
+    const core = await import('@tauri-apps/api/core');
+    if (core.isTauri()) {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const picked = await open({
+        multiple: false,
+        directory: false,
+        filters: [{ name: 'HektikCad', extensions: ['hcad', 'json'] }],
+      });
+      // Plugin returns `string | string[] | null`. With multiple:false we get
+      // a string or null; guard anyway in case the typings drift.
+      const path = typeof picked === 'string' ? picked : null;
+      if (!path) return;
+      const text = await core.invoke<string>('read_file_text', { path });
+      if (!applyLoadedDrawing(text)) {
+        toast(`Fehler beim Laden: ${path}`);
+        return;
+      }
+      setCurrentFilePath(path);
+      toast(`Geladen: ${path}`);
+      return;
+    }
+  } catch (err) {
+    // Fall through to browser flow — typically means the dialog plugin API
+    // isn't reachable (dev preview, stripped build).
+    console.warn('[loadJson] Tauri path failed, using browser fallback:', err);
+  }
+
+  // Browser fallback: plain file input. No real FS path, so we clear any
+  // previous binding — silent Ctrl+S after opening a different drawing
+  // would otherwise overwrite the wrong file.
   const inp = document.createElement('input');
   inp.type = 'file';
   // Accept the current `.hcad` extension plus legacy `.json` so users with
@@ -188,40 +345,9 @@ export function loadJson(): void {
     const f = inp.files?.[0];
     if (!f) return;
     f.text().then(t => {
-      try {
-        const data = JSON.parse(t) as SaveFormat;
-        if (data.layers) {
-          // Migrate legacy `style: 'dash'` (pre-linetype-expansion) to the new
-          // `'dashed'` preset so every save cycle produces type-valid JSON.
-          for (const L of data.layers) {
-            if ((L.style as unknown) === 'dash') L.style = 'dashed';
-          }
-          state.layers = data.layers;
-        }
-        state.nextId = data.nextId ?? 1;
-        state.parameters = data.parameters ?? [];
-        state.features = data.features ?? [];
-        state.selection.clear();
-        // Guarantee locked origin axes are present (may be missing in old files).
-        ensureAxisFeatures();
-        // Features are authoritative — rebuild entities from the timeline.
-        // Legacy saves without features fall back to persisted entities as-is.
-        if (state.features.length) {
-          evaluateTimeline();
-        } else {
-          state.entities = data.entities ?? [];
-        }
-        resetHistory();
-        // A freshly loaded drawing has no unsaved edits by definition.
-        markClean();
-        renderLayers();
-        updateStats();
-        updateSelStatus();
-        render();
-        toast('Geladen');
-      } catch {
-        toast('Fehler beim Laden');
-      }
+      const ok = applyLoadedDrawing(t);
+      if (ok) setCurrentFilePath(null);
+      toast(ok ? 'Geladen' : 'Fehler beim Laden');
     });
   };
   inp.click();
@@ -415,6 +541,11 @@ export async function clearAll(): Promise<void> {
     state.projectMeta.revision = '';
     saveProjectMeta(state.projectMeta);
   }
+  // Fresh drawing → drop the file binding (it belonged to the previous
+  // drawing). setCurrentFilePath(null) already triggers a title refresh,
+  // and because we cleared AFTER saveProjectMeta the refresh reads the
+  // freshly-incremented drawingNumber (e.g. "002_zeichnung.hcad").
+  setCurrentFilePath(null);
   updateStats();
   updateSelStatus();
   render();

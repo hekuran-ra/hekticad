@@ -74,6 +74,14 @@ export type CmdSchema = {
    * twice to lock.
    */
   commitOnEnter?: boolean;
+  /**
+   * Called when Enter on a field advances focus to the next empty field
+   * instead of committing. Lets a schema "lock" the partial value into its
+   * tool context so the live preview and a subsequent cursor click respect
+   * it — e.g. rect: typing a width and pressing Enter locks the width and
+   * leaves the height to the cursor.
+   */
+  onPartial?: (values: CmdValues, advancedFrom: string) => void;
 };
 
 // ============================================================================
@@ -436,7 +444,21 @@ dom.cmdFields.addEventListener('keydown', (e) => {
       // lock immediately, not bounce focus to the length field).
       if (!isLast && !currentSchema.commitOnEnter) {
         for (let i = idx + 1; i < inputs.length; i++) {
-          if (!inputs[i].value) { inputs[i].focus(); return; }
+          if (!inputs[i].value) {
+            // Before we hand focus to the next field, give the schema a chance
+            // to "lock" the value the user just typed into the tool context —
+            // rect uses this to pin the width so the live preview and a
+            // subsequent cursor click both respect it.
+            if (currentSchema.onPartial) {
+              currentSchema.onPartial(fieldValues, target.dataset.fieldName!);
+              // onPartial may have swapped the schema via setPrompt → rebuild;
+              // in that case the new schema's focus logic (pendingFocusField)
+              // takes over and we stop touching the old input list.
+              if (currentSchema !== schemaAtStart) return;
+            }
+            inputs[i].focus();
+            return;
+          }
         }
         // All later fields already filled → commit (fall through).
       }
@@ -540,13 +562,49 @@ function schemaFor(tool: ToolId, tc: ToolCtx | null): CmdSchema | null {
     };
   }
   if (tool === 'rect' && tc && tc.step === 'dims' && tc.p1) {
+    // Partial-lock: if the user typed a width and pressed Enter without also
+    // entering a height, the width gets pinned into `tc.horizontal` / its expr
+    // into `tc.horizontalExpr` (see onPartial below). The live preview and the
+    // next canvas click both already respect those fields — we just surface
+    // the lock state back into the prompt + field values so the user sees the
+    // pinned number instead of an empty input after rebuild.
+    const wLocked = tc.horizontal != null;
+    const hLocked = tc.vertical != null;
+    const lockNote = wLocked && hLocked
+      ? ' (Breite + Höhe gelockt)'
+      : wLocked ? ' (Breite gelockt)'
+      : hLocked ? ' (Höhe gelockt)'
+      : '';
+    const wVal = wLocked ? String(tc.horizontal) : undefined;
+    const hVal = hLocked ? String(tc.vertical) : undefined;
     return {
-      prompt: 'Breite + Höhe',
+      prompt: 'Breite + Höhe' + lockNote,
       fields: [
-        { name: 'width',  label: 'Breite', kind: 'expr', meaningHint: 'Breite' },
-        { name: 'height', label: 'Höhe',   kind: 'expr', meaningHint: 'Höhe' },
+        { name: 'width',  label: 'Breite', kind: 'expr', meaningHint: 'Breite', value: wVal, required: false },
+        { name: 'height', label: 'Höhe',   kind: 'expr', meaningHint: 'Höhe',   value: hVal, required: false },
       ],
       commit: (v) => commitRect(tc, v),
+      onPartial: (values, advancedFrom) => {
+        // Enter on Breite without Höhe → lock width, let cursor (or typed
+        // height) finish the rectangle. Symmetric for Höhe, though the field
+        // order means this path is rarely hit in practice.
+        const v = values[advancedFrom];
+        if (!v || v.value <= 0) return;
+        const cur = runtime.toolCtx;
+        if (!cur || cur.step !== 'dims') return;
+        if (advancedFrom === 'width') {
+          runtime.toolCtx = { ...cur, horizontal: v.value, horizontalExpr: v.expr };
+        } else if (advancedFrom === 'height') {
+          runtime.toolCtx = { ...cur, vertical: v.value, verticalExpr: v.expr };
+        }
+        // Refresh the prompt + field values so the user sees the lock badge.
+        // `setPromptRef` → `rebuildCmdBar` → new schema with value preset.
+        // We use the existing height-focus field so focus lands on the one the
+        // user still needs to fill.
+        pendingFocusField = advancedFrom === 'width' ? 'height' : 'width';
+        setPromptRef('Breite + Höhe');
+        render();
+      },
     };
   }
   if (tool === 'circle' && tc && tc.step === 'r' && tc.cx != null && tc.cy != null) {
@@ -969,7 +1027,19 @@ function commitPolyline(tc: ToolCtx, v: CmdValues): void {
 
 function commitRect(tc: ToolCtx, v: CmdValues): void {
   if (!tc.p1) return;
-  const w = v.width, h = v.height;
+  // Fall back to values already locked into the tool context from a previous
+  // partial-commit (e.g. user typed width + Enter, then typed height + Enter:
+  // the width field was rebuilt empty but `tc.horizontalExpr` still holds it).
+  const w: CmdValue | undefined = v.width ?? (
+    tc.horizontalExpr != null && tc.horizontal != null
+      ? { expr: tc.horizontalExpr, value: tc.horizontal }
+      : undefined
+  );
+  const h: CmdValue | undefined = v.height ?? (
+    tc.verticalExpr != null && tc.vertical != null
+      ? { expr: tc.verticalExpr, value: tc.vertical }
+      : undefined
+  );
   if (!w || w.value <= 0 || !h || h.value <= 0) { toast('Breite und Höhe eingeben'); return; }
   // Sign follows the cursor direction relative to the first corner, so the
   // rectangle opens "into" the quadrant the mouse is currently in (matches
@@ -1209,6 +1279,11 @@ function commitStretchDirection(tc: ToolCtx, v: CmdValues): void {
     click1: tc.click1, click2: tc.click2, basePt: tc.basePt,
     lockedDir: dir,
   };
+  // `setPromptRef` reaches `rebuildCmdBar` which swaps the schema to the
+  // distance step and (via `focusFirstField`) puts the caret in the new
+  // "Abstand" input — without this the schema updates but focus stays on the
+  // old angle field, and the user has to click the Abstand box to continue.
+  setPromptRef('Abstand klicken oder eingeben');
   render();
 }
 

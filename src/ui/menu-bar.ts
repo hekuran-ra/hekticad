@@ -25,8 +25,9 @@ import { clearAll, loadJson, saveJson } from '../io';
 import { showExportDialog } from './export-dialog';
 import { showCompanySettings } from './company-settings';
 import { showDimStyleDialog } from './dim-style-dialog';
-import { showAboutDialog, showShortcutsDialog } from './help-dialogs';
-import { exportBundledDefaultsFlow, resetUserDefaultsFlow, saveCurrentAsDefaultFlow } from './user-defaults-dialogs';
+import { showAboutDialog } from './help-dialogs';
+import { showShortcutsSettingsDialog } from './shortcuts-settings';
+import { resetUserDefaultsFlow, saveCurrentAsDefaultFlow } from './user-defaults-dialogs';
 import { closeThemePopover, showThemeDialog } from '../themes';
 import { cancelTool, getPanelsLocked, resetToolOrder, setPanelsLocked, setTool, TOOLS, toolRequiresSelection } from '../tools';
 import { undo, redo } from '../undo';
@@ -34,6 +35,7 @@ import { toast, updateSelStatus } from '../ui';
 import { requestRender } from '../render';
 import { runtime } from '../state';
 import { zoomFit } from '../view';
+import { getShortcutKey } from '../shortcuts';
 
 type MenuAction = () => void | Promise<void>;
 type MenuEntry =
@@ -48,7 +50,16 @@ type MenuEntry =
        */
       id: string;
       label: string;
-      shortcut?: string;
+      /**
+       * Right-hand shortcut label in the dropdown. Either a static string
+       * (for system chords like `Strg+S` that never change) or a getter
+       * resolved at open-time — used for tool-activation items so the menu
+       * stays in sync with the current tool key (including any user override
+       * from Einstellungen → Tastenkürzel). Without the getter, hard-coding
+       * the letter here risks drift: if the tool table remaps a key (e.g.
+       * Polylinie Y → P) the menu would keep showing the stale letter.
+       */
+      shortcut?: string | (() => string);
       action: MenuAction;
       disabled?: () => boolean;
       /**
@@ -107,6 +118,20 @@ function activateTool(id: string): void {
   setTool(def.id as Parameters<typeof setTool>[0]);
 }
 
+/**
+ * Resolve the current effective shortcut for a tool id, honouring any user
+ * override. Returns an empty string if the tool doesn't exist (so the menu
+ * simply renders without an accelerator chip rather than showing "undefined").
+ * Used by the insert-menu entries below — keeping the resolution in one place
+ * means the menu, the rail tooltip and the keydown matcher all draw from the
+ * same source of truth and can't drift out of sync.
+ */
+function toolShortcutLabel(toolId: string): string {
+  const def = TOOLS.find(t => t.id === toolId);
+  if (!def) return '';
+  return getShortcutKey(String(def.id), def.key);
+}
+
 // Stub — wired up when the import dialog lands in a later phase. Until then,
 // the menu item and header button both call this and show a placeholder toast.
 function showImportDialogStub(): void {
@@ -161,13 +186,18 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
   einfuegen: {
     label: 'Einfügen',
     entries: [
-      { id: 'insert:line',     label: 'Linie',      shortcut: 'L', action: () => activateTool('line') },
-      { id: 'insert:polyline', label: 'Polylinie',  shortcut: 'Y', action: () => activateTool('polyline') },
-      { id: 'insert:rect',     label: 'Rechteck',   shortcut: 'R', action: () => activateTool('rect') },
-      { id: 'insert:circle',   label: 'Kreis',      shortcut: 'C', action: () => activateTool('circle') },
-      { id: 'insert:text',     label: 'Text',       shortcut: 'T', action: () => activateTool('text') },
-      { id: 'insert:dim',      label: 'Bemaßung',   shortcut: 'D', action: () => activateTool('dim') },
-      { id: 'insert:xline',    label: 'Hilfslinie', shortcut: 'H', action: () => activateTool('xline') },
+      // Shortcut labels resolve at open-time from the live tool table so a
+      // remap (factory default or user override) shows up here without hand-
+      // edits. Previously the literals drifted — Polylinie showed `Y` long
+      // after the tool moved to `P`, making it look like Y was bound twice
+      // (extend_to on the rail AND Polylinie in the menu).
+      { id: 'insert:line',     label: 'Linie',      shortcut: () => toolShortcutLabel('line'),     action: () => activateTool('line') },
+      { id: 'insert:polyline', label: 'Polylinie',  shortcut: () => toolShortcutLabel('polyline'), action: () => activateTool('polyline') },
+      { id: 'insert:rect',     label: 'Rechteck',   shortcut: () => toolShortcutLabel('rect'),     action: () => activateTool('rect') },
+      { id: 'insert:circle',   label: 'Kreis',      shortcut: () => toolShortcutLabel('circle'),   action: () => activateTool('circle') },
+      { id: 'insert:text',     label: 'Text',       shortcut: () => toolShortcutLabel('text'),     action: () => activateTool('text') },
+      { id: 'insert:dim',      label: 'Bemaßung',   shortcut: () => toolShortcutLabel('dim'),      action: () => activateTool('dim') },
+      { id: 'insert:xline',    label: 'Hilfslinie', shortcut: () => toolShortcutLabel('xline'),    action: () => activateTool('xline') },
     ],
   },
   format: {
@@ -196,17 +226,26 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
         action: () => { void saveCurrentAsDefaultFlow(); } },
       { id: 'settings:reset-default', label: 'Eigenen Standard zurücksetzen',
         action: () => { void resetUserDefaultsFlow(); } },
-      // Developer-only: dump the current state to a bundled-defaults.json the
-      // developer commits over src/bundled-defaults.json. Every future build
-      // then ships those defaults to new users who have no personal snapshot.
-      { id: 'settings:export-bundled-default', label: 'Aktuellen Zustand als Build-Standard exportieren…',
-        action: () => { void exportBundledDefaultsFlow(); } },
+      'separator',
+      // Editable tool-key bindings. Moved from the old Hilfe → Übersicht
+      // (read-only) so power users can remap single-key shortcuts (L, R, C, …)
+      // from one place that also functions as the up-to-date reference.
+      { id: 'settings:shortcuts', label: 'Tastenkürzel…',
+        action: () => { void showShortcutsSettingsDialog(); } },
+      // Developer-only export of the bundled defaults file lives in
+      // `exportBundledDefaultsFlow` (src/ui/user-defaults-dialogs.ts). It's
+      // intentionally NOT wired into the menu — end users shouldn't see it.
+      // To regenerate `src/bundled-defaults.json` for a new build, re-add an
+      // entry here that calls the flow, export, commit the JSON, then revert.
     ],
   },
   hilfe: {
     label: 'Hilfe',
     entries: [
-      { id: 'help:shortcuts', label: 'Tastenkürzel-Übersicht', action: () => { void showShortcutsDialog(); } },
+      // The Tastenkürzel entry moved to Einstellungen → Tastenkürzel… because
+      // that dialog is now editable (not just a read-only list). Leaving
+      // "Über HektikCad" as Hilfe's sole entry for now; future entries (Log
+      // öffnen, Bug melden, …) can rejoin here.
       { id: 'help:about',     label: 'Über HektikCad',         action: () => { void showAboutDialog(); } },
     ],
   },
@@ -298,10 +337,17 @@ function openMenu(id: MenuId): void {
     label.textContent = checked ? `✓ ${entry.label}` : entry.label;
     item.appendChild(label);
 
-    if (entry.shortcut) {
+    // `shortcut` is either a literal string (for static system chords like
+    // `Strg+S`) or a getter for items whose accelerator is derived from the
+    // live tool table. Resolving on each open keeps the displayed letter in
+    // sync with user overrides from Einstellungen → Tastenkürzel.
+    const shortcutText = typeof entry.shortcut === 'function'
+      ? entry.shortcut()
+      : entry.shortcut;
+    if (shortcutText) {
       const sc = document.createElement('span');
       sc.className = 'menu-dropdown-shortcut';
-      sc.textContent = entry.shortcut;
+      sc.textContent = shortcutText;
       item.appendChild(sc);
     }
 
