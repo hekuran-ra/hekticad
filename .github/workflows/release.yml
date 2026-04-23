@@ -57,6 +57,11 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'HektikCad ${{ github.ref_name }}'
           releaseBody: 'See the changelog below for what changed. The installed app will auto-update on next launch.'
-          releaseDraft: true
+          # Publish immediately — the updater endpoint is
+          # /releases/latest/download/latest.json, which resolves via the
+          # "latest release" redirect and a draft release is NOT considered
+          # latest. Leaving this `true` meant v0.2.5 shipped as a draft and
+          # existing 0.2.4 installs kept seeing 0.2.4's latest.json.
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
