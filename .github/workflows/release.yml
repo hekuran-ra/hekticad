@@ -1,7 +1,7 @@
 name: Release HektikCad
 
 # Triggered by pushing a version tag: `git tag v0.3.0 && git push --tags`.
-# Builds native installers on macOS (Universal), Windows and Linux runners,
+# Builds native installers on macOS (Universal) and Windows runners,
 # signs them with the Tauri updater key (from secrets), and publishes them
 # as a GitHub Release. The Tauri updater in the installed app checks the
 # `latest.json` artifact this workflow publishes and offers in-app updates.
@@ -20,8 +20,6 @@ jobs:
         include:
           - platform: 'macos-latest'
             args: '--target universal-apple-darwin'
-          - platform: 'ubuntu-22.04'
-            args: ''
           - platform: 'windows-latest'
             args: ''
 
@@ -34,16 +32,6 @@ jobs:
         with:
           # macOS universal builds need both architectures.
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
-
-      - name: Install Linux build dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf
 
       - name: Setup Node
         uses: actions/setup-node@v4
