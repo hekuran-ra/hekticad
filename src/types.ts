@@ -85,7 +85,21 @@ export type PointRef =
       angle: Expr;
       target: string;
       edge: FeatureEdgeRef;
-    };
+    }
+  /**
+   * Axis-aligned composite: x is taken from `xFrom`, y from `yFrom`. Used
+   * when a rectangle's diagonally-opposite corner needs to stay tied to two
+   * different snapped references — e.g. the user placed corner A on one
+   * xline-intersection and corner C on another. The two derived corners B
+   * and D are then `{ xFrom: C, yFrom: A }` and `{ xFrom: A, yFrom: C }`
+   * respectively, so when either anchor moves, the rectangle's edges follow
+   * on the correct axis while staying axis-aligned (no skew).
+   *
+   * Chained references are fine: `xFrom` / `yFrom` can themselves be
+   * `axisProject` / `polar` / `intersection` / etc. — `resolvePt` recurses
+   * through whatever it's given.
+   */
+  | { kind: 'axisProject'; xFrom: PointRef; yFrom: PointRef };
 
 // ────────────────────────────────────────────────────────────────────────────
 // Layers + styling
@@ -625,7 +639,7 @@ export type ToolId =
   | 'ellipse' | 'spline' | 'polygon' | 'text'
   | 'xline' | 'dim'
   | 'move' | 'copy' | 'rotate' | 'mirror' | 'cross_mirror' | 'stretch' | 'scale'
-  | 'fillet' | 'chamfer' | 'extend' | 'trim' | 'offset' | 'line_offset' | 'delete'
+  | 'fillet' | 'chamfer' | 'extend' | 'extend_to' | 'trim' | 'offset' | 'line_offset' | 'delete'
   /* Design-file additions */
   | 'point' | 'axis' | 'ref_circle' | 'angle' | 'radius' | 'hatch' | 'fill'
   | 'divide_xline';

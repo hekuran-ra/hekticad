@@ -341,11 +341,23 @@ export function collectSnapPoints(
     }
   }
 
-  const axisX: XLineEntity = { id: -1, layer: 0, type: 'xline', x1: 0, y1: 0, dx: 1, dy: 0 };
-  const axisY: XLineEntity = { id: -1, layer: 0, type: 'xline', x1: 0, y1: 0, dx: 0, dy: 1 };
+  // Sentinel entity IDs that tag a snap point as involving the X or Y origin
+  // axis. The axes aren't real entities; these negative numbers never collide
+  // with real entity ids (which are positive) and let `snapToPointRef`
+  // translate an axis-intersection snap back into a parametric PointRef
+  // (`intersection` with feature1/2 = AXIS_X_ID / AXIS_Y_ID). Without this
+  // transport the axis side of the intersection silently decays to abs and
+  // the drawn geometry detaches from the axis on variable change.
+  const AXIS_X_ENT = -1001;
+  const AXIS_Y_ENT = -1002;
+  const axisX: XLineEntity = { id: AXIS_X_ENT, layer: 0, type: 'xline', x1: 0, y1: 0, dx: 1, dy: 0 };
+  const axisY: XLineEntity = { id: AXIS_Y_ENT, layer: 0, type: 'xline', x1: 0, y1: 0, dx: 0, dy: 1 };
 
   // Origin is always valuable when axis snap is on, independent of `int`.
-  if (snapSettings.axis) pts.push({ type: 'int', x: 0, y: 0 });
+  // Tag it as the X×Y intersection so a snap here links both axes.
+  if (snapSettings.axis) {
+    pts.push({ type: 'int', x: 0, y: 0, entityId: AXIS_X_ENT, entityId2: AXIS_Y_ENT });
+  }
 
   if (snapSettings.int) {
     // Only intersections near the cursor can ever win (the final pass rejects
@@ -370,7 +382,10 @@ export function collectSnapPoints(
           const ip = intersectLines(L, A);
           if (!ip) continue;
           if (Math.abs(ip.x - cursor.x) > intTol || Math.abs(ip.y - cursor.y) > intTol) continue;
-          pts.push({ type: 'int', x: ip.x, y: ip.y });
+          // Transport both entity ids — L is the real feature, A is the axis
+          // sentinel. `snapToPointRef` uses these to produce a parametric
+          // `intersection` PointRef whose one side is the axis constant.
+          pts.push({ type: 'int', x: ip.x, y: ip.y, entityId: L.id, entityId2: A.id });
         }
       }
 
@@ -394,7 +409,11 @@ export function collectSnapPoints(
             const ip = intersectLines(ed, A);
             if (!ip) continue;
             if (Math.abs(ip.x - cursor.x) > intTol || Math.abs(ip.y - cursor.y) > intTol) continue;
-            pts.push({ type: 'int', x: ip.x, y: ip.y });
+            // Rect edges can't be addressed as a single PointRef in current
+            // type, so we transport only the axis sentinel; the rect-side
+            // ref stays abs (two of the four rect corners already decay to
+            // abs in snapToPointRef, same reasoning).
+            pts.push({ type: 'int', x: ip.x, y: ip.y, entityId: e.id, entityId2: A.id });
           }
         }
       }

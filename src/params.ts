@@ -341,6 +341,7 @@ export function isParameterReferenced(id: string): boolean {
     if (pt.kind === 'abs') return inExpr(pt.x) || inExpr(pt.y);
     if (pt.kind === 'polar') return inExpr(pt.angle) || inExpr(pt.distance) || inPtRef(pt.from);
     if (pt.kind === 'rayHit') return inExpr(pt.angle) || inPtRef(pt.from);
+    if (pt.kind === 'axisProject') return inPtRef(pt.xFrom) || inPtRef(pt.yFrom);
     return false; // endpoint / center / mid / intersection carry no Exprs
   };
   for (const f of state.features) {

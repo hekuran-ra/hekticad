@@ -1017,6 +1017,47 @@ document.querySelectorAll<HTMLButtonElement>('.side-section-header').forEach(btn
   });
 });
 
+// ----------------- Whole-sidebar collapse/expand -----------------
+//
+// Toggles `body.sidebar-collapsed` which shrinks the grid's third column to
+// a narrow rail (see `--sidebar-w` in styles.css) and hides every section so
+// only the toggle handle remains. The state is persisted in localStorage so
+// the user's preference survives reload.
+
+const SIDEBAR_COLLAPSED_KEY = 'hektikcad.sidebarCollapsed';
+
+function applySidebarCollapsed(collapsed: boolean): void {
+  document.body.classList.toggle('sidebar-collapsed', collapsed);
+  // The canvas is sized off window.innerWidth minus the grid columns — trigger
+  // a resize so the canvas reflows to the new sidebar width immediately.
+  resize();
+}
+
+// Restore persisted state on boot.
+try {
+  const stored = localStorage.getItem(SIDEBAR_COLLAPSED_KEY);
+  if (stored === '1') applySidebarCollapsed(true);
+} catch { /* localStorage unavailable — boot with default (expanded) */ }
+
+const sidebarToggleBtn = document.getElementById('sidebar-collapse-btn');
+sidebarToggleBtn?.addEventListener('click', () => {
+  const nowCollapsed = !document.body.classList.contains('sidebar-collapsed');
+  applySidebarCollapsed(nowCollapsed);
+  try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, nowCollapsed ? '1' : '0'); }
+  catch { /* persistence is best-effort */ }
+});
+
+// F4 shortcut — matches common IDE sidebar-toggle conventions.
+window.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'F4') return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return;
+  // Don't steal the shortcut from form inputs (param/variable editors etc.).
+  const t = ev.target as HTMLElement | null;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  ev.preventDefault();
+  sidebarToggleBtn?.click();
+});
+
 // ----------------- Canvas snap-toolbar overlay wiring -----------------
 //
 // The overlay is the ONLY source of truth for snap settings. State lives in

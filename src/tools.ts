@@ -12,9 +12,9 @@ import {
 import { pushUndo } from './undo';
 import { evalExpr } from './params';
 import {
-  addFeatureFromInit, deleteFeatures, entityIdForFeature, evaluateTimeline,
-  featureForEntity, featureFromEntityInit, modifierOutputInfo, newFeatureId,
-  replaceFeatureFromInit,
+  addFeatureFromInit, AXIS_X_ID, AXIS_Y_ID, deleteFeatures, entityIdForFeature,
+  evaluateTimeline, featureForEntity, featureFromEntityInit, modifierOutputInfo,
+  newFeatureId, replaceFeatureFromInit,
 } from './features';
 import { showConfirm } from './modal';
 import { layoutText } from './textlayout';
@@ -41,6 +41,34 @@ function snapToPointRef(snap: SnapPoint | null, fallback: Pt): PointRef {
   // coordinates. No downstream chains, no surprise moves when unrelated
   // features change. Toggled globally via the PARAM button in the snap bar.
   if (!runtime.parametricMode) return abs(pt);
+
+  // Axis-intersection snap: one side is a real feature, the other is the X
+  // or Y origin axis (transported as reserved entity ids -1001 / -1002 — see
+  // snap.ts). Translate both sides into their PointRef feature-id form
+  // (AXIS_X_ID / AXIS_Y_ID for the axes, real string id for the feature)
+  // and return an `intersection` PointRef. Resolves via the short-circuit
+  // branch in features.ts → `resolvePt` which fabricates an axis xline.
+  if (snap?.type === 'int' && snap.entityId !== undefined && snap.entityId2 !== undefined) {
+    const axisRefOf = (eid: number): string | null => {
+      if (eid === -1001) return AXIS_X_ID;
+      if (eid === -1002) return AXIS_Y_ID;
+      return null;
+    };
+    const ax1 = axisRefOf(snap.entityId);
+    const ax2 = axisRefOf(snap.entityId2);
+    if (ax1 || ax2) {
+      const side = (ax: string | null, eid: number): string | null => {
+        if (ax) return ax;
+        const f = featureForEntity(eid);
+        return f ? f.id : null;
+      };
+      const id1 = side(ax1, snap.entityId);
+      const id2 = side(ax2, snap.entityId2);
+      if (id1 && id2) return { kind: 'intersection', feature1: id1, feature2: id2 };
+      // One side is the axis but the other feature is gone / untracked —
+      // fall through to abs rather than fabricating a broken ref.
+    }
+  }
 
   // Intersection of two lines/xlines: link to both features so the point tracks
   // when either feature or its parameters change.
@@ -336,6 +364,8 @@ export const TOOLS: ToolDef[] = [
     icon: '<path d="M3 11 L8 11 M14 11 L19 11"/><path d="M11 3 L11 19" stroke-dasharray="2 1.8" opacity="0.6"/><path d="M8 8 L14 14 M14 8 L8 14"/>' },
   { id: 'extend', label: 'Verlängern',  key: 'X', group: 'modify',
     icon: '<path d="M3 11 L12 11"/><path d="M10 8 L13 11 L10 14" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M16 3 L16 19" stroke-dasharray="2 1.8" opacity="0.6"/>' },
+  { id: 'extend_to', label: 'Bis Linie',  key: 'Y', group: 'modify',
+    icon: '<path d="M3 14 L12 14"/><path d="M10 11 L13 14 L10 17" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 6 L17 6" opacity="0.75"/><path d="M17 2.5 L17 17" stroke-dasharray="2 1.8" opacity="0.55"/>' },
   { id: 'fillet', label: 'Abrunden',    key: 'G', group: 'modify',
     icon: '<path d="M4 11 L4 18 L11 18" stroke-dasharray="2 1.8" opacity="0.35"/><path d="M4 4 L4 11 A 7 7 0 0 0 11 18 L18 18" stroke-linecap="round" fill="none"/>' },
   { id: 'chamfer', label: 'Fase',       key: 'F', group: 'modify',
@@ -1795,6 +1825,9 @@ export function setTool(id: ToolId): void {
   } else if (id === 'extend') {
     runtime.toolCtx = { step: 'pick' };
     setPrompt('Linie am zu verlängernden Ende anklicken');
+  } else if (id === 'extend_to') {
+    runtime.toolCtx = { step: 'pick1' };
+    setPrompt('Linie am zu verlängernden/verkürzenden Ende anklicken');
   } else if (id === 'trim') {
     runtime.toolCtx = { step: 'pick' };
     setPrompt('Linien-Abschnitt anklicken (wird bis zum nächsten Schnittpunkt gestutzt)');
@@ -2549,6 +2582,7 @@ function dispatchClick(p: Pt, worldPt: Pt, shiftKey: boolean): void {
   if (state.tool === 'fillet')   { handleFilletClick(worldPt); return; }
   if (state.tool === 'chamfer')  { handleChamferClick(worldPt); return; }
   if (state.tool === 'extend')   { handleExtendClick(worldPt); return; }
+  if (state.tool === 'extend_to'){ handleExtendToClick(worldPt); return; }
   if (state.tool === 'trim')     { handleTrimClick(worldPt); return; }
   if (state.tool === 'text')     { handleTextClick(p); return; }
   if (state.tool === 'dim')      { handleDimClick(p); return; }
@@ -2645,7 +2679,14 @@ function handleLineClick(p: Pt): void {
         if (snap) {
           length = lengthToSnapAxis(tc.p1, tc.lockedDir, { x: snap.x, y: snap.y });
         } else {
-          const ap = sub(state.mouseWorld, tc.p1);
+          // Project the incoming click onto the locked direction. For mouse
+          // clicks `p` equals the cursor position, so this matches the old
+          // behaviour exactly; for cmdbar-driven clicks (useSnap=false, p =
+          // tc.p1 + dir*typedLength) the projection recovers the typed length
+          // instead of silently falling back to the cursor. Previously this
+          // path read `state.mouseWorld` directly, which caused the "typed 50,
+          // got cursor distance" bug after locking the angle.
+          const ap = sub(p, tc.p1);
           length = dot(ap, tc.lockedDir);
         }
         if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
@@ -2815,6 +2856,14 @@ function handleRectClick(p: Pt): void {
     runtime.toolCtx = { step: 'dims', p1: p, p1Ref, vertical: null, horizontal: null };
     setPrompt('Breite + Höhe eingeben');
   } else if (tc.step === 'dims' && tc.p1) {
+    // Also capture a PointRef for the diagonal corner. When BOTH corners are
+    // parametric (e.g. each one snapped onto an xline × xline intersection),
+    // the rectangle's other two corners can be expressed as `axisProject`
+    // refs that share x with one corner and y with the other. That ties the
+    // whole rectangle to its two anchor intersections, so if a variable
+    // moves either xline the rectangle reshapes to keep each corner glued
+    // to its intersection.
+    const p3Ref = snapToPointRef(runtime.lastSnap, p);
     let x1 = tc.p1.x, y1 = tc.p1.y, x2 = p.x, y2 = p.y;
     if (tc.vertical != null)   y2 = y1 + (Math.sign(p.y - y1) || 1) * tc.vertical;
     if (tc.horizontal != null) x2 = x1 + (Math.sign(p.x - x1) || 1) * tc.horizontal;
@@ -2822,19 +2871,21 @@ function handleRectClick(p: Pt): void {
       toast('Rechteck zu klein');
       return;
     }
-    // Keep the rectangle tied to its anchor when p1 is a parametric ref
-    // (endpoint/center/intersection/polar). Without this the corner snap
-    // captured on the first click is silently dropped — so when the user
-    // later moves the anchor geometry, the rectangle would float away.
-    // Dimensions are numeric here (click-click path), so we wrap them as
-    // numeric Exprs and use the parametric commit path. Corners B/C/D
-    // become polar off A and follow A through evaluateTimeline.
-    if (tc.p1Ref && tc.p1Ref.kind !== 'abs') {
+    const aIsParam = tc.p1Ref && tc.p1Ref.kind !== 'abs';
+    const cIsParam = p3Ref && p3Ref.kind !== 'abs';
+    const dimsLocked = tc.vertical != null || tc.horizontal != null;
+    if (aIsParam && cIsParam && !dimsLocked) {
+      // Full parametric path: A = p1Ref, C = p3Ref, B/D = axisProject.
+      commitRectFromCorners(tc.p1Ref!, p3Ref!, state.activeLayer);
+    } else if (aIsParam) {
+      // Partial parametric: only the first corner anchors. Fall back to
+      // polar-off-A so corners B/C/D at least follow A rigidly when its
+      // source feature moves. Dimensions are numeric (click-click path).
       const sX: 1 | -1 = (x2 - x1) >= 0 ? 1 : -1;
       const sY: 1 | -1 = (y2 - y1) >= 0 ? 1 : -1;
       const width  = Math.abs(x2 - x1);
       const height = Math.abs(y2 - y1);
-      commitRectAsLinesExpr(tc.p1Ref, numE(width), numE(height), sX, sY, state.activeLayer);
+      commitRectAsLinesExpr(tc.p1Ref!, numE(width), numE(height), sX, sY, state.activeLayer);
     } else {
       commitRectAsLines(x1, y1, x2, y2);
     }
@@ -2842,6 +2893,45 @@ function handleRectClick(p: Pt): void {
     setPrompt('Erster Eckpunkt');
   }
   render();
+}
+
+/**
+ * Commit a rectangle as 4 line features given two opposite corners A and C
+ * as parametric PointRefs. The other two corners (B = A.x extended to C.y,
+ * D = C.x with A.y — or the mirror depending on which diagonal was drawn)
+ * use the new `axisProject` PointRef kind so they derive their x from one
+ * anchor corner and their y from the other.
+ *
+ *   A ◄─────────► B         B.x = C, B.y = A  → axisProject(xFrom:C, yFrom:A)
+ *   │             │         D.x = A, D.y = C  → axisProject(xFrom:A, yFrom:C)
+ *   D ◄─────────► C
+ *
+ * Because evaluateTimeline walks the ref dependency graph, moving either A
+ * or C (e.g. by changing a variable that drives one of the intersecting
+ * xlines) reshapes the rectangle automatically. The x/y separation is what
+ * makes an axis-aligned rectangle stay axis-aligned under two free-roaming
+ * anchor corners — a plain polar link would rotate the rectangle instead.
+ */
+export function commitRectFromCorners(
+  A: PointRef,
+  C: PointRef,
+  layer: number,
+): void {
+  const B: PointRef = { kind: 'axisProject', xFrom: C, yFrom: A };
+  const D: PointRef = { kind: 'axisProject', xFrom: A, yFrom: C };
+  const edges: [PointRef, PointRef][] = [[A, B], [B, C], [C, D], [D, A]];
+  pushUndo();
+  for (const [p1, p2] of edges) {
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'line',
+      layer,
+      p1,
+      p2,
+    });
+  }
+  evaluateTimeline();
+  updateStats();
 }
 
 /**
@@ -4980,9 +5070,20 @@ function collectCycleSegments(): { segs: CycleSeg[]; clusters: Pt[] } {
     return clusters.length - 1;
   };
   const segs: CycleSeg[] = [];
+  // Track undirected edges we've already emitted so two rectangles that share
+  // a border (or any pair of coincident segments) don't push duplicate edges
+  // into the planar graph. Duplicates silently corrupt the face tracer: each
+  // extra directed edge gives the "turn-right" walk an alternative path that
+  // can merge two adjacent interior faces into one, which was the root cause
+  // of hatches bleeding from one rectangle into a neighbour when the regions
+  // shared an edge. Key is order-independent so both orientations collapse.
+  const seen = new Set<string>();
   const push = (a: Pt, b: Pt, layer: number): void => {
     const ia = indexOf(a), ib = indexOf(b);
     if (ia === ib) return;
+    const key = ia < ib ? `${ia}:${ib}` : `${ib}:${ia}`;
+    if (seen.has(key)) return;
+    seen.add(key);
     segs.push({ a: ia, b: ib, layer });
   };
   for (const e of state.entities) {
@@ -5901,13 +6002,27 @@ function replaceLineEndPreservingRef(
   keptEnd: 0 | 1,
   newCutPt: Pt,
   layer: number,
+  /**
+   * Optional parametric override for the NEW cut end. When the cut was
+   * produced by an intersecting feature (trim / extend-to-target), the
+   * caller can pass an `intersection`/`endpoint` ref here so the cut end
+   * keeps tracking that other feature — otherwise we fall back to a flat
+   * abs coordinate and the link is lost. Only used when `runtime
+   * .parametricMode` is on; in free-draw mode we always emit abs so the
+   * "no chains" contract holds.
+   */
+  cutRefOverride?: PointRef | null,
 ): boolean {
   const idx = state.features.findIndex(f => f.id === featureId);
   if (idx < 0) return false;
   const prev = state.features[idx];
   if (prev.kind !== 'line') return false;
   const keptRef = keptEnd === 0 ? prev.p1 : prev.p2;
-  const cutRef: PointRef = { kind: 'abs', x: numE(newCutPt.x), y: numE(newCutPt.y) };
+  const useOverride = !!cutRefOverride && runtime.parametricMode
+    && cutRefOverride.kind !== 'abs';
+  const cutRef: PointRef = useOverride
+    ? cutRefOverride as PointRef
+    : { kind: 'abs', x: numE(newCutPt.x), y: numE(newCutPt.y) };
   const next: LineFeature = {
     id: prev.id,
     kind: 'line',
@@ -6340,9 +6455,10 @@ function handleExtendClick(worldPt: Pt): void {
   const dir = norm(sub(endpoint, anchor));
   if (len(dir) < 1e-9) return;
   const dists = extendCutterDistances(endpoint, dir, hit.id);
-  const positive = dists.filter(d => d > 1e-6).sort((x, y) => x - y);
+  const positive = dists.filter(c => c.d > 1e-6).sort((x, y) => x.d - y.d);
   if (!positive.length) { toast('Kein Ziel zum Verlängern gefunden'); return; }
-  const d = positive[0];
+  const hitTarget = positive[0];
+  const d = hitTarget.d;
   const newEnd: Pt = { x: endpoint.x + dir.x * d, y: endpoint.y + dir.y * d };
   pushUndo();
   const fid = featureForEntity(hit.id)?.id;
@@ -6351,33 +6467,126 @@ function handleExtendClick(worldPt: Pt): void {
     ? { ...hit, x2: newEnd.x, y2: newEnd.y }
     : { ...hit, x1: newEnd.x, y1: newEnd.y };
   // Preserve the anchor end's PointRef (anchor is the end that stays put;
-  // `newEnd` is the extended end). Same reasoning as fillet/chamfer.
+  // `newEnd` is the extended end). The extended end becomes an
+  // `intersection` ref tying our line to the target feature — so if the
+  // target later moves (variable change), the extended end tracks it.
   const anchorEnd = keptEndOfLine(hit, anchor);
-  if (!replaceLineEndPreservingRef(fid, anchorEnd, newEnd, hit.layer)) {
+  const targetFid = featureForEntity(hitTarget.entityId)?.id ?? null;
+  const cutRefOverride: PointRef | null = targetFid
+    ? { kind: 'intersection', feature1: fid, feature2: targetFid }
+    : null;
+  if (!replaceLineEndPreservingRef(fid, anchorEnd, newEnd, hit.layer, cutRefOverride)) {
     replaceFeatureFromInit(fid, entityInit(newLine));
   }
   evaluateTimeline();
   render();
 }
 
+// ---------------- Extend/Shorten to target line ----------------
+
+/**
+ * Two-click modifier: pick a source line near the end you want to move, then
+ * pick a target line. The picked end is moved to the infinite-line intersection
+ * with the target — extending the source if the target is past the endpoint,
+ * or shortening it if the target crosses between the endpoints. Preserves the
+ * opposite end's PointRef and sets the moved end to an `intersection` ref so
+ * the source tracks the target when variables later shift either line.
+ */
+function handleExtendToClick(worldPt: Pt): void {
+  const tc = runtime.toolCtx;
+  if (!tc) return;
+  if (tc.step === 'pick1') {
+    const line = pickFilletLine(worldPt);
+    if (!line) return;
+    tc.entity1 = line;
+    tc.click1 = worldPt;
+    state.selection.clear();
+    state.selection.add(line.id);
+    updateSelStatus();
+    tc.step = 'pick2';
+    setPrompt('Ziel-Linie wählen');
+    render();
+    return;
+  }
+  if (tc.step === 'pick2') {
+    const src = tc.entity1;
+    const clk = tc.click1;
+    if (!src || src.type !== 'line' || !clk) { toast('Erst Quelllinie wählen'); return; }
+    const tgt = pickFilletLine(worldPt);
+    if (!tgt) return;
+    if (tgt.id === src.id) { toast('Andere Linie wählen'); return; }
+    if (tgt.type !== 'line') { toast('Ziel muss eine Linie sein'); return; }
+
+    const ip = lineIntersectionInfinite(src, tgt);
+    if (!ip) { toast('Linien sind parallel'); return; }
+
+    const a: Pt = { x: src.x1, y: src.y1 };
+    const b: Pt = { x: src.x2, y: src.y2 };
+    // The end closer to the first click is the one that moves; the other stays.
+    const dA = dist(clk, a), dB = dist(clk, b);
+    const movingPt = dA < dB ? a : b;
+    const anchorPt = dA < dB ? b : a;
+    if (dist(movingPt, ip) < 1e-9) {
+      toast('Endpunkt liegt bereits auf der Ziellinie');
+      runtime.toolCtx = { step: 'pick1' };
+      state.selection.clear();
+      updateSelStatus();
+      setPrompt('Linie am zu verlängernden/verkürzenden Ende anklicken');
+      render();
+      return;
+    }
+    if (dist(anchorPt, ip) < 1e-9) {
+      toast('Zielschnittpunkt fällt mit dem Ankerende zusammen');
+      return;
+    }
+
+    const fid = featureForEntity(src.id)?.id;
+    if (!fid) return;
+    const targetFid = featureForEntity(tgt.id)?.id ?? null;
+    const anchorEnd = keptEndOfLine(src, anchorPt);
+    const cutRefOverride: PointRef | null = targetFid
+      ? { kind: 'intersection', feature1: fid, feature2: targetFid }
+      : null;
+
+    pushUndo();
+    if (!replaceLineEndPreservingRef(fid, anchorEnd, ip, src.layer, cutRefOverride)) {
+      // Defensive fallback — should never hit because we verified src.type === 'line'.
+      const newLine: LineEntity = anchorEnd === 0
+        ? { ...src, x2: ip.x, y2: ip.y }
+        : { ...src, x1: ip.x, y1: ip.y };
+      replaceFeatureFromInit(fid, entityInit(newLine));
+    }
+    evaluateTimeline();
+    updateStats();
+    state.selection.clear();
+    updateSelStatus();
+    runtime.toolCtx = { step: 'pick1' };
+    setPrompt('Linie am zu verlängernden/verkürzenden Ende anklicken');
+    render();
+    return;
+  }
+}
+
 /** Distances along a ray from `origin` in unit-direction `dir` where the ray
- *  hits any other entity. The ray is built as a very long segment so the
- *  existing segSegT/lineCircleT helpers (which clamp to [0,1]) work unchanged. */
-function extendCutterDistances(origin: Pt, dir: Pt, selfId: number): number[] {
+ *  hits any other entity, paired with the hit entity's id so the caller can
+ *  build a parametric intersection ref for the extended end. The ray is
+ *  built as a very long segment so the existing segSegT/lineCircleT helpers
+ *  (which clamp to [0,1]) work unchanged. */
+function extendCutterDistances(origin: Pt, dir: Pt, selfId: number): { d: number; entityId: number }[] {
   const HUGE = 1e6;
   const a = origin;
   const b: Pt = { x: origin.x + dir.x * HUGE, y: origin.y + dir.y * HUGE };
-  const out: number[] = [];
+  const out: { d: number; entityId: number }[] = [];
   for (const e of state.entities) {
     if (e.id === selfId) continue;
     const layer = state.layers[e.layer];
     if (!layer || !layer.visible) continue;
     if (e.type === 'line') {
       const t = segSegT(a, b, { x: e.x1, y: e.y1 }, { x: e.x2, y: e.y2 });
-      if (t !== null) out.push(t * HUGE);
+      if (t !== null) out.push({ d: t * HUGE, entityId: e.id });
     } else if (e.type === 'xline') {
       const t = segSegT(a, b, { x: e.x1, y: e.y1 }, { x: e.x1 + e.dx, y: e.y1 + e.dy }, true);
-      if (t !== null) out.push(t * HUGE);
+      if (t !== null) out.push({ d: t * HUGE, entityId: e.id });
     } else if (e.type === 'rect') {
       const xl = Math.min(e.x1, e.x2), xr = Math.max(e.x1, e.x2);
       const yb = Math.min(e.y1, e.y2), yt = Math.max(e.y1, e.y2);
@@ -6389,24 +6598,24 @@ function extendCutterDistances(origin: Pt, dir: Pt, selfId: number): number[] {
       ];
       for (const [p1, p2] of edges) {
         const t = segSegT(a, b, p1, p2);
-        if (t !== null) out.push(t * HUGE);
+        if (t !== null) out.push({ d: t * HUGE, entityId: e.id });
       }
     } else if (e.type === 'circle') {
-      for (const t of lineCircleT(a, b, { x: e.cx, y: e.cy }, e.r)) out.push(t * HUGE);
+      for (const t of lineCircleT(a, b, { x: e.cx, y: e.cy }, e.r)) out.push({ d: t * HUGE, entityId: e.id });
     } else if (e.type === 'arc') {
       for (const t of lineCircleT(a, b, { x: e.cx, y: e.cy }, e.r)) {
         const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
         const ang = Math.atan2(py - e.cy, px - e.cx);
-        if (angleInSweep(ang, e.a1, e.a2)) out.push(t * HUGE);
+        if (angleInSweep(ang, e.a1, e.a2)) out.push({ d: t * HUGE, entityId: e.id });
       }
     } else if (e.type === 'polyline') {
       for (let i = 0; i < e.pts.length - 1; i++) {
         const t = segSegT(a, b, e.pts[i], e.pts[i + 1]);
-        if (t !== null) out.push(t * HUGE);
+        if (t !== null) out.push({ d: t * HUGE, entityId: e.id });
       }
       if (e.closed && e.pts.length >= 2) {
         const t = segSegT(a, b, e.pts[e.pts.length - 1], e.pts[0]);
-        if (t !== null) out.push(t * HUGE);
+        if (t !== null) out.push({ d: t * HUGE, entityId: e.id });
       }
     }
   }
@@ -6885,20 +7094,27 @@ function lineCircleT(a: Pt, b: Pt, c: Pt, r: number): number[] {
   return out;
 }
 
-function trimCutterTs(target: LineEntity): number[] {
+/**
+ * Every t along `target` where another visible entity crosses it, paired
+ * with that entity's id. The id lets `handleTrimClick` look up the cutting
+ * feature and build an `intersection` PointRef so the freshly-trimmed end
+ * stays parametrically linked to whatever cut it — matches the "Bug 3"
+ * user expectation (stutzen darf Verknüpfungen nicht verlieren).
+ */
+function trimCutterTs(target: LineEntity): { t: number; entityId: number }[] {
   const a: Pt = { x: target.x1, y: target.y1 };
   const b: Pt = { x: target.x2, y: target.y2 };
-  const out: number[] = [];
+  const out: { t: number; entityId: number }[] = [];
   for (const e of state.entities) {
     if (e.id === target.id) continue;
     const layer = state.layers[e.layer];
     if (!layer || !layer.visible) continue;
     if (e.type === 'line') {
       const t = segSegT(a, b, { x: e.x1, y: e.y1 }, { x: e.x2, y: e.y2 });
-      if (t !== null) out.push(t);
+      if (t !== null) out.push({ t, entityId: e.id });
     } else if (e.type === 'xline') {
       const t = segSegT(a, b, { x: e.x1, y: e.y1 }, { x: e.x1 + e.dx, y: e.y1 + e.dy }, true);
-      if (t !== null) out.push(t);
+      if (t !== null) out.push({ t, entityId: e.id });
     } else if (e.type === 'rect') {
       const xl = Math.min(e.x1, e.x2), xr = Math.max(e.x1, e.x2);
       const yb = Math.min(e.y1, e.y2), yt = Math.max(e.y1, e.y2);
@@ -6910,24 +7126,24 @@ function trimCutterTs(target: LineEntity): number[] {
       ];
       for (const [p1, p2] of edges) {
         const t = segSegT(a, b, p1, p2);
-        if (t !== null) out.push(t);
+        if (t !== null) out.push({ t, entityId: e.id });
       }
     } else if (e.type === 'circle') {
-      out.push(...lineCircleT(a, b, { x: e.cx, y: e.cy }, e.r));
+      for (const t of lineCircleT(a, b, { x: e.cx, y: e.cy }, e.r)) out.push({ t, entityId: e.id });
     } else if (e.type === 'arc') {
       for (const t of lineCircleT(a, b, { x: e.cx, y: e.cy }, e.r)) {
         const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
         const ang = Math.atan2(py - e.cy, px - e.cx);
-        if (angleInSweep(ang, e.a1, e.a2)) out.push(t);
+        if (angleInSweep(ang, e.a1, e.a2)) out.push({ t, entityId: e.id });
       }
     } else if (e.type === 'polyline') {
       for (let i = 0; i < e.pts.length - 1; i++) {
         const t = segSegT(a, b, e.pts[i], e.pts[i + 1]);
-        if (t !== null) out.push(t);
+        if (t !== null) out.push({ t, entityId: e.id });
       }
       if (e.closed && e.pts.length >= 2) {
         const t = segSegT(a, b, e.pts[e.pts.length - 1], e.pts[0]);
-        if (t !== null) out.push(t);
+        if (t !== null) out.push({ t, entityId: e.id });
       }
     }
   }
@@ -6944,17 +7160,40 @@ function handleTrimClick(worldPt: Pt): void {
   const L2 = abX * abX + abY * abY;
   if (L2 < 1e-12) return;
   const tClick = ((worldPt.x - a.x) * abX + (worldPt.y - a.y) * abY) / L2;
-  const ts = trimCutterTs(hit).filter(t => t > 1e-6 && t < 1 - 1e-6);
+  // Keep cutters as (t, cutterEntityId) pairs — we need the id so the
+  // trimmed end can become an `intersection` PointRef pointing at the
+  // cutting feature instead of the default flat abs ref.
+  const cutters = trimCutterTs(hit).filter(c => c.t > 1e-6 && c.t < 1 - 1e-6);
   let tLow = 0, tHigh = 1;
   let hasLow = false, hasHigh = false;
-  for (const t of ts) {
-    if (t < tClick) { if (t > tLow) { tLow = t; hasLow = true; } }
-    else            { if (t < tHigh) { tHigh = t; hasHigh = true; } }
+  let cutterLowId: number | null = null;
+  let cutterHighId: number | null = null;
+  for (const c of cutters) {
+    if (c.t < tClick) {
+      if (c.t > tLow) { tLow = c.t; hasLow = true; cutterLowId = c.entityId; }
+    } else {
+      if (c.t < tHigh) { tHigh = c.t; hasHigh = true; cutterHighId = c.entityId; }
+    }
   }
-  if (!hasLow && !hasHigh) { toast('Kein Schnittpunkt — nichts zu stutzen'); return; }
-  pushUndo();
   const fid = featureForEntity(hit.id)?.id;
   if (!fid) return;
+  if (!hasLow && !hasHigh) {
+    // No intersection → Stutzen doubles as a targeted delete so users can
+    // clean up loose lines with the same tool instead of switching back to
+    // Auswahl → Entf. Matches the user's mental model: "click what you want
+    // gone". Goes through `deleteFeatures` so linked dependents hide instead
+    // of orphaning their refs.
+    pushUndo();
+    deleteFeatures([fid]);
+    state.selection.delete(hit.id);
+    evaluateTimeline();
+    updateStats();
+    updateSelStatus();
+    toast('Linie entfernt');
+    render();
+    return;
+  }
+  pushUndo();
   const mk = (t0: number, t1: number): EntityInit => ({
     type: 'line', layer: hit.layer,
     x1: a.x + abX * t0, y1: a.y + abY * t0,
@@ -6980,7 +7219,19 @@ function handleTrimClick(worldPt: Pt): void {
       ? { x: a.x + abX * tLow,  y: a.y + abY * tLow  }
       : { x: a.x + abX * tHigh, y: a.y + abY * tHigh };
     const keptEnd = keptEndOfLine(hit, keptPt);
-    if (!replaceLineEndPreservingRef(fid, keptEnd, cutPt, hit.layer)) {
+    // Parametric cut-end: build an `intersection` ref between the trimmed
+    // line and whatever cut it, so when either side later changes the
+    // endpoint tracks the new crossing. `intersection` resolves the exact
+    // math at eval time and works for any cutter type (line/xline/rect/…)
+    // as long as both sides resolve to geometry the intersector handles.
+    const cutterEntityId = hasLow ? cutterLowId : cutterHighId;
+    const cutterFeatureId = cutterEntityId != null
+      ? featureForEntity(cutterEntityId)?.id ?? null
+      : null;
+    const cutRefOverride: PointRef | null = cutterFeatureId
+      ? { kind: 'intersection', feature1: fid, feature2: cutterFeatureId }
+      : null;
+    if (!replaceLineEndPreservingRef(fid, keptEnd, cutPt, hit.layer, cutRefOverride)) {
       replaceFeatureFromInit(fid, pieces[0]);
     }
     for (let i = 1; i < pieces.length; i++) {

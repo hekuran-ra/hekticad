@@ -120,6 +120,10 @@ function collectRefTargets(ref: PointRef, out: Set<string>): void {
       out.add(ref.target);
       collectRefTargets(ref.from, out);
       return;
+    case 'axisProject':
+      collectRefTargets(ref.xFrom, out);
+      collectRefTargets(ref.yFrom, out);
+      return;
   }
 }
 
@@ -270,8 +274,21 @@ function resolvePt(ref: PointRef, ctx: EvalCtx): Pt {
       return midOf(e);
     }
     case 'intersection': {
-      const e1 = ctx.get(ref.feature1);
-      const e2 = ctx.get(ref.feature2);
+      // Either feature id can be the origin X or Y axis — a synthetic "line"
+      // through (0,0) along (1,0) or (0,1). The axes don't live in
+      // `state.features`, so the intersection PointRef short-circuits them
+      // here instead of doing a context lookup. That lets the line and
+      // rectangle tools build intersection refs that include the axis as one
+      // side (e.g. "endpoint = X axis × some xline") and have the point
+      // follow any variable change on the real feature, while the axis stays
+      // anchored at origin.
+      const axisEntity = (id: string): XLineEntity | null => {
+        if (id === AXIS_X_ID) return { id: -1, layer: 0, type: 'xline', x1: 0, y1: 0, dx: 1, dy: 0 };
+        if (id === AXIS_Y_ID) return { id: -1, layer: 0, type: 'xline', x1: 0, y1: 0, dx: 0, dy: 1 };
+        return null;
+      };
+      const e1 = axisEntity(ref.feature1) ?? ctx.get(ref.feature1);
+      const e2 = axisEntity(ref.feature2) ?? ctx.get(ref.feature2);
       if (!e1 || !e2) return { x: NaN, y: NaN };
       if ((e1.type !== 'line' && e1.type !== 'xline') ||
           (e2.type !== 'line' && e2.type !== 'xline')) return { x: NaN, y: NaN };
@@ -312,6 +329,16 @@ function resolvePt(ref: PointRef, ctx: EvalCtx): Pt {
       if (t < -EPS) return { x: NaN, y: NaN };                  // behind base
       if (!infiniteEdge && (u < -EPS || u > 1 + EPS)) return { x: NaN, y: NaN };
       return { x: base.x + t * dx, y: base.y + t * dy };
+    }
+    case 'axisProject': {
+      // Composite: x from one source, y from another. Propagates NaN
+      // defensively — if either sub-ref fails to resolve (feature deleted,
+      // eval cycle, etc.) we return NaN and let downstream renderers hide
+      // the degenerate geometry.
+      const xp = resolvePt(ref.xFrom, ctx);
+      const yp = resolvePt(ref.yFrom, ctx);
+      if (!Number.isFinite(xp.x) || !Number.isFinite(yp.y)) return { x: NaN, y: NaN };
+      return { x: xp.x, y: yp.y };
     }
   }
 }
@@ -975,6 +1002,7 @@ function featureReferencesAnyParam(f: Feature, changed: Set<string>): boolean {
     if (p.kind === 'abs') return eRefs(p.x) || eRefs(p.y);
     if (p.kind === 'polar') return eRefs(p.angle) || eRefs(p.distance) || pRefs(p.from);
     if (p.kind === 'rayHit') return eRefs(p.angle) || pRefs(p.from);
+    if (p.kind === 'axisProject') return pRefs(p.xFrom) || pRefs(p.yFrom);
     return false;
   };
   switch (f.kind) {
@@ -1445,6 +1473,7 @@ function collectRefs(pt: PointRef): string[] {
   if (pt.kind === 'intersection') return [pt.feature1, pt.feature2];
   if (pt.kind === 'polar') return collectRefs(pt.from);
   if (pt.kind === 'rayHit') return [pt.target, ...collectRefs(pt.from)];
+  if (pt.kind === 'axisProject') return [...collectRefs(pt.xFrom), ...collectRefs(pt.yFrom)];
   return [pt.feature];
 }
 
@@ -1539,6 +1568,9 @@ function ptLabel(pt: PointRef): string {
   }
   if (pt.kind === 'rayHit') {
     return `${ptLabel(pt.from)}→${pt.target.slice(0, 4)}@${exprLabel(pt.angle)}°`;
+  }
+  if (pt.kind === 'axisProject') {
+    return `⊓(x:${ptLabel(pt.xFrom)}, y:${ptLabel(pt.yFrom)})`;
   }
   return `${pt.kind}(${pt.feature.slice(0, 4)})`;
 }

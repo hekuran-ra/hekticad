@@ -68,10 +68,21 @@ input, select, textarea { font: inherit; color: inherit; }
   /* First column is a tool-palette dock: palettes live *inside* it as docked
    * children, or float freely over the canvas. `auto` lets the dock widen
    * when palettes wrap into multiple columns (see `#tools { flex-wrap }`) so
-   * extra columns get the space they need instead of introducing a scrollbar. */
-  grid-template-columns: auto 1fr 288px;
+   * extra columns get the space they need instead of introducing a scrollbar.
+   *
+   * Third column is the sidebar. Its width is driven by `--sidebar-w` so the
+   * sidebar-collapse toggle can shrink it to a narrow rail without having to
+   * mutate the grid template at runtime. */
+  grid-template-columns: auto 1fr var(--sidebar-w, 288px);
   height: 100vh;
 }
+
+/* Collapsed sidebar: only the handle remains visible as a narrow rail. All
+   sections, section-actions and inline content are hidden; the handle stays
+   clickable on the left edge so the user can expand again. */
+body.sidebar-collapsed { --sidebar-w: 22px; }
+body.sidebar-collapsed #sidebar .side-section,
+body.sidebar-collapsed #sidebar .section-actions { display: none !important; }
 
 /* ════════════════════════════════════════════════════════════════
    HEADER
@@ -116,6 +127,7 @@ header {
 .menu-item {
   padding: 4px 10px; border-radius: 3px; font-size: 12px;
   color: var(--fg-mid); font-weight: 400;
+  white-space: nowrap; flex-shrink: 0;
 }
 .menu-item:hover { background: var(--panel-2); color: var(--fg); }
 .menu-item.active {
@@ -675,30 +687,33 @@ body.palette-dragging .tool-palette { pointer-events: none; }
 }
 canvas { position: absolute; inset: 0; display: block; }
 
-/* ─── Floating snap toolbar ─────────────────────────────────────── */
-/* Right edge of the canvas, stacked vertically directly underneath the
- * viewcube (+ / − / A). `top` = viewcube height (30px) + its 10px offset +
- * an 8px visual gap, so the two floating controls read as a single column
- * of view utilities on the right edge.
- * z-index must beat `#tool-palettes` (z:10) so free-floating palettes never
- * occlude the snap bar — it's a primary UI surface that must always read. */
+/* ─── Snap toolbar (inline in header) ───────────────────────────── */
+/* Moved into the 36px header row, left of the "mm" pill. Horizontal flex
+ * so all snap toggles sit side-by-side; keeps the canvas top-right free
+ * for the viewcube and tool-HUD pickers. Transparent background blends
+ * into the header chrome — no extra panel/shadow stack in the corner. */
 .snap-toolbar {
-  position: absolute; top: 48px; right: 10px; z-index: 20;
-  background: color-mix(in oklab, var(--panel) 92%, transparent);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  border: 1px solid var(--hair);
-  border-radius: 4px;
-  display: flex; flex-direction: column; align-items: stretch;
-  padding: 3px; gap: 2px;
-  box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+  display: flex; flex-direction: row; align-items: center;
+  padding: 0; gap: 0;
+  /* Allow the snap-toolbar to give up space before the menu-bar or the
+     hdr-actions are pushed off-screen. On narrow viewports the toolbar
+     scrolls horizontally instead of overflowing the window. */
+  flex-shrink: 1;
+  min-width: 0;
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
+  background: transparent;
+  border: none;
+  box-shadow: none;
 }
+.snap-toolbar::-webkit-scrollbar { display: none; }
 .snap-ob-btn {
-  padding: 4px 6px; border-radius: 2px;
-  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.5px;
+  padding: 2px 5px; border-radius: 2px;
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.3px;
   color: var(--fg-dim);
   font-weight: 500;
-  text-align: center; min-width: 58px;
+  text-align: center; min-width: 0;
+  white-space: nowrap; flex-shrink: 0;
 }
 .snap-ob-btn:hover { background: var(--panel-2); color: var(--fg); }
 .snap-ob-btn.on {
@@ -724,12 +739,13 @@ canvas { position: absolute; inset: 0; display: block; }
   background: color-mix(in oklab, #ffb020 10%, transparent);
   color: #ffb020;
 }
-/* Horizontal hair-line divider between button groups in the vertical stack. */
-.snap-sep { height: 1px; width: auto; background: var(--hair); margin: 3px 4px; }
+/* Vertical hair-line divider between button groups (row layout). */
+.snap-sep { width: 1px; height: 18px; background: var(--hair); margin: 0 3px; flex-shrink: 0; }
 .snap-ob-grid {
-  width: auto; padding: 3px 6px; margin: 1px 2px;
+  width: 36px; padding: 2px 3px; margin: 0 2px;
+  flex-shrink: 0;
   background: var(--bg-deep); border: 1px solid var(--hair); border-radius: 2px;
-  color: var(--fg); font-family: var(--mono); font-size: 9.5px;
+  color: var(--fg); font-family: var(--mono); font-size: 9px;
   font-feature-settings: var(--num-feat);
   outline: none; text-align: center;
 }
@@ -1433,6 +1449,39 @@ canvas { position: absolute; inset: 0; display: block; }
   border-left: 1px solid var(--hair);
   display: flex; flex-direction: column;
   overflow-y: auto;
+  position: relative;
+}
+
+/* Collapse toggle — a thin vertical tab on the sidebar's left edge. Always
+   visible (both in expanded and collapsed states) so the user always has a
+   clear click target. The chevron points toward the direction that the
+   button will move the sidebar: ‹ when expanded (click to collapse), › when
+   collapsed (click to expand). */
+.sidebar-collapse {
+  position: absolute;
+  top: 50%; left: 0;
+  transform: translate(-50%, -50%);
+  width: 18px; height: 48px;
+  display: grid; place-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  z-index: 5;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.sidebar-collapse:hover {
+  background: var(--panel-3);
+  color: var(--fg);
+  border-color: color-mix(in oklab, var(--accent) 40%, var(--hair));
+}
+.sidebar-collapse-chev { transition: transform 0.15s; }
+body.sidebar-collapsed .sidebar-collapse-chev { transform: rotate(180deg); }
+body.sidebar-collapsed .sidebar-collapse {
+  /* In collapsed mode the rail is only 22px wide — pull the handle fully
+     inside so it doesn't overhang the canvas. */
+  left: 50%;
 }
 #sidebar::-webkit-scrollbar { width: 6px; }
 #sidebar::-webkit-scrollbar-track { background: transparent; }

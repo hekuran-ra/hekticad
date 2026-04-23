@@ -53,26 +53,11 @@
       </nav>
 
       <span class="spacer"></span>
-      <span class="hdr-units">mm</span>
 
-      <div class="hdr-actions">
-        <button class="hdr-btn" id="btn-save" title="Speichern (Strg+S)">Speichern</button>
-        <button class="hdr-btn" id="btn-import" title="Importieren (Strg+Shift+I)">Import</button>
-        <button class="hdr-btn" id="btn-export" title="Exportieren (Strg+Shift+E)">Export</button>
-      </div>
-      <div id="theme-popover" class="theme-popover" hidden></div>
-      <div id="menu-popover" class="menu-popover" hidden></div>
-    </header>
-
-    <!-- ═══ TOOL RAIL ═══ -->
-    <div id="tools"></div>
-
-    <!-- ═══ CANVAS ═══ -->
-    <div id="canvaswrap">
-      <canvas id="cv"></canvas>
-
-      <!-- Floating snap toolbar (top-right, below viewcube) -->
-      <!-- Layout: grid-display + grid-size   │   snap-master + grid-snap + object snaps + guide snaps -->
+      <!-- Snap toolbar — lives in the header, left of the "mm" pill. Kept
+           inline so palettes and floating tool HUDs in the canvas never
+           occlude it, and so the top-right of the drawing area stays clear
+           for the viewcube. -->
       <div class="snap-toolbar" id="snap-overlay">
         <button class="snap-ob-btn" id="tb-raster" title="Raster anzeigen (F7)">RASTER</button>
         <input class="snap-ob-grid" id="grid-size" type="number" min="0.1" step="1" value="10" title="Raster-Abstand (mm)">
@@ -92,6 +77,24 @@
         <div class="snap-sep"></div>
         <button class="snap-ob-btn snap-ob-accent on" id="tb-parametric" title="Parametrisches Zeichnen — Fangpunkte werden als Verknüpfungen (PointRefs) gespeichert. Aus: Freies Zeichnen, jede Linie steht für sich, keine automatischen Nachführungen bei Änderungen anderer Objekte.">PARAM</button>
       </div>
+
+      <span class="hdr-units">mm</span>
+
+      <div class="hdr-actions">
+        <button class="hdr-btn" id="btn-save" title="Speichern (Strg+S)">Speichern</button>
+        <button class="hdr-btn" id="btn-import" title="Importieren (Strg+Shift+I)">Import</button>
+        <button class="hdr-btn" id="btn-export" title="Exportieren (Strg+Shift+E)">Export</button>
+      </div>
+      <div id="theme-popover" class="theme-popover" hidden></div>
+      <div id="menu-popover" class="menu-popover" hidden></div>
+    </header>
+
+    <!-- ═══ TOOL RAIL ═══ -->
+    <div id="tools"></div>
+
+    <!-- ═══ CANVAS ═══ -->
+    <div id="canvaswrap">
+      <canvas id="cv"></canvas>
 
       <!-- Dimension mode picker (visible only while the dim tool is active) -->
       <div class="dim-picker" id="dim-picker" hidden>
@@ -218,6 +221,16 @@
 
     <!-- ═══ SIDEBAR ═══ -->
     <aside id="sidebar">
+
+      <!-- Collapse handle — toggles the whole sidebar between full width and a
+           narrow rail. Lives absolutely positioned on the sidebar's left edge
+           so the click target is equally reachable in both states; the CSS
+           rotates the chevron (‹ / ›) according to body.sidebar-collapsed. -->
+      <button class="sidebar-collapse" id="sidebar-collapse-btn" title="Seitenleiste ein-/ausklappen (F4)" aria-label="Seitenleiste umschalten">
+        <svg class="sidebar-collapse-chev" viewBox="0 0 12 12" width="10" height="10" aria-hidden="true">
+          <path d="M7.5 3 L4.5 6 L7.5 9" stroke="currentColor" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
 
       <div class="side-section open" data-section="layers">
         <button class="side-section-header">
