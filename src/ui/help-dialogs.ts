@@ -153,7 +153,11 @@ export async function showAboutDialog(): Promise<void> {
 
     const p1 = document.createElement('div');
     p1.className = 'hk-modal-msg';
-    p1.textContent = 'HektikCad — Ein schlanker, paramterisierbarer 2D-CAD-Editor im Browser.';
+    // Text previously claimed "im Browser" because HektikCad started as a
+    // pure web app. We now ship a native Tauri desktop build (macOS + Windows
+    // + Linux) with auto-update, native file dialogs, and menu bar — so the
+    // tagline should describe the app generically, not the runtime.
+    p1.textContent = 'HektikCad — Ein schlanker, parametrisierbarer 2D-CAD-Editor für Entwurf, Konstruktion und technische Zeichnung.';
     body.appendChild(p1);
 
     const p2 = document.createElement('div');

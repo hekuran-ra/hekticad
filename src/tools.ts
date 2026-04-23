@@ -6495,7 +6495,13 @@ function pickFilletLine(worldPt: Pt): LineEntity | null {
     const rectFid = featureForEntity(hit.id)?.id;
     const lineInits = explodeRect(hit);
     if (rectFid) {
-      state.features = state.features.filter(f => f.id !== rectFid);
+      // Route through deleteFeatures so dependents (dims on the rect's corners,
+      // points snapped to its edges, mirrors using it as source) survive: the
+      // rect becomes hidden if anyone references it, and its ctx entry keeps
+      // their PointRefs resolvable. A plain orphan rect is removed outright.
+      // Without this, filleting a rect edge silently breaks every parametric
+      // link that pointed at the rect.
+      deleteFeatures([rectFid]);
     }
     const newFids: string[] = [];
     for (const init of lineInits) {
@@ -6634,9 +6640,11 @@ export function applyFillet(radius: number): void {
   }
   lastFilletRadius = radius;
   pushUndo();
-  // Drop the old arc first so undo captures the true "before" state.
+  // Drop the old arc first so undo captures the true "before" state. Route
+  // through deleteFeatures so dependents on the old arc (e.g. a radius dim)
+  // keep resolving via the hidden ctx slot instead of dropping to NaN.
   if (existing) {
-    state.features = state.features.filter(f => f.id !== existing.arcFeatureId);
+    deleteFeatures([existing.arcFeatureId]);
   }
   // Replace each line's source feature in place (entity id preserved) and
   // append a new arc feature. We use the "preserving" path so the *kept*
@@ -7585,7 +7593,11 @@ function handleTrimClick(worldPt: Pt): void {
   if (hasLow)  pieces.push(mk(0, tLow));
   if (hasHigh) pieces.push(mk(tHigh, 1));
   if (!pieces.length) {
-    state.features = state.features.filter(f => f.id !== fid);
+    // Line fully consumed by two flanking cutters. Route through
+    // deleteFeatures so dependents (next line's endpoint ref, a dim, etc.)
+    // keep resolving against the hidden feature instead of dropping to NaN
+    // and disappearing on the next eval.
+    deleteFeatures([fid]);
     state.selection.delete(hit.id);
   } else {
     // Reuse the source feature for the first surviving piece to keep the
@@ -7899,7 +7911,10 @@ function handleTrimArcClick(hit: ArcEntity, worldPt: Pt): void {
   if (hasLow)  pieces.push({ t0: 0,     t1: tLow  });
   if (hasHigh) pieces.push({ t0: tHigh, t1: 1     });
   if (!pieces.length) {
-    state.features = state.features.filter(f => f.id !== fid);
+    // Entire arc consumed by flanking cutters — hide-if-referenced instead
+    // of nuking the feature, so dependents (a dim, a tangent ref, a hatch
+    // boundary) keep resolving through the preserved ctx slot.
+    deleteFeatures([fid]);
     state.selection.delete(hit.id);
   } else {
     const idx = state.features.findIndex(f => f.id === fid);

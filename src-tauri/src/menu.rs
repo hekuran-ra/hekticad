@@ -150,19 +150,17 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&MenuItemBuilder::with_id("insert:xline", "Hilfslinie").build(app)?)
         .build()?;
 
-    // ── Einstellungen
+    // ── Settings
     //
-    // Windows-Workaround: muda (0.17.2) misst die Breite der Top-Level-Menü-
-    // Titel mit dem Font, der bei `AppendMenuW` aktiv ist — das passiert im
-    // Tauri-setup BEVOR das Fenster DPI-aware ist, und der längste Titel wird
-    // dann am Paint-Zeitpunkt um ein paar Pixel geclippt ("Einstellungen"
-    // → "Einstellun"). Ein Trailing-Space gibt dem Labelslot genug Slack.
-    // Auf macOS passiert die Messung korrekt, deshalb ohne Leerzeichen.
-    #[cfg(target_os = "windows")]
-    let settings_title = "Einstellungen ";
-    #[cfg(not(target_os = "windows"))]
-    let settings_title = "Einstellungen";
-    let settings_submenu = SubmenuBuilder::new(app, settings_title)
+    // Der Titel war früher "Einstellungen" — wurde aber auf Windows zuverlässig
+    // als "Einstellun" abgeschnitten (muda 0.17.2 misst die Breite im Tauri-
+    // Setup, bevor das Fenster DPI-aware ist, und reserviert zu wenig Pixel).
+    // Ein Trailing-Space als Workaround hat nur teilweise geholfen. Nachdem
+    // "Settings" ein etablierter Loanword in deutscher UI-Software ist (IDEs,
+    // Browser, Editoren) und problemlos in den Slot passt, wechseln wir hier
+    // durchgehend — das hält die Windows-Darstellung verlustfrei und macht
+    // den Eintrag auch auf anderen Plattformen eine Spur kürzer.
+    let settings_submenu = SubmenuBuilder::new(app, "Settings")
         .item(&MenuItemBuilder::with_id("settings:theme", "Design…").build(app)?)
         .separator()
         .item(&MenuItemBuilder::with_id("settings:company", "Firmeneinstellungen…").build(app)?)

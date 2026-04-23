@@ -703,12 +703,29 @@ function drawRadialDim(e: DimEntity | Extract<EntityShape, { type: 'dim' }>): vo
  * (ux, uy) is the unit vector pointing ALONG the dim line INTO the line
  * (so at endpoint `a` it points toward `b`, at endpoint `b` it points toward `a`).
  */
+/**
+ * Canvas-side mirror of `src/io/export-pdf.ts` `drawDimCapPdf`. Canvas uses
+ * CSS pixels and PDF uses paper-mm, so exact identical values are impossible
+ * — but the proportions (length-to-half-width ratio for arrows, tick length,
+ * arch dot size) are kept in lockstep here so a dim on-canvas and the same
+ * dim in the exported PDF look like the same cap, just at different DPIs.
+ *
+ *   PDF constants (paper-mm): LEN=2.5, HALF=0.9, TICK=1.2, ARCH=1.5, DOT=0.45
+ *   Canvas constants (CSS px, ≈ 96dpi → 3.78 px/mm):
+ *     LEN ≈ 9.5 px, HALF ≈ 3.4 px, TICK ≈ 4.5 px, ARCH ≈ 5.7 px, DOT ≈ 1.7 px
+ *
+ * The earlier canvas values (L=10, H=3.5) drifted from the PDF's ratio (L/H
+ * 2.86 vs PDF 2.78) — close but not identical, and the user noticed in
+ * side-by-side screenshots. Using matching ratios + pure fill (no stroke
+ * border — the PDF side is also fill-only now) makes them visually match.
+ */
 function drawDimCap(x: number, y: number, ux: number, uy: number, style: DimStyle): void {
   // Perpendicular to the line (left-hand normal).
   const px = -uy, py = ux;
   if (style === 'arrow') {
-    // Solid filled triangle: tip at (x,y), base 8px back along dim.
-    const L0 = 10, H = 3.5;
+    // Solid filled triangle: tip at (x,y), base L0 back along dim. Ratio
+    // L0/H = 2.78 matches the PDF export's 2.5mm × 0.9mm arrow.
+    const L0 = 9.5, H = 3.4;
     const bx = x + ux * L0, by = y + uy * L0;
     ctx.beginPath();
     ctx.moveTo(x, y);
@@ -717,8 +734,8 @@ function drawDimCap(x: number, y: number, ux: number, uy: number, style: DimStyl
     ctx.closePath();
     ctx.fill();
   } else if (style === 'open') {
-    // Two strokes forming an open V.
-    const L0 = 10, H = 3.5;
+    // Two strokes forming an open V — same proportions as the filled arrow.
+    const L0 = 9.5, H = 3.4;
     const bx = x + ux * L0, by = y + uy * L0;
     ctx.beginPath();
     ctx.moveTo(bx + px * H, by + py * H);
@@ -727,7 +744,8 @@ function drawDimCap(x: number, y: number, ux: number, uy: number, style: DimStyl
     ctx.stroke();
   } else if (style === 'tick') {
     // AutoCAD-style short 45° stroke crossing the dim line (mechanical).
-    const t = 5;
+    // 4.5 px ≈ 1.2mm at 96dpi → matches PDF's DIM_TICK_HALF_MM.
+    const t = 4.5;
     // 45° rotation of ux by combining ux with the perpendicular component.
     const txv = (ux - uy), tyv = (uy + ux);   // unit not required; cap by t
     const k = t / Math.hypot(txv, tyv);
@@ -739,7 +757,8 @@ function drawDimCap(x: number, y: number, ux: number, uy: number, style: DimStyl
   } else {
     // 'arch' — architect tick: short 45° stroke on ONE side of the line only,
     // with a small dot at the endpoint (visually distinct from mech tick).
-    const t = 6;
+    // 5.7 px / 1.7 px ≈ PDF's 1.5mm stroke + 0.45mm dot at 96dpi.
+    const t = 5.7;
     const txv = (ux - uy), tyv = (uy + ux);
     const k = t / Math.hypot(txv, tyv);
     const dx0 = txv * k, dy0 = tyv * k;
@@ -748,7 +767,7 @@ function drawDimCap(x: number, y: number, ux: number, uy: number, style: DimStyl
     ctx.lineTo(x + dx0, y + dy0);
     ctx.stroke();
     ctx.beginPath();
-    ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+    ctx.arc(x, y, 1.7, 0, Math.PI * 2);
     ctx.fill();
   }
 }

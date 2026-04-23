@@ -441,9 +441,14 @@ function drawDimCapPdf(
     const d = `M ${tip.x.toFixed(3)} ${sy(tip.y).toFixed(3)} ` +
               `L ${(bx + px * halfW).toFixed(3)} ${sy(by + py * halfW).toFixed(3)} ` +
               `L ${(bx - px * halfW).toFixed(3)} ${sy(by - py * halfW).toFixed(3)} Z`;
+    // Pure fill — no border. Earlier builds passed `borderColor + borderWidth
+    // = 0.1` which triggered pdf-lib's fillAndStroke path and laid a 0.1pt
+    // outline on top of the triangle, making PDF arrowheads look subtly
+    // heavier than the canvas version (pure `ctx.fill()`). Using fill-only
+    // keeps the two renderers identical in appearance.
     page.drawSvgPath(d, {
       x: 0, y: ph, scale: 1,
-      color, borderColor: color, borderWidth: 0.1,
+      color,
     });
   } else if (style === 'open') {
     // Two strokes forming an open V.

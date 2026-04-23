@@ -78,6 +78,32 @@ type SaveFormat = {
 };
 
 /**
+ * Build the default export filename for a given target format. If the
+ * drawing is bound to a `.hcad` file on disk we reuse its basename so the
+ * exported artefact lands next to the source with a matching stem (`HLogo.hcad`
+ * → `HLogo.pdf`), which is what every other editor does on export. When no
+ * binding exists yet (fresh drawing not yet saved) we fall back to the
+ * numbered default, swapping the `.hcad` extension for the target format.
+ *
+ * Prior behaviour was to always suggest `zeichnung.<ext>` regardless of the
+ * drawing's identity — annoying if the user had ten drawings in one folder
+ * and wanted to keep them organised by name.
+ */
+function defaultExportFilename(ext: 'pdf' | 'dxf' | 'eps' | 'svg'): string {
+  const bound = getCurrentFilePath();
+  const source = bound ?? getDefaultSaveFilename();
+  // Trim the last path separator segment — handles both POSIX and Windows
+  // paths defensively in case a round-tripped Windows path ever reaches here.
+  const base = source.split(/[\\/]/).pop() ?? source;
+  // Drop the final extension (`.hcad`, `.json`, …) — the file picker adds
+  // the target extension on its own via the filter, but prefilling with the
+  // full `<stem>.<ext>` means users on platforms where the picker doesn't
+  // auto-append still get a correct filename.
+  const stem = base.replace(/\.[^.]+$/, '') || base;
+  return `${stem}.${ext}`;
+}
+
+/**
  * Unified export entry point. The export dialog (Phase 7) and keyboard
  * shortcut both land here. Dispatches to the format-specific writer,
  * wraps the result in a download, and toasts success or failure.
@@ -98,20 +124,20 @@ export async function exportDrawing(opts: ExportOptions): Promise<void> {
         const svgBlob = buildSvgBlob();
         if (!svgBlob) { toast('Nichts zu exportieren'); return; }
         blob = svgBlob;
-        filename = opts.filename ?? 'zeichnung.svg';
+        filename = opts.filename ?? defaultExportFilename('svg');
         break;
       }
       case 'dxf':
         blob = exportDxf(state.entities, state.layers);
-        filename = opts.filename ?? 'zeichnung.dxf';
+        filename = opts.filename ?? defaultExportFilename('dxf');
         break;
       case 'eps':
         blob = exportEps(state.entities, state.layers);
-        filename = opts.filename ?? 'zeichnung.eps';
+        filename = opts.filename ?? defaultExportFilename('eps');
         break;
       case 'pdf':
         blob = await exportPdf(state.entities, state.layers, opts.template, opts.titleBlock);
-        filename = opts.filename ?? 'zeichnung.pdf';
+        filename = opts.filename ?? defaultExportFilename('pdf');
         break;
     }
 

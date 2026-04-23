@@ -16,6 +16,11 @@ import type { Bbox } from './units';
  *   - xline (infinite construction line): never export
  *   - entity on invisible layer: skip
  *   - entity on locked 'Achsen' layer: skip (construction axes)
+ *   - entity on a `style: 'guide'` layer (Hilfslinie): skip — these are
+ *     construction aids (Hilfskreis, reference xlines, scratch geometry)
+ *     that the user expects to see on-canvas but not on the printed sheet.
+ *     Matches the xline rule: xlines live on guide layers by convention, and
+ *     a Hilfskreis is the circular counterpart, so treat them the same.
  */
 export function isExportable(e: Entity, layers: Layer[]): boolean {
   if (e.type === 'xline') return false;
@@ -25,6 +30,10 @@ export function isExportable(e: Entity, layers: Layer[]): boolean {
   // Origin axes live on layer 0 ("Achsen") which is locked by default — they
   // are construction helpers, not drawn content.
   if (L.name === 'Achsen' && L.locked) return false;
+  // Any construction-style layer (Hilfslinie by convention) is non-printable.
+  // `style` is `LineStyle | undefined`; a guide-preset is the string 'guide',
+  // a custom dash pattern is an object so we only match the string form.
+  if (L.style === 'guide') return false;
   return true;
 }
 

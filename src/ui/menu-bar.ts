@@ -201,9 +201,14 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
     ],
   },
   format: {
-    // Display label: "Einstellungen". Internal id stays `format` so the
-    // menu-bar data-menu attribute and MenuId enum don't have to change.
-    label: 'Einstellungen',
+    // Display label: "Settings" (loanword) — was "Einstellungen" but the
+    // Windows native menu bar consistently clipped it to "Einstellun" (see
+    // detailed note in `src-tauri/src/menu.rs`). Keeping the label consistent
+    // between the in-app menu and the native menu bar means users moving
+    // between browser and desktop builds see the same top-level item.
+    // Internal id stays `format` so the data-menu attribute and MenuId enum
+    // don't have to change.
+    label: 'Settings',
     entries: [
       { id: 'settings:theme', label: 'Design…', action: () => { void showThemeDialog(); } },
       'separator',
