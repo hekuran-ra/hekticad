@@ -2,7 +2,7 @@ mod menu;
 
 use std::sync::Mutex;
 
-use tauri::{Emitter, Manager, RunEvent};
+use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 /// Accumulates `.hcad` paths that the OS has asked us to open before the
@@ -219,18 +219,26 @@ pub fn run() {
     })
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
-    .run(|app, event| {
+    .run(|_app, _event| {
       // macOS delivers "open with" via Apple Events, which Tauri surfaces as
-      // RunEvent::Opened. Fires both at launch (cold open) and while running
-      // (the single-instance case is redundant on macOS — Apple Events reuse
-      // the existing process — but doesn't hurt).
-      if let RunEvent::Opened { urls } = event {
-        let paths: Vec<String> = urls
-          .into_iter()
-          .filter_map(|u| u.to_file_path().ok())
-          .map(|p| p.to_string_lossy().into_owned())
-          .collect();
-        deliver_open_paths(app, paths);
+      // RunEvent::Opened. Fires both at launch (cold open) and while running.
+      // The variant ONLY exists in the macOS build of `tauri::RunEvent` —
+      // matching on it unconditionally fails to compile on Windows/Linux with
+      // `no variant named 'Opened' found for enum 'RunEvent'`. Gate the whole
+      // block behind `#[cfg(target_os = "macos")]` so the other targets see
+      // an empty runner (they receive paths via argv/single-instance instead,
+      // wired up in `.setup()` above and in the single-instance plugin).
+      #[cfg(target_os = "macos")]
+      {
+        let app = _app;
+        if let tauri::RunEvent::Opened { urls } = _event {
+          let paths: Vec<String> = urls
+            .into_iter()
+            .filter_map(|u| u.to_file_path().ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+          deliver_open_paths(app, paths);
+        }
       }
     });
 }
