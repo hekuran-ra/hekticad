@@ -907,56 +907,62 @@ function computeFilletGeometry(
   l2: LineEntity, cut2End: 1 | 2,
   radius: number,
 ): { newL1End: Pt; newL2End: Pt; arc: { cx: number; cy: number; r: number; a1: number; a2: number } } | null {
-  // The "cut end" is the one near the corner; the opposite is "kept".
+  // "Kept" end = the far end that stays; "cut" end = corner end that gets trimmed.
+  // cut1End===1 → x1,y1 is the corner end; kept end is x2,y2.
+  // cut1End===2 → x2,y2 is the corner end; kept end is x1,y1.
   const kept1: Pt = cut1End === 1 ? { x: l1.x2, y: l1.y2 } : { x: l1.x1, y: l1.y1 };
-  const cut1:  Pt = cut1End === 1 ? { x: l1.x1, y: l1.y1 } : { x: l1.x2, y: l1.y2 };
   const kept2: Pt = cut2End === 1 ? { x: l2.x2, y: l2.y2 } : { x: l2.x1, y: l2.y1 };
-  const cut2:  Pt = cut2End === 1 ? { x: l2.x1, y: l2.y1 } : { x: l2.x2, y: l2.y2 };
 
-  // Direction vectors from kept → cut (toward the corner).
-  const len1 = Math.hypot(cut1.x - kept1.x, cut1.y - kept1.y);
-  const len2 = Math.hypot(cut2.x - kept2.x, cut2.y - kept2.y);
-  if (len1 < 1e-9 || len2 < 1e-9) return null;
-  const u1: Pt = { x: (cut1.x - kept1.x) / len1, y: (cut1.y - kept1.y) / len1 };
-  const u2: Pt = { x: (cut2.x - kept2.x) / len2, y: (cut2.y - kept2.y) / len2 };
-
-  // Infinite intersection of the two lines.
-  const denom = u1.x * u2.y - u1.y * u2.x;
+  // Find the corner P by intersecting the two infinite lines.
+  // Parametric form: P = kept1 + t·dir1 = kept2 + s·dir2
+  // dir = cut_end − kept_end (toward the corner).
+  const cx1 = cut1End === 1 ? l1.x1 : l1.x2, cy1 = cut1End === 1 ? l1.y1 : l1.y2;
+  const cx2 = cut2End === 1 ? l2.x1 : l2.x2, cy2 = cut2End === 1 ? l2.y1 : l2.y2;
+  const dx1 = cx1 - kept1.x, dy1 = cy1 - kept1.y;
+  const dx2 = cx2 - kept2.x, dy2 = cy2 - kept2.y;
+  const denom = dx1 * dy2 - dy1 * dx2;
   if (Math.abs(denom) < 1e-9) return null;   // parallel
-  const dx = kept2.x - kept1.x, dy = kept2.y - kept1.y;
-  const t1 = (dx * u2.y - dy * u2.x) / denom;
-  const P: Pt = { x: kept1.x + u1.x * t1, y: kept1.y + u1.y * t1 };
+  const dpx = kept2.x - kept1.x, dpy = kept2.y - kept1.y;
+  const t = (dpx * dy2 - dpy * dx2) / denom;
+  const P: Pt = { x: kept1.x + t * dx1, y: kept1.y + t * dy1 };
 
-  // Half-angle bisector → fillet centre.
-  const cosA = u1.x * (-u2.x) + u1.y * (-u2.y);
-  const angle = Math.acos(Math.max(-1, Math.min(1, cosA)));
-  if (angle < 1e-4 || angle > Math.PI - 1e-4) return null;
-  const tanHalf = Math.tan(angle / 2);
-  if (tanHalf < 1e-9) return null;
-  const d = radius / tanHalf;  // distance from P to each tangent point along each line
+  // Unit vectors FROM the corner P toward each kept end.
+  // This matches the convention in `computeFillet` in tools.ts.
+  const d1x = kept1.x - P.x, d1y = kept1.y - P.y;
+  const d2x = kept2.x - P.x, d2y = kept2.y - P.y;
+  const len1 = Math.hypot(d1x, d1y);
+  const len2 = Math.hypot(d2x, d2y);
+  if (len1 < 1e-9 || len2 < 1e-9) return null;
+  const u1: Pt = { x: d1x / len1, y: d1y / len1 };  // P → kept1
+  const u2: Pt = { x: d2x / len2, y: d2y / len2 };  // P → kept2
 
-  // Check the lines are long enough.
-  if (d > Math.hypot(P.x - kept1.x, P.y - kept1.y) + 1e-6) return null;
-  if (d > Math.hypot(P.x - kept2.x, P.y - kept2.y) + 1e-6) return null;
+  // Interior angle and derived fillet geometry — identical to computeFillet.
+  const cosA = Math.max(-1, Math.min(1, u1.x * u2.x + u1.y * u2.y));
+  const angle = Math.acos(cosA);
+  if (angle < 1e-4 || angle > Math.PI - 1e-4) return null;  // collinear or anti-parallel
+  const half = angle / 2;
+  const tanDist = radius / Math.tan(half);   // distance P→tangent point on each line
+  const cDist   = radius / Math.sin(half);   // distance P→arc centre
 
-  const T1: Pt = { x: P.x - u1.x * d, y: P.y - u1.y * d };  // tangent on l1
-  const T2: Pt = { x: P.x - u2.x * d, y: P.y - u2.y * d };  // tangent on l2
+  // Check both lines are long enough to fit the fillet.
+  if (tanDist > len1 + 1e-6) return null;
+  if (tanDist > len2 + 1e-6) return null;
 
-  // Fillet centre: offset from P toward the bisector by radius/sin(angle/2).
-  const bis: Pt = { x: u1.x - u2.x, y: u1.y - u2.y };
-  const bisLen = Math.hypot(bis.x, bis.y);
+  const T1: Pt = { x: P.x + u1.x * tanDist, y: P.y + u1.y * tanDist };
+  const T2: Pt = { x: P.x + u2.x * tanDist, y: P.y + u2.y * tanDist };
+
+  // Arc centre on the interior bisector.
+  const bisX = u1.x + u2.x, bisY = u1.y + u2.y;
+  const bisLen = Math.hypot(bisX, bisY);
   if (bisLen < 1e-9) return null;
-  const bisN: Pt = { x: bis.x / bisLen, y: bis.y / bisLen };
-  const distCenter = radius / Math.sin(angle / 2);
-  const C: Pt = { x: P.x - bisN.x * distCenter, y: P.y - bisN.y * distCenter };
+  const C: Pt = { x: P.x + (bisX / bisLen) * cDist, y: P.y + (bisY / bisLen) * cDist };
 
-  // Arc angles — from C to each tangent point, CCW.
+  // Arc sweep: short arc between the two tangent points (CCW, < 180°).
   let a1 = Math.atan2(T1.y - C.y, T1.x - C.x);
   let a2 = Math.atan2(T2.y - C.y, T2.x - C.x);
-  // Ensure the arc sweeps CCW and stays under 180°.
-  let sweep = a2 - a1;
-  while (sweep < 0) sweep += Math.PI * 2;
-  if (sweep > Math.PI) { const tmp = a1; a1 = a2; a2 = tmp; }
+  const twoPi = Math.PI * 2;
+  const normA = (x: number) => ((x % twoPi) + twoPi) % twoPi;
+  if (normA(a2 - a1) > Math.PI) { const tmp = a1; a1 = a2; a2 = tmp; }
 
   return { newL1End: T1, newL2End: T2, arc: { cx: C.x, cy: C.y, r: radius, a1, a2 } };
 }
