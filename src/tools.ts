@@ -13,8 +13,8 @@ import { pushUndo } from './undo';
 import { evalExpr } from './params';
 import {
   addFeatureFromInit, AXIS_X_ID, AXIS_Y_ID, deleteFeatures, entityIdForFeature,
-  evaluateTimeline, featureForEntity, featureFromEntityInit, modifierOutputInfo,
-  newFeatureId, replaceFeatureFromInit,
+  evaluateTimeline, featureDependsOn, featureForEntity, featureFromEntityInit,
+  modifierOutputInfo, newFeatureId, replaceFeatureFromInit, topoSortFeatures,
 } from './features';
 import { showConfirm } from './modal';
 import { layoutText } from './textlayout';
@@ -472,12 +472,44 @@ function buildRayHitCutOverride(
   cutPt: Pt,
   cutter: Entity,
   cutterFeatureId: string,
+  selfFeatureId?: string,
 ): PointRef | null {
   const dx = cutPt.x - keptPt.x;
   const dy = cutPt.y - keptPt.y;
   if (dx * dx + dy * dy < 1e-18) return null;
   const edge = featureEdgeForCutter(cutter, cutPt);
   if (!edge) return null;
+  // The rayHit evaluator resolves the target via `ctx.get(cutterFeatureId)`,
+  // so the cutter MUST be the primary output of its feature. Modifier
+  // sub-entities (mirror-copy of an xline, array cell, fillet's trimmed
+  // side, chamfer's cut line, clip segments) don't satisfy this — their
+  // primary ctx entry is either empty or a DIFFERENT entity (e.g. the
+  // fillet's arc). If we naively stored `target: cutterFeatureId` for one of
+  // those, the evaluator would look up a missing/unrelated entity and
+  // collapse the cut end to NaN, making the trimmed line disappear on the
+  // next re-evaluation. Fall back to null so the caller uses a flat abs cut
+  // point — the parametric link is lost for this specific case, but the
+  // geometry stays correct. (Trimming ON a mirror sub-entity is an edge
+  // case we can tackle later with a richer target ref.)
+  if (entityIdForFeature(cutterFeatureId) !== cutter.id) return null;
+  // Cycle guard: if the cutter transitively depends on the feature being
+  // trimmed, linking the trimmed line's endpoint to rayHit(cutter) closes a
+  // cycle in the feature graph. evaluateTimeline can't resolve cycles —
+  // topoSortFeatures would detect it and bail out of reordering, leaving the
+  // cutter's ctx entry missing when the trimmed line evaluates → NaN → the
+  // line's cut end snaps to the far edge of the drawing on the next eval.
+  //
+  // The canonical example: the divide tool creates xlines anchored to the
+  // line's endpoints (so they track as the line moves). Trimming that same
+  // line between those xlines would then make the line's endpoint a rayHit
+  // of an xline whose position is itself a polar-from-line-endpoint → cycle.
+  //
+  // Returning null here makes the caller bake the cut as abs coords — the
+  // parametric link to the cutter is lost for this specific cut, but the
+  // geometry is immediately correct and stays correct while only this line's
+  // own variables change. That matches the non-parametric behaviour the user
+  // already relies on.
+  if (selfFeatureId && featureDependsOn(cutterFeatureId, selfFeatureId)) return null;
   const angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
   return {
     kind: 'rayHit',
@@ -2880,43 +2912,72 @@ function handleLineClick(p: Pt): void {
       // Three tiers, all preserve the locked ray:
       //  1. snap has explicit `edge` (axis snap on xline, rect corner/mid) →
       //     rayHit against snap.entityId.
+      //  1a. snap has entityId but no `edge` and targets a line/xline →
+      //     synthesize `{kind:'lineSeg'}` and also go via rayHit. This is the
+      //     case when the user's "END" snap lands on an xline's base point
+      //     (e.g. at the crossing of two Hilfslinien). Without this the line
+      //     decays to a frozen polar at Tier 3 and detaches from the xline
+      //     when the user later changes the variable that moved the xline.
       //  2. snap is an intersection of two entities (no `edge`) → rayHit
       //     against whichever of the two entities gives the closer hit along
       //     the ray. Preserves angle-lock AND parametrically tracks that
       //     entity (fixes the "intersection snap loses param link" bug).
       //  3. no upgradeable feature ref → baked polar-from-p1 with length
       //     derived from ray-vs-snap-axis (or raw cursor projection).
-      const rayHit = (runtime.parametricMode && snap && snap.entityId != null && snap.edge)
-        ? (() => {
-            const feat = featureForEntity(snap.entityId!);
-            if (!feat) return null;
-            // Modifier features (mirror/array/rotate) don't put their outputs
-            // into the resolve-ctx — a rayHit whose target is a modifier would
-            // resolve to NaN on the next timeline eval. Fall back to polar in
-            // that case so the line at least keeps its typed angle/length.
-            if (feat.kind === 'mirror' || feat.kind === 'array' || feat.kind === 'rotate' || feat.kind === 'crossMirror') return null;
-            // For corner snaps, the snap's `edge` is arbitrarily top/bottom;
-            // upgrade to the adjacent edge that's more perpendicular to the
-            // ray so the endpoint tracks the edge that actually moves when
-            // the rect resizes along the ray axis.
-            const edge = pickBestRectCornerEdge(
-              tc.p1!, tc.lockedDir!, snap.entityId!,
-              { x: snap.x, y: snap.y }, snap.edge!,
-            );
-            const hit = rayEdgeIntersect(tc.p1!, tc.lockedDir!, snap.entityId!, edge);
-            if (!hit) return null;
-            const ref: PointRef = {
-              kind: 'rayHit',
-              from: p1RefParam,
-              angle: numE(angleDegAbs),
-              target: feat.id,
-              edge,
-            };
-            return { pt: hit, ref };
-          })()
-        : (runtime.parametricMode && snap)
-          ? tryBuildIntersectionRayHit(tc.p1!, tc.lockedDir!, snap, p1RefParam, angleDegAbs)
-          : null;
+      const rayHit: { pt: Pt; ref: PointRef } | null = (() => {
+        if (!runtime.parametricMode || !snap) return null;
+
+        // Tier 2 first: an `int` snap carries two entities, not one edge.
+        if (snap.type === 'int') {
+          return tryBuildIntersectionRayHit(
+            tc.p1!, tc.lockedDir!, snap, p1RefParam, angleDegAbs,
+          );
+        }
+
+        if (snap.entityId == null) return null;
+        const feat = featureForEntity(snap.entityId);
+        if (!feat) return null;
+        // Modifier features (mirror/array/rotate) don't put their outputs
+        // into the resolve-ctx — a rayHit whose target is a modifier would
+        // resolve to NaN on the next timeline eval. Fall back to polar in
+        // that case so the line at least keeps its typed angle/length.
+        if (feat.kind === 'mirror' || feat.kind === 'array' ||
+            feat.kind === 'rotate' || feat.kind === 'crossMirror') return null;
+
+        // Determine the target edge. Snap producers tag rect corner/mid, xline
+        // axis, and perp snaps with an explicit `edge`. END snaps on line/xline
+        // don't — they're single-point anchors. We upgrade those by
+        // synthesizing a lineSeg edge so rayHit can resolve against the host
+        // line/xline. Polyline/spline endpoints are left to Tier 3 (polyline
+        // would need the specific segment index, which the snap doesn't
+        // record; circles/arcs have no lineSeg equivalent).
+        let edge = snap.edge;
+        if (!edge) {
+          const ent = state.entities.find(e => e.id === snap.entityId);
+          if (!ent) return null;
+          if (ent.type !== 'line' && ent.type !== 'xline') return null;
+          edge = { kind: 'lineSeg' };
+        }
+
+        // For corner snaps, the snap's `edge` is arbitrarily top/bottom;
+        // upgrade to the adjacent edge that's more perpendicular to the
+        // ray so the endpoint tracks the edge that actually moves when
+        // the rect resizes along the ray axis.
+        const bestEdge = pickBestRectCornerEdge(
+          tc.p1!, tc.lockedDir!, snap.entityId,
+          { x: snap.x, y: snap.y }, edge,
+        );
+        const hit = rayEdgeIntersect(tc.p1!, tc.lockedDir!, snap.entityId, bestEdge);
+        if (!hit) return null;
+        const ref: PointRef = {
+          kind: 'rayHit',
+          from: p1RefParam,
+          angle: numE(angleDegAbs),
+          target: feat.id,
+          edge: bestEdge,
+        };
+        return { pt: hit, ref };
+      })();
 
       if (rayHit) {
         endPt = rayHit.pt;
@@ -3016,29 +3077,43 @@ export function handlePolylineClick(p: Pt): void {
     const snap = runtime.lastSnap;
     const angleDegAbs = Math.atan2(tc.lockedDir.y, tc.lockedDir.x) * 180 / Math.PI;
 
-    // Same three tiers as handleLineClick's angle-lock path.
-    const rayHitResult = (runtime.parametricMode && snap && snap.entityId != null && snap.edge)
-      ? (() => {
-          const feat = featureForEntity(snap.entityId!);
-          if (!feat) return null;
-          // Modifier sub-entities aren't in the resolve-ctx → fall back to polar.
-          if (feat.kind === 'mirror' || feat.kind === 'array' ||
-              feat.kind === 'rotate' || feat.kind === 'crossMirror') return null;
-          const edge = pickBestRectCornerEdge(
-            prevPt, tc.lockedDir!, snap.entityId!,
-            { x: snap.x, y: snap.y }, snap.edge!,
-          );
-          const hit = rayEdgeIntersect(prevPt, tc.lockedDir!, snap.entityId!, edge);
-          if (!hit) return null;
-          const r: PointRef = {
-            kind: 'rayHit', from: prevRef,
-            angle: numE(angleDegAbs), target: feat.id, edge,
-          };
-          return { pt: hit, ref: r };
-        })()
-      : (runtime.parametricMode && snap)
-        ? tryBuildIntersectionRayHit(prevPt, tc.lockedDir!, snap, prevRef, angleDegAbs)
-        : null;
+    // Same three tiers as handleLineClick's angle-lock path, including the
+    // tier-1a upgrade for entity-tagged snaps without an explicit `edge` (e.g.
+    // an END snap on an xline's base point at the crossing of two Hilfslinien).
+    const rayHitResult: { pt: Pt; ref: PointRef } | null = (() => {
+      if (!runtime.parametricMode || !snap) return null;
+      // Tier 2 first: an `int` snap carries two entities, not one edge.
+      if (snap.type === 'int') {
+        return tryBuildIntersectionRayHit(prevPt, tc.lockedDir!, snap, prevRef, angleDegAbs);
+      }
+      if (snap.entityId == null) return null;
+      const feat = featureForEntity(snap.entityId);
+      if (!feat) return null;
+      // Modifier sub-entities aren't in the resolve-ctx → fall back to polar.
+      if (feat.kind === 'mirror' || feat.kind === 'array' ||
+          feat.kind === 'rotate' || feat.kind === 'crossMirror') return null;
+      // Synthesize a lineSeg edge for line/xline snaps that don't carry one
+      // (END snap on xline's base point is the common case). Polyline / circle
+      // endpoints have no clean lineSeg edge — skip them, they decay to polar.
+      let edge = snap.edge;
+      if (!edge) {
+        const ent = state.entities.find(e => e.id === snap.entityId);
+        if (!ent) return null;
+        if (ent.type !== 'line' && ent.type !== 'xline') return null;
+        edge = { kind: 'lineSeg' };
+      }
+      const bestEdge = pickBestRectCornerEdge(
+        prevPt, tc.lockedDir!, snap.entityId,
+        { x: snap.x, y: snap.y }, edge,
+      );
+      const hit = rayEdgeIntersect(prevPt, tc.lockedDir!, snap.entityId, bestEdge);
+      if (!hit) return null;
+      const r: PointRef = {
+        kind: 'rayHit', from: prevRef,
+        angle: numE(angleDegAbs), target: feat.id, edge: bestEdge,
+      };
+      return { pt: hit, ref: r };
+    })();
 
     if (rayHitResult) {
       pt  = rayHitResult.pt;
@@ -4187,14 +4262,39 @@ function handleDivideXLineClick(worldPt: Pt): void {
  * Emit n-1 perpendicular xlines that divide the given line into n equal
  * segments. All emitted under a single undo step.
  *
- * Parametric anchor: each xline's base point is stored as a `polar` ref
- * from the source line's p1 PointRef (same direction as the line, at
- * distance i/n·L).  When the source line translates because a variable
- * changes, every division xline follows automatically.  Rotation / scaling
- * of the source line is not tracked (the angle and distance are baked in at
- * creation time), but translation — the most common parametric change — is
- * handled correctly.  Falls back to abs when the source line's feature or
- * p1 ref is not accessible (e.g. sub-entity of a modifier).
+ * Parametric anchor: each xline's base point is stored as an `interpolate`
+ * ref between DEEP-CLONED SNAPSHOTS of the source line's current p1 and p2
+ * PointRefs at parameter `t = i/n`. The snapshot approach is critical for
+ * two reasons:
+ *
+ * 1. REDISTRIBUTION on variable change — whatever the original p1/p2 refs
+ *    depended on (variable-driven expressions, other features' endpoints,
+ *    etc.) is preserved verbatim in the snapshot, so when the user changes
+ *    a variable, both interpolation endpoints re-evaluate and the xlines
+ *    redistribute proportionally along the new line. That's the behaviour
+ *    the user actually wants: "wenn ich die linie durch 5 teile und später
+ *    die variable von 50mm auf 100mm ändere, [müssen die xlines] gleichmässig
+ *    geteilt sein".
+ *
+ * 2. IMMUNITY to later edits of the source line — if we used indirect
+ *    `{kind:'endpoint', feature: lineFid, end: 0|1}` refs, any later
+ *    operation that REPLACES the line's endpoints (trim, grip-drag,
+ *    properties-panel edit) would drag the xlines along with the new
+ *    endpoints. Worse, if the line is later TRIMMED against these very
+ *    xlines, trim installs rayHit refs that depend on the xlines, while
+ *    the xlines (via indirect endpoint refs) depend on the line — a
+ *    feature-graph cycle that makes topo-sort bail out and leaves the
+ *    geometry broken when variables change. Snapshotting the refs breaks
+ *    this cycle: the xlines anchor to whatever the original p1/p2 pointed
+ *    at (a rectangle corner, an absolute expression, etc.), independent
+ *    of what the line itself is later mutated into.
+ *
+ * The xline's perpendicular normal (dx/dy) is still baked as a numeric
+ * literal — rotation of the source line is not tracked, which matches the
+ * divide-circle behaviour and is acceptable because length changes (the
+ * common parametric case) preserve direction. Falls back to abs when the
+ * source line's feature is not accessible as a plain 'line' feature
+ * (e.g. sub-entity of a modifier like fillet/chamfer/mirror).
  */
 function applyDivideXLine(l: LineEntity, n: number): void {
   if (!Number.isInteger(n) || n < 2 || n > 200) {
@@ -4206,23 +4306,30 @@ function applyDivideXLine(l: LineEntity, n: number): void {
   if (L < 1e-9) { toast('Linie zu kurz'); return; }
   const ux = dx / L, uy = dy / L;
   const nx = -uy, ny = ux;
-  // Angle from p1 toward p2, in degrees — stored in the polar ref so the
-  // xline anchor stays on the correct point even after p1 translates.
-  const angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
 
-  // Retrieve the source line feature's p1 PointRef for parametric anchoring.
-  const lineFid = featureForEntity(l.id)?.id ?? null;
-  const lineFeat = lineFid ? state.features.find(f => f.id === lineFid) : null;
-  const p1Ref: PointRef | null = (lineFeat && lineFeat.kind === 'line') ? lineFeat.p1 : null;
+  const lineFeat = featureForEntity(l.id);
+  const canLink = runtime.parametricMode && !!lineFeat && lineFeat.kind === 'line';
+  // Snapshot the current p1/p2 refs so our xlines remain anchored to the
+  // ORIGINAL endpoint references, immune to later mutations of the line.
+  // structuredClone matches the pattern already used by undo.ts for features
+  // and is safe for all PointRef variants (they're plain serializable data).
+  const p1Snap: PointRef | null = canLink
+    ? structuredClone((lineFeat as Extract<Feature, { kind: 'line' }>).p1)
+    : null;
+  const p2Snap: PointRef | null = canLink
+    ? structuredClone((lineFeat as Extract<Feature, { kind: 'line' }>).p2)
+    : null;
 
   const layer = hilfslinieLayer();
   pushUndo();
   for (let i = 1; i < n; i++) {
     const t = i / n;
-    const segDist = t * L;
-    // Use a polar ref so the anchor tracks p1 when the source line moves.
-    const pRef: PointRef = (p1Ref && runtime.parametricMode)
-      ? { kind: 'polar', from: p1Ref, angle: numE(angleDeg), distance: numE(segDist) }
+    // Use an interpolate ref so the anchor redistributes proportionally
+    // when either original endpoint ref re-evaluates. Clone the snapshots
+    // per-iteration so each xline owns an independent PointRef tree — lets
+    // downstream editing of one xline's anchor not bleed into its siblings.
+    const pRef: PointRef = (p1Snap && p2Snap)
+      ? { kind: 'interpolate', from: structuredClone(p1Snap), to: structuredClone(p2Snap), t: numE(t) }
       : { kind: 'abs', x: numE(l.x1 + dx * t), y: numE(l.y1 + dy * t) };
     state.features.push({
       id: newFeatureId(),
@@ -7081,11 +7188,12 @@ function handleExtendClick(worldPt: Pt): void {
     ? (anchorEnd === 0 ? prevFeat.p1 : prevFeat.p2)
     : null;
   const cutRefOverride: PointRef | null = (targetFid && cutterEntity && keptRef)
-    ? buildRayHitCutOverride(keptRef, anchor, newEnd, cutterEntity, targetFid)
+    ? buildRayHitCutOverride(keptRef, anchor, newEnd, cutterEntity, targetFid, fid)
     : null;
   if (!replaceLineEndPreservingRef(fid, anchorEnd, newEnd, hit.layer, cutRefOverride)) {
     replaceFeatureFromInit(fid, entityInit(newLine));
   }
+  topoSortFeatures();
   evaluateTimeline();
   render();
 }
@@ -7177,7 +7285,7 @@ function handleExtendToClick(worldPt: Pt): void {
       ? (anchorEnd === 0 ? prevFeat.p1 : prevFeat.p2)
       : null;
     const cutRefOverride: PointRef | null = (targetFid && keptRef)
-      ? buildRayHitCutOverride(keptRef, anchorPt, ip, tgt, targetFid)
+      ? buildRayHitCutOverride(keptRef, anchorPt, ip, tgt, targetFid, fid)
       : null;
 
     pushUndo();
@@ -7188,6 +7296,7 @@ function handleExtendToClick(worldPt: Pt): void {
         : { ...src, x1: ip.x, y1: ip.y };
       replaceFeatureFromInit(fid, entityInit(newLine));
     }
+    topoSortFeatures();
     evaluateTimeline();
     updateStats();
     state.selection.clear();
@@ -7844,9 +7953,13 @@ function handleTrimClick(worldPt: Pt): void {
       ? (state.entities.find(e => e.id === cutterLow!.entityId) ?? null) : null;
     const targetFid = cutterEnt ? (featureForEntity(cutterEnt.id)?.id ?? null) : null;
     const cutRef = (cutterEnt && targetFid)
-      ? buildRayHitCutOverride(p1Ref, a, cutPt, cutterEnt, targetFid) : null;
+      ? buildRayHitCutOverride(p1Ref, a, cutPt, cutterEnt, targetFid, fid) : null;
     pushUndo();
     replaceLineEndPreservingRef(fid, 0, cutPt, hit.layer, cutRef);
+    // The rewritten line may now depend on a cutter that was created AFTER
+    // it — reorder the timeline so dependencies evaluate first, otherwise
+    // the rayHit target is missing from ctx and the endpoint collapses to NaN.
+    topoSortFeatures();
     state.selection.delete(hit.id);
     evaluateTimeline();
     updateStats();
@@ -7860,9 +7973,10 @@ function handleTrimClick(worldPt: Pt): void {
       ? (state.entities.find(e => e.id === cutterHigh!.entityId) ?? null) : null;
     const targetFid = cutterEnt ? (featureForEntity(cutterEnt.id)?.id ?? null) : null;
     const cutRef = (cutterEnt && targetFid)
-      ? buildRayHitCutOverride(p2Ref, b, cutPt, cutterEnt, targetFid) : null;
+      ? buildRayHitCutOverride(p2Ref, b, cutPt, cutterEnt, targetFid, fid) : null;
     pushUndo();
     replaceLineEndPreservingRef(fid, 1, cutPt, hit.layer, cutRef);
+    topoSortFeatures();
     state.selection.delete(hit.id);
     evaluateTimeline();
     updateStats();
@@ -7883,10 +7997,13 @@ function handleTrimClick(worldPt: Pt): void {
 
     // rayHit ref for segment 1's cut end: ray from p1 toward lowPt.
     const lowCutRef = (lowCutEnt && lowTargetFid)
-      ? buildRayHitCutOverride(p1Ref, a, lowPt, lowCutEnt, lowTargetFid) : null;
+      ? buildRayHitCutOverride(p1Ref, a, lowPt, lowCutEnt, lowTargetFid, fid) : null;
     // rayHit ref for segment 2's cut end: ray from p2 toward highPt.
+    // Segment 2 becomes a new feature — its own id doesn't yet exist, but it
+    // starts out as a fresh line with the same dependencies as segment 1
+    // would have, so the same cycle check against `fid` applies.
     const highCutRef = (highCutEnt && highTargetFid)
-      ? buildRayHitCutOverride(p2Ref, b, highPt, highCutEnt, highTargetFid) : null;
+      ? buildRayHitCutOverride(p2Ref, b, highPt, highCutEnt, highTargetFid, fid) : null;
 
     pushUndo();
 
@@ -7906,6 +8023,7 @@ function handleTrimClick(worldPt: Pt): void {
     };
     state.features.push(newFeat);
 
+    topoSortFeatures();
     state.selection.delete(hit.id);
     evaluateTimeline();
     updateStats();

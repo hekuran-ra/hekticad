@@ -125,6 +125,10 @@ function collectRefTargets(ref: PointRef, out: Set<string>): void {
       collectRefTargets(ref.xFrom, out);
       collectRefTargets(ref.yFrom, out);
       return;
+    case 'interpolate':
+      collectRefTargets(ref.from, out);
+      collectRefTargets(ref.to, out);
+      return;
   }
 }
 
@@ -213,6 +217,111 @@ export function featureDependencies(f: Feature): Set<string> {
       break;
   }
   return out;
+}
+
+/**
+ * Does `candidateFid` transitively depend on `rootFid`? Used to detect the
+ * cycle that occurs when trim / extend / fillet would link a line to a cutter
+ * that itself depends on the same line (e.g. the divide tool puts xlines whose
+ * geometry is pegged to the line's endpoint; trimming the line against those
+ * xlines would then put the line's endpoint in a rayHit of those xlines —
+ * cycle). The feature graph is a DAG in steady state, so a DFS terminates.
+ */
+export function featureDependsOn(candidateFid: string, rootFid: string): boolean {
+  if (candidateFid === rootFid) return true;
+  const feats = new Map<string, Feature>();
+  for (const f of state.features) feats.set(f.id, f);
+  const visited = new Set<string>();
+  const stack: string[] = [candidateFid];
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    const f = feats.get(id);
+    if (!f) continue;
+    for (const dep of featureDependencies(f)) {
+      if (dep === rootFid) return true;
+      if (!visited.has(dep)) stack.push(dep);
+    }
+  }
+  return false;
+}
+
+/**
+ * Reorder `state.features` so every feature appears after all of its
+ * dependencies. Insertion order is preserved among features that are not
+ * transitively related — so the typical case (features created in a legal
+ * order) is a no-op.
+ *
+ * Why this matters: evaluateTimeline walks `state.features` in order and
+ * resolves PointRefs against a `ctx` that is built up as it goes. If feature
+ * A depends on B but appears earlier in the array, A evaluates with B absent
+ * from ctx and its rayHit/endpoint/etc. refs produce NaN geometry. This is
+ * visible e.g. after the trim tool rewrites an existing line to rayHit a
+ * construction xline that was created AFTER the line — the new dependency
+ * goes backwards in the insertion order.
+ *
+ * Returns true iff the order actually changed.
+ */
+export function topoSortFeatures(): boolean {
+  const feats = state.features;
+  const n = feats.length;
+  if (n < 2) return false;
+
+  // Build id → index + adjacency (dep → list of dependents that sit earlier).
+  const indexById = new Map<string, number>();
+  for (let i = 0; i < n; i++) indexById.set(feats[i].id, i);
+
+  // Kahn's algorithm with a stable tie-breaker: among nodes whose deps are
+  // satisfied, pick the one with the smallest original index so unrelated
+  // features keep their creation order.
+  const indeg = new Array<number>(n).fill(0);
+  const deps: Set<number>[] = feats.map(() => new Set());
+  for (let i = 0; i < n; i++) {
+    for (const dep of featureDependencies(feats[i])) {
+      const di = indexById.get(dep);
+      if (di == null || di === i) continue;
+      if (!deps[i].has(di)) {
+        deps[i].add(di);
+        indeg[i]++;
+      }
+    }
+  }
+
+  // A tiny sorted-by-original-index "ready" set. n is small (drawings rarely
+  // exceed a few thousand features) so a linear-scan ready list is fine.
+  const ready: number[] = [];
+  for (let i = 0; i < n; i++) if (indeg[i] === 0) ready.push(i);
+
+  // Reverse adjacency: dependents[d] = all i that depend on d.
+  const dependents: number[][] = feats.map(() => []);
+  for (let i = 0; i < n; i++) for (const d of deps[i]) dependents[d].push(i);
+
+  const outOrder: number[] = [];
+  while (ready.length) {
+    // Pop smallest (original index) for stable order.
+    let minPos = 0;
+    for (let k = 1; k < ready.length; k++) if (ready[k] < ready[minPos]) minPos = k;
+    const idx = ready.splice(minPos, 1)[0];
+    outOrder.push(idx);
+    for (const dep of dependents[idx]) {
+      indeg[dep]--;
+      if (indeg[dep] === 0) ready.push(dep);
+    }
+  }
+
+  // Cycle — bail out and leave order unchanged. Shouldn't happen in practice
+  // (the feature graph is meant to be a DAG) but guard against silent damage.
+  if (outOrder.length !== n) return false;
+
+  // Already sorted?
+  let changed = false;
+  for (let i = 0; i < n; i++) if (outOrder[i] !== i) { changed = true; break; }
+  if (!changed) return false;
+
+  const reordered = outOrder.map(i => feats[i]);
+  state.features = reordered;
+  return true;
 }
 
 /**
@@ -359,6 +468,17 @@ function resolvePt(ref: PointRef, ctx: EvalCtx): Pt {
       if (!Number.isFinite(xp.x) || !Number.isFinite(yp.y)) return { x: NaN, y: NaN };
       return { x: xp.x, y: yp.y };
     }
+    case 'interpolate': {
+      // Linear blend between two reference points. Resolver propagates NaN
+      // if either anchor fails (e.g. the referenced feature was deleted or
+      // its ctx entry is missing due to an eval-order issue).
+      const p0 = resolvePt(ref.from, ctx);
+      const p1 = resolvePt(ref.to, ctx);
+      if (!Number.isFinite(p0.x) || !Number.isFinite(p0.y)) return { x: NaN, y: NaN };
+      if (!Number.isFinite(p1.x) || !Number.isFinite(p1.y)) return { x: NaN, y: NaN };
+      const t = evalExpr(ref.t);
+      return { x: p0.x + (p1.x - p0.x) * t, y: p0.y + (p1.y - p0.y) * t };
+    }
   }
 }
 
@@ -497,24 +617,32 @@ export function modifierOutputInfo(
   // produced this entity. Map is small (one entry per modifier output), and
   // delete is not a hot path.
   const prefix = `${modFid}#`;
+  // Strip the multi-output `~idx` tail (added when the source feature produces
+  // more than one entity, e.g. fillet → [l1, l2, arc]). The tail is an
+  // evaluation artifact; for selection/delete semantics all we care about is
+  // which source feature produced the entity.
+  const stripSubIdx = (s: string): string => {
+    const tilde = s.indexOf('~');
+    return tilde >= 0 ? s.slice(0, tilde) : s;
+  };
   for (const [key, eid] of subEntityIds) {
     if (eid !== entityId) continue;
     if (!key.startsWith(prefix)) continue;
     const sub = key.slice(prefix.length);
-    // CrossMirror sub-key: "sid@variant" — split out the source fid so delete
-    // prunes the same sourceIds list a plain mirror would.
+    // CrossMirror sub-key: "sid@variant" (or "sid~idx@variant") — split out
+    // the source fid so delete prunes the same sourceIds list a plain mirror would.
     const atIdx = sub.indexOf('@');
     if (atIdx > 0) {
-      return { modFid, sourceFid: sub.slice(0, atIdx) };
+      return { modFid, sourceFid: stripSubIdx(sub.slice(0, atIdx)) };
     }
-    // Array sub-key: "sid|col|row" — split and parse.
+    // Array sub-key: "sid|col|row" (or "sid~idx|col|row") — split and parse.
     const parts = sub.split('|');
     if (parts.length === 3) {
       const col = parseInt(parts[1], 10);
       const row = parseInt(parts[2], 10);
-      return { modFid, sourceFid: parts[0], cell: { col, row } };
+      return { modFid, sourceFid: stripSubIdx(parts[0]), cell: { col, row } };
     }
-    return { modFid, sourceFid: sub };
+    return { modFid, sourceFid: stripSubIdx(sub) };
   }
   return null;
 }
@@ -786,17 +914,20 @@ function buildArrayEntities(f: ArrayFeature, ctx: EvalCtx): Entity[] {
 
   const out: Entity[] = [];
   for (const sid of f.sourceIds) {
-    const src = ctx.get(sid);
-    if (!src) continue;
-    for (let j = 0; j < nr; j++) {
-      for (let i = 0; i < nc; i++) {
-        if (i === 0 && j === 0) continue;   // (0,0) is the source itself
-        const offX = i * dx + j * rowDx;
-        const offY = i * dy + j * rowDy;
-        const key = `${sid}|${i}|${j}`;
-        const id = allocSubEntityId(f.id, key);
-        const copied = translateEntity(src, offX, offY, id, src.layer);
-        if (copied) out.push(copied);
+    const srcs = resolveSourceOutputs(sid, ctx);
+    for (let si = 0; si < srcs.length; si++) {
+      const src = srcs[si];
+      const sfx = sourceSubSuffix(srcs.length, si);   // '' or '~idx'
+      for (let j = 0; j < nr; j++) {
+        for (let i = 0; i < nc; i++) {
+          if (i === 0 && j === 0) continue;   // (0,0) is the source itself
+          const offX = i * dx + j * rowDx;
+          const offY = i * dy + j * rowDy;
+          const key = `${sid}${sfx}|${i}|${j}`;
+          const id = allocSubEntityId(f.id, key);
+          const copied = translateEntity(src, offX, offY, id, src.layer);
+          if (copied) out.push(copied);
+        }
       }
     }
   }
@@ -809,11 +940,14 @@ function buildRotateEntities(f: RotateFeature, ctx: EvalCtx): Entity[] {
   const ang = evalExpr(f.angle) * Math.PI / 180;
   const out: Entity[] = [];
   for (const sid of f.sourceIds) {
-    const src = ctx.get(sid);
-    if (!src) continue;
-    const id = allocSubEntityId(f.id, sid);
-    const rot = rotateEntity(src, c, ang, id, src.layer);
-    if (rot) out.push(rot);
+    const srcs = resolveSourceOutputs(sid, ctx);
+    for (let i = 0; i < srcs.length; i++) {
+      const src = srcs[i];
+      const subKey = `${sid}${sourceSubSuffix(srcs.length, i)}`;
+      const id = allocSubEntityId(f.id, subKey);
+      const rot = rotateEntity(src, c, ang, id, src.layer);
+      if (rot) out.push(rot);
+    }
   }
   return out;
 }
@@ -839,18 +973,21 @@ function buildCrossMirrorEntities(f: CrossMirrorFeature, ctx: EvalCtx): Entity[]
   const axis2: Pt = { x: -Math.sin(ang), y: Math.cos(ang) };
   const out: Entity[] = [];
   for (const sid of f.sourceIds) {
-    const src = ctx.get(sid);
-    if (!src) continue;
-    const id1 = allocSubEntityId(f.id, `${sid}@m1`);
-    const m1 = reflectEntity(src, c, axis1, id1, src.layer);
-    if (m1) out.push(m1);
-    if (f.variant === 'quarter') {
-      const id2 = allocSubEntityId(f.id, `${sid}@m2`);
-      const m2 = reflectEntity(src, c, axis2, id2, src.layer);
-      if (m2) out.push(m2);
-      const id3 = allocSubEntityId(f.id, `${sid}@m3`);
-      const m3 = rotateEntity(src, c, Math.PI, id3, src.layer);
-      if (m3) out.push(m3);
+    const srcs = resolveSourceOutputs(sid, ctx);
+    for (let i = 0; i < srcs.length; i++) {
+      const src = srcs[i];
+      const sfx = sourceSubSuffix(srcs.length, i);   // '' or '~idx'
+      const id1 = allocSubEntityId(f.id, `${sid}${sfx}@m1`);
+      const m1 = reflectEntity(src, c, axis1, id1, src.layer);
+      if (m1) out.push(m1);
+      if (f.variant === 'quarter') {
+        const id2 = allocSubEntityId(f.id, `${sid}${sfx}@m2`);
+        const m2 = reflectEntity(src, c, axis2, id2, src.layer);
+        if (m2) out.push(m2);
+        const id3 = allocSubEntityId(f.id, `${sid}${sfx}@m3`);
+        const m3 = rotateEntity(src, c, Math.PI, id3, src.layer);
+        if (m3) out.push(m3);
+      }
     }
   }
   return out;
@@ -1242,23 +1379,60 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
 }
 
 /**
+ * Resolve the live Entity outputs for a source feature id, used by the four
+ * copy-modifiers (mirror / crossMirror / array / rotate) when iterating their
+ * `sourceIds`. Most features produce a single Entity that lives in `ctx` under
+ * their fid — return `[ctx.get(sid)]`. Non-destructive modifiers (clip /
+ * fillet / chamfer) produce multiple outputs that are NOT individually keyed
+ * in ctx; we grab them from `cachedModifierOutputs` (populated by the earlier
+ * eval pass in `evaluateTimeline`). This is what lets a mirror of a filleted
+ * corner carry BOTH the trimmed lines AND the arc — not just the fillet's arc
+ * (which is all `ctx.get(filletFid)` returns).
+ */
+function resolveSourceOutputs(sid: string, ctx: EvalCtx): Entity[] {
+  const feat = state.features.find(f => f.id === sid);
+  if (feat && (feat.kind === 'fillet' || feat.kind === 'chamfer' || feat.kind === 'clip')) {
+    const cached = cachedModifierOutputs.get(sid);
+    if (cached && cached.length > 0) return cached;
+  }
+  const e = ctx.get(sid);
+  return e ? [e] : [];
+}
+
+/**
+ * Build the sub-key suffix for a multi-output source: `''` for simple
+ * single-output sources (preserves existing sub-key format and selection
+ * stability) and `~${idx}` for the idx-th output of a multi-output modifier
+ * (fillet / chamfer / clip). The tilde is chosen because no feature id
+ * contains it and no other sub-key separator uses it, so parsers can split
+ * unambiguously.
+ */
+function sourceSubSuffix(total: number, idx: number): string {
+  return total > 1 ? `~${idx}` : '';
+}
+
+/**
  * Evaluate a MirrorFeature into zero-or-more Entity outputs (one per source
- * feature that currently resolves in ctx). Sub-entity ids are stable across
- * re-evals so selection survives variable tweaks. The MirrorFeature itself
- * doesn't go into `ctx` — nothing references it as a point source.
+ * feature that currently resolves in ctx, or N per multi-output source like a
+ * fillet). Sub-entity ids are stable across re-evals so selection survives
+ * variable tweaks. The MirrorFeature itself doesn't go into `ctx` — nothing
+ * references it as a point source.
  */
 function buildMirrorEntities(f: MirrorFeature, ctx: EvalCtx): Entity[] {
   const ax = resolveMirrorAxis(f.axis, ctx);
   if (!ax) return [];
   const out: Entity[] = [];
   for (const sid of f.sourceIds) {
-    const src = ctx.get(sid);
-    if (!src) continue;
-    const id = allocSubEntityId(f.id, sid);
-    // Inherit each source's layer so colour/linestyle stay consistent with the
-    // original; the MirrorFeature's own `layer` field is only a hint for UI.
-    const mirrored = reflectEntity(src, ax.base, ax.dir, id, src.layer);
-    if (mirrored) out.push(mirrored);
+    const srcs = resolveSourceOutputs(sid, ctx);
+    for (let i = 0; i < srcs.length; i++) {
+      const src = srcs[i];
+      const subKey = `${sid}${sourceSubSuffix(srcs.length, i)}`;
+      const id = allocSubEntityId(f.id, subKey);
+      // Inherit each source's layer so colour/linestyle stay consistent with the
+      // original; the MirrorFeature's own `layer` field is only a hint for UI.
+      const mirrored = reflectEntity(src, ax.base, ax.dir, id, src.layer);
+      if (mirrored) out.push(mirrored);
+    }
   }
   return out;
 }
@@ -1296,6 +1470,7 @@ function featureReferencesAnyParam(f: Feature, changed: Set<string>): boolean {
     if (p.kind === 'polar') return eRefs(p.angle) || eRefs(p.distance) || pRefs(p.from);
     if (p.kind === 'rayHit') return eRefs(p.angle) || pRefs(p.from);
     if (p.kind === 'axisProject') return pRefs(p.xFrom) || pRefs(p.yFrom);
+    if (p.kind === 'interpolate') return eRefs(p.t) || pRefs(p.from) || pRefs(p.to);
     return false;
   };
   switch (f.kind) {
@@ -1419,8 +1594,15 @@ export function evaluateTimeline(opts?: {
         outputs = buildMirrorEntities(f, ctx);
         cachedModifierOutputs.set(f.id, outputs);
       }
+      // Register aliveSubKeys matching the exact keys buildMirrorEntities
+      // allocated. For single-output sources this is the legacy `${fid}#${sid}`;
+      // for multi-output modifier sources (fillet/chamfer/clip) we append
+      // `~idx` for each produced entity.
       for (const sid of f.sourceIds) {
-        if (ctx.has(sid)) aliveSubKeys.add(`${f.id}#${sid}`);
+        const n = resolveSourceOutputs(sid, ctx).length;
+        for (let i = 0; i < n; i++) {
+          aliveSubKeys.add(`${f.id}#${sid}${sourceSubSuffix(n, i)}`);
+        }
       }
       if (!f.hidden) for (const e of outputs) out.push(e);
       continue;
@@ -1439,11 +1621,15 @@ export function evaluateTimeline(opts?: {
       const nc = Math.max(1, Math.floor(evalExpr(f.cols)));
       const nr = f.mode === 'matrix' ? Math.max(1, Math.floor(evalExpr(f.rows))) : 1;
       for (const sid of f.sourceIds) {
-        if (!ctx.has(sid)) continue;
-        for (let j = 0; j < nr; j++) {
-          for (let i = 0; i < nc; i++) {
-            if (i === 0 && j === 0) continue;
-            aliveSubKeys.add(`${f.id}#${sid}|${i}|${j}`);
+        const n = resolveSourceOutputs(sid, ctx).length;
+        if (n === 0) continue;
+        for (let si = 0; si < n; si++) {
+          const sfx = sourceSubSuffix(n, si);
+          for (let j = 0; j < nr; j++) {
+            for (let i = 0; i < nc; i++) {
+              if (i === 0 && j === 0) continue;
+              aliveSubKeys.add(`${f.id}#${sid}${sfx}|${i}|${j}`);
+            }
           }
         }
       }
@@ -1459,7 +1645,10 @@ export function evaluateTimeline(opts?: {
         cachedModifierOutputs.set(f.id, outputs);
       }
       for (const sid of f.sourceIds) {
-        if (ctx.has(sid)) aliveSubKeys.add(`${f.id}#${sid}`);
+        const n = resolveSourceOutputs(sid, ctx).length;
+        for (let i = 0; i < n; i++) {
+          aliveSubKeys.add(`${f.id}#${sid}${sourceSubSuffix(n, i)}`);
+        }
       }
       if (!f.hidden) for (const e of outputs) out.push(e);
       continue;
@@ -1477,9 +1666,12 @@ export function evaluateTimeline(opts?: {
       // actually emitted — stale ids otherwise linger in `subEntityIds`.
       const variants = f.variant === 'quarter' ? ['m1', 'm2', 'm3'] : ['m1'];
       for (const sid of f.sourceIds) {
-        if (!ctx.has(sid)) continue;
-        for (const v of variants) {
-          aliveSubKeys.add(`${f.id}#${sid}@${v}`);
+        const n = resolveSourceOutputs(sid, ctx).length;
+        for (let i = 0; i < n; i++) {
+          const sfx = sourceSubSuffix(n, i);
+          for (const v of variants) {
+            aliveSubKeys.add(`${f.id}#${sid}${sfx}@${v}`);
+          }
         }
       }
       if (!f.hidden) for (const e of outputs) out.push(e);
@@ -1865,6 +2057,7 @@ function collectRefs(pt: PointRef): string[] {
   if (pt.kind === 'polar') return collectRefs(pt.from);
   if (pt.kind === 'rayHit') return [pt.target, ...collectRefs(pt.from)];
   if (pt.kind === 'axisProject') return [...collectRefs(pt.xFrom), ...collectRefs(pt.yFrom)];
+  if (pt.kind === 'interpolate') return [...collectRefs(pt.from), ...collectRefs(pt.to)];
   return [pt.feature];
 }
 
@@ -1971,6 +2164,9 @@ function ptLabel(pt: PointRef): string {
   }
   if (pt.kind === 'axisProject') {
     return `⊓(x:${ptLabel(pt.xFrom)}, y:${ptLabel(pt.yFrom)})`;
+  }
+  if (pt.kind === 'interpolate') {
+    return `${ptLabel(pt.from)}—${exprLabel(pt.t)}—${ptLabel(pt.to)}`;
   }
   return `${pt.kind}(${pt.feature.slice(0, 4)})`;
 }

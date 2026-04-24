@@ -99,7 +99,21 @@ export type PointRef =
    * `axisProject` / `polar` / `intersection` / etc. — `resolvePt` recurses
    * through whatever it's given.
    */
-  | { kind: 'axisProject'; xFrom: PointRef; yFrom: PointRef };
+  | { kind: 'axisProject'; xFrom: PointRef; yFrom: PointRef }
+  /**
+   * Linear interpolation between two reference points: `from + t·(to − from)`.
+   * `t = 0` collapses to `from`, `t = 1` to `to`, `0.5` is the midpoint, and
+   * so on. Used by the "Linie teilen" tool so the N division xlines stay
+   * evenly distributed along a line as its endpoints move with variable
+   * changes — a polar with a baked distance would keep the xlines parallel
+   * to the line but not redistribute them proportionally.
+   *
+   * Both `from` and `to` can themselves be any PointRef; the resolver just
+   * recurses. `t` is an Expr (not a raw number) so the user could in theory
+   * drive the split by a parameter — we don't currently expose that, but it
+   * costs nothing to support.
+   */
+  | { kind: 'interpolate'; from: PointRef; to: PointRef; t: Expr };
 
 // ────────────────────────────────────────────────────────────────────────────
 // Layers + styling
