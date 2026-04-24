@@ -320,7 +320,14 @@ function resolvePt(ref: PointRef, ctx: EvalCtx): Pt {
     case 'rayHit': {
       const base = resolvePt(ref.from, ctx);
       if (!Number.isFinite(base.x) || !Number.isFinite(base.y)) return { x: NaN, y: NaN };
-      const tgt = ctx.get(ref.target);
+      // Origin axes aren't real features, so short-circuit them the same way
+      // the `intersection` case does: synthesize an infinite xline through
+      // origin. Lets snap-to-axis with locked angle track the axis.
+      const tgt = (ref.target === AXIS_X_ID)
+        ? ({ id: -1, layer: 0, type: 'xline', x1: 0, y1: 0, dx: 1, dy: 0 } as XLineEntity)
+        : (ref.target === AXIS_Y_ID)
+          ? ({ id: -1, layer: 0, type: 'xline', x1: 0, y1: 0, dx: 0, dy: 1 } as XLineEntity)
+          : ctx.get(ref.target);
       if (!tgt) return { x: NaN, y: NaN };
       const seg = edgeSegmentOf(tgt, ref.edge);
       if (!seg) return { x: NaN, y: NaN };

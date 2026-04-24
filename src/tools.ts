@@ -318,16 +318,60 @@ function tryBuildIntersectionRayHit(
 ): { pt: Pt; ref: PointRef } | null {
   if (snap.type !== 'int') return null;
   if (snap.entityId == null || snap.entityId2 == null) return null;
-  // Skip axis sentinels (-1001 / -1002) — they're not real entities; rayHit
-  // target must be a real feature id.  For axis-intersection snaps we'd lose
-  // the parametric link to the axis side either way; polar fallback is fine.
-  const candEntIds: number[] = [];
-  if (snap.entityId > 0)  candEntIds.push(snap.entityId);
-  if (snap.entityId2 > 0) candEntIds.push(snap.entityId2);
-  if (candEntIds.length === 0) return null;
+
+  // Two kinds of candidates:
+  //   • Real entities (positive id) — rayHit against the feature.
+  //   • Origin axis sentinels (-1001 / -1002) — rayHit against the synthetic
+  //     axis xline (through origin, dx=1/dy=0 or dx=0/dy=1). The evaluator
+  //     short-circuits AXIS_X_ID / AXIS_Y_ID targets to the same xline, so
+  //     the resolved point stays on the locked ray AND on the axis.
+  //     This matches the user request: origin axes behave like xlines.
+  type Cand =
+    | { kind: 'real'; eid: number }
+    | { kind: 'axis'; axis: 'x' | 'y' };
+  const candidates: Cand[] = [];
+  const addCand = (eid: number) => {
+    if (eid === -1001) candidates.push({ kind: 'axis', axis: 'x' });
+    else if (eid === -1002) candidates.push({ kind: 'axis', axis: 'y' });
+    else if (eid > 0) candidates.push({ kind: 'real', eid });
+  };
+  addCand(snap.entityId);
+  addCand(snap.entityId2);
+  if (candidates.length === 0) return null;
+
+  // Fire the ray against an axis and intersect with the synthetic infinite
+  // xline through origin. Returns the hit point along the ray and its t.
+  const rayHitAxis = (axis: 'x' | 'y'): { pt: Pt; t: number } | null => {
+    // Axis edge is the x-axis (dy=0) or y-axis (dx=0). Solve ray × axis.
+    //   axis: y = 0 (for 'x') → t = -base.y / dir.y
+    //   axis: x = 0 (for 'y') → t = -base.x / dir.x
+    const t = axis === 'x'
+      ? (Math.abs(dir.y) < 1e-9 ? null : -base.y / dir.y)
+      : (Math.abs(dir.x) < 1e-9 ? null : -base.x / dir.x);
+    if (t === null) return null;
+    if (t < 1e-6) return null;          // behind the base or degenerate
+    return { pt: { x: base.x + t * dir.x, y: base.y + t * dir.y }, t };
+  };
 
   let best: { pt: Pt; ref: PointRef; t: number } | null = null;
-  for (const eid of candEntIds) {
+  for (const c of candidates) {
+    if (c.kind === 'axis') {
+      const h = rayHitAxis(c.axis);
+      if (!h) continue;
+      if (!best || h.t < best.t) {
+        best = {
+          pt: h.pt,
+          ref: {
+            kind: 'rayHit', from: fromRef, angle: numE(angleDeg),
+            target: c.axis === 'x' ? AXIS_X_ID : AXIS_Y_ID,
+            edge: { kind: 'lineSeg' },
+          },
+          t: h.t,
+        };
+      }
+      continue;
+    }
+    const eid = c.eid;
     const feat = featureForEntity(eid);
     if (!feat) continue;
     if (feat.kind === 'mirror' || feat.kind === 'array' ||
