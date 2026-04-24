@@ -298,6 +298,63 @@ function pickBestRectCornerEdge(base: Pt, dir: Pt, entityId: number, snapped: Pt
 }
 
 /**
+ * Angle-lock + intersection-snap: build a parametric `rayHit` PointRef by
+ * firing the locked ray against one of the two intersecting entities, whichever
+ * yields the closer hit along the ray. This preserves the typed angle (the
+ * endpoint stays on the ray) while giving the endpoint a live link to at
+ * least one of the two intersecting features — so changing a variable that
+ * moves that feature nudges the endpoint along the ray accordingly.
+ *
+ * Returns null for snaps that can't be upgraded: modifier outputs (not in
+ * resolve-ctx), non-line/xline entities (circles, arcs — no `lineSeg` support
+ * here), or when the ray doesn't cross either candidate's segment.
+ *
+ * Picks the smaller-t hit because that matches the old `lengthToSnapAxis`
+ * heuristic visually — users see the same endpoint position before/after the
+ * parametric upgrade.
+ */
+function tryBuildIntersectionRayHit(
+  base: Pt, dir: Pt, snap: SnapPoint, fromRef: PointRef, angleDeg: number,
+): { pt: Pt; ref: PointRef } | null {
+  if (snap.type !== 'int') return null;
+  if (snap.entityId == null || snap.entityId2 == null) return null;
+  // Skip axis sentinels (-1001 / -1002) — they're not real entities; rayHit
+  // target must be a real feature id.  For axis-intersection snaps we'd lose
+  // the parametric link to the axis side either way; polar fallback is fine.
+  const candEntIds: number[] = [];
+  if (snap.entityId > 0)  candEntIds.push(snap.entityId);
+  if (snap.entityId2 > 0) candEntIds.push(snap.entityId2);
+  if (candEntIds.length === 0) return null;
+
+  let best: { pt: Pt; ref: PointRef; t: number } | null = null;
+  for (const eid of candEntIds) {
+    const feat = featureForEntity(eid);
+    if (!feat) continue;
+    if (feat.kind === 'mirror' || feat.kind === 'array' ||
+        feat.kind === 'rotate' || feat.kind === 'crossMirror') continue;
+    const ent = state.entities.find(e => e.id === eid);
+    if (!ent) continue;
+    // Only line / xline support `lineSeg` edges for rayHit. Polyline would
+    // need a segment index we don't have at snap time; circles / arcs have
+    // no edge kind here. Skip those — they fall through to polar.
+    if (ent.type !== 'line' && ent.type !== 'xline') continue;
+    const edge: EdgeRef = { kind: 'lineSeg' };
+    const hit = rayEdgeIntersect(base, dir, eid, edge);
+    if (!hit) continue;
+    const t = dot(sub(hit, base), dir);
+    if (t < 1e-6) continue;
+    if (!best || t < best.t) {
+      best = {
+        pt: hit,
+        ref: { kind: 'rayHit', from: fromRef, angle: numE(angleDeg), target: feat.id, edge },
+        t,
+      };
+    }
+  }
+  return best ? { pt: best.pt, ref: best.ref } : null;
+}
+
+/**
  * Identify which `FeatureEdgeRef` on a cutter best describes the piece of edge
  * nearest `hitPt`. Used by trim / extend / extend-to to turn an "abs-coord
  * cut point" into a parametric `rayHit` PointRef so the cut end keeps tracking
@@ -2776,6 +2833,15 @@ function handleLineClick(p: Pt): void {
       const p1RefParam: PointRef = tc.p1Ref ?? { kind: 'abs', x: numE(tc.p1.x), y: numE(tc.p1.y) };
       const angleDegAbs = Math.atan2(tc.lockedDir.y, tc.lockedDir.x) * 180 / Math.PI;
 
+      // Three tiers, all preserve the locked ray:
+      //  1. snap has explicit `edge` (axis snap on xline, rect corner/mid) →
+      //     rayHit against snap.entityId.
+      //  2. snap is an intersection of two entities (no `edge`) → rayHit
+      //     against whichever of the two entities gives the closer hit along
+      //     the ray. Preserves angle-lock AND parametrically tracks that
+      //     entity (fixes the "intersection snap loses param link" bug).
+      //  3. no upgradeable feature ref → baked polar-from-p1 with length
+      //     derived from ray-vs-snap-axis (or raw cursor projection).
       const rayHit = (runtime.parametricMode && snap && snap.entityId != null && snap.edge)
         ? (() => {
             const feat = featureForEntity(snap.entityId!);
@@ -2804,57 +2870,44 @@ function handleLineClick(p: Pt): void {
             };
             return { pt: hit, ref };
           })()
-        : null;
+        : (runtime.parametricMode && snap)
+          ? tryBuildIntersectionRayHit(tc.p1!, tc.lockedDir!, snap, p1RefParam, angleDegAbs)
+          : null;
 
       if (rayHit) {
         endPt = rayHit.pt;
         endRef = rayHit.ref;
       } else {
-        // Before falling back to a baked polar distance, try to get a
-        // feature-backed ref from the snap (intersection, endpoint, mid,
-        // center). If one exists, use the exact snap position + that ref so
-        // the endpoint tracks the snapped feature when variables change.
-        // This is the fix for "type angle, click intersection/endpoint →
-        // parametric link broken": those snap types have no `edge` field so
-        // the rayHit path above is skipped, but snapToPointRef still returns
-        // a live ref for them.
-        const snapRef = (runtime.parametricMode && snap)
-          ? snapToPointRef(snap, { x: snap.x, y: snap.y }) : null;
-        if (snapRef && snapRef.kind !== 'abs') {
-          endPt  = { x: snap!.x, y: snap!.y };
-          endRef = snapRef;
+        let length: number;
+        if (snap) {
+          length = lengthToSnapAxis(tc.p1, tc.lockedDir, { x: snap.x, y: snap.y });
         } else {
-          let length: number;
-          if (snap) {
-            length = lengthToSnapAxis(tc.p1, tc.lockedDir, { x: snap.x, y: snap.y });
-          } else {
-            // Project the incoming click onto the locked direction. For mouse
-            // clicks `p` equals the cursor position, so this matches the old
-            // behaviour exactly; for cmdbar-driven clicks (useSnap=false, p =
-            // tc.p1 + dir*typedLength) the projection recovers the typed length
-            // instead of silently falling back to the cursor. Previously this
-            // path read `state.mouseWorld` directly, which caused the "typed 50,
-            // got cursor distance" bug after locking the angle.
-            const ap = sub(p, tc.p1);
-            length = dot(ap, tc.lockedDir);
-          }
-          if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
-          endPt = add(tc.p1, scale(tc.lockedDir, length));
-          // Store the endpoint parametrically as polar-from-p1 so that when p1Ref
-          // links to a feature (e.g. rect corner), the line swings rigidly with
-          // it when that feature's variables change — preserving the typed angle
-          // and length. Without this the endpoint would be flat abs coords and
-          // the line would break the instant p1's source moved.
-          // Free-draw mode: plain abs endpoint, no implicit link to p1.
-          endRef = runtime.parametricMode
-            ? {
-                kind: 'polar',
-                from: p1RefParam,
-                angle: numE(angleDegAbs),
-                distance: numE(length),
-              }
-            : { kind: 'abs', x: numE(endPt.x), y: numE(endPt.y) };
+          // Project the incoming click onto the locked direction. For mouse
+          // clicks `p` equals the cursor position, so this matches the old
+          // behaviour exactly; for cmdbar-driven clicks (useSnap=false, p =
+          // tc.p1 + dir*typedLength) the projection recovers the typed length
+          // instead of silently falling back to the cursor. Previously this
+          // path read `state.mouseWorld` directly, which caused the "typed 50,
+          // got cursor distance" bug after locking the angle.
+          const ap = sub(p, tc.p1);
+          length = dot(ap, tc.lockedDir);
         }
+        if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
+        endPt = add(tc.p1, scale(tc.lockedDir, length));
+        // Store the endpoint parametrically as polar-from-p1 so that when p1Ref
+        // links to a feature (e.g. rect corner), the line swings rigidly with
+        // it when that feature's variables change — preserving the typed angle
+        // and length. Without this the endpoint would be flat abs coords and
+        // the line would break the instant p1's source moved.
+        // Free-draw mode: plain abs endpoint, no implicit link to p1.
+        endRef = runtime.parametricMode
+          ? {
+              kind: 'polar',
+              from: p1RefParam,
+              angle: numE(angleDegAbs),
+              distance: numE(length),
+            }
+          : { kind: 'abs', x: numE(endPt.x), y: numE(endPt.y) };
       }
     } else {
       endPt = maybeOrtho(tc.p1, p);
@@ -2919,6 +2972,7 @@ export function handlePolylineClick(p: Pt): void {
     const snap = runtime.lastSnap;
     const angleDegAbs = Math.atan2(tc.lockedDir.y, tc.lockedDir.x) * 180 / Math.PI;
 
+    // Same three tiers as handleLineClick's angle-lock path.
     const rayHitResult = (runtime.parametricMode && snap && snap.entityId != null && snap.edge)
       ? (() => {
           const feat = featureForEntity(snap.entityId!);
@@ -2938,34 +2992,25 @@ export function handlePolylineClick(p: Pt): void {
           };
           return { pt: hit, ref: r };
         })()
-      : null;
+      : (runtime.parametricMode && snap)
+        ? tryBuildIntersectionRayHit(prevPt, tc.lockedDir!, snap, prevRef, angleDegAbs)
+        : null;
 
     if (rayHitResult) {
       pt  = rayHitResult.pt;
       ref = rayHitResult.ref;
     } else {
-      // Same fix as handleLineClick: try a feature-backed snap ref before
-      // falling back to a baked polar distance. Intersection and endpoint
-      // snaps have no `edge` so rayHit is skipped, but they do resolve via
-      // snapToPointRef → use the live ref so the vertex tracks the feature.
-      const snapRef = (runtime.parametricMode && snap)
-        ? snapToPointRef(snap, { x: snap.x, y: snap.y }) : null;
-      if (snapRef && snapRef.kind !== 'abs') {
-        pt  = { x: snap!.x, y: snap!.y };
-        ref = snapRef;
+      let length: number;
+      if (snap) {
+        length = lengthToSnapAxis(prevPt, tc.lockedDir, { x: snap.x, y: snap.y });
       } else {
-        let length: number;
-        if (snap) {
-          length = lengthToSnapAxis(prevPt, tc.lockedDir, { x: snap.x, y: snap.y });
-        } else {
-          length = dot(sub(p, prevPt), tc.lockedDir);
-        }
-        if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
-        pt = add(prevPt, scale(tc.lockedDir, length));
-        ref = runtime.parametricMode
-          ? { kind: 'polar', from: prevRef, angle: numE(angleDegAbs), distance: numE(length) }
-          : { kind: 'abs', x: numE(pt.x), y: numE(pt.y) };
+        length = dot(sub(p, prevPt), tc.lockedDir);
       }
+      if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
+      pt = add(prevPt, scale(tc.lockedDir, length));
+      ref = runtime.parametricMode
+        ? { kind: 'polar', from: prevRef, angle: numE(angleDegAbs), distance: numE(length) }
+        : { kind: 'abs', x: numE(pt.x), y: numE(pt.y) };
     }
   } else {
     // ── Free-direction path (original logic) ─────────────────────────────
