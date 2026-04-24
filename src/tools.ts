@@ -1,4 +1,4 @@
-import type { ArcEntity, CircleEntity, ClipSegment, CrossMirrorMode, EllipseEntity, Entity, EntityInit, EntityShape, Expr, Feature, FeatureEdgeRef, LineEntity, LineFeature, PointRef, Pt, RadiusMode, RectEntity, SnapPoint, ToolCtx, ToolId } from './types';
+import type { ArcEntity, CircleEntity, CrossMirrorMode, EllipseEntity, Entity, EntityInit, EntityShape, Expr, Feature, FeatureEdgeRef, LineEntity, LineFeature, PointRef, Pt, RadiusMode, RectEntity, SnapPoint, ToolCtx, ToolId } from './types';
 import { state, runtime, savePanelsLocked } from './state';
 import {
   add, dist, dot, len, norm, orthoSnap, perp, perpOffset, scale, sub,
@@ -14,7 +14,7 @@ import { evalExpr } from './params';
 import {
   addFeatureFromInit, AXIS_X_ID, AXIS_Y_ID, deleteFeatures, entityIdForFeature,
   evaluateTimeline, featureForEntity, featureFromEntityInit, modifierOutputInfo,
-  newFeatureId, replaceFeatureFromInit, resolveClipSubEntity,
+  newFeatureId, replaceFeatureFromInit,
 } from './features';
 import { showConfirm } from './modal';
 import { layoutText } from './textlayout';
@@ -6527,56 +6527,6 @@ function computeFillet(l1: LineEntity, click1: Pt, l2: LineEntity, click2: Pt, r
   return { newL1, newL2, arc, t1: T1, t2: T2 };
 }
 
-/**
- * Determine which endpoint of `line` is the "cut" (corner-adjacent) end given
- * the click position and the lines' mutual intersection P.
- * Returns 1 (x1,y1 is cut) or 2 (x2,y2 is cut) — matching FilletFeature /
- * ChamferFeature convention.
- */
-function pickLineCutEnd(line: LineEntity, clickPt: Pt, P: Pt): 1 | 2 {
-  const a = { x: line.x1, y: line.y1 };
-  const b = { x: line.x2, y: line.y2 };
-  const d = sub(clickPt, P);
-  // The kept endpoint is the one on the same side of P as the click.
-  const keptIsA = dot(sub(a, P), d) > dot(sub(b, P), d);
-  // If A (x1,y1) is kept → x2,y2 is cut → cut end = 2.
-  return keptIsA ? 2 : 1;
-}
-
-/**
- * Find an existing FilletFeature that references both `fid1` and `fid2` as
- * its source lines.  Used to detect "re-fillet" so we can update the radius
- * in-place instead of stacking a second FilletFeature.
- */
-function findExistingFilletFeature(
-  fid1: string, fid2: string,
-): Feature & { kind: 'fillet' } | null {
-  for (const f of state.features) {
-    if (f.kind !== 'fillet') continue;
-    if ((f.line1Id === fid1 && f.line2Id === fid2) ||
-        (f.line1Id === fid2 && f.line2Id === fid1)) {
-      return f;
-    }
-  }
-  return null;
-}
-
-/**
- * Find an existing ChamferFeature that references both `fid1` and `fid2`.
- */
-function findExistingChamferFeature(
-  fid1: string, fid2: string,
-): Feature & { kind: 'chamfer' } | null {
-  for (const f of state.features) {
-    if (f.kind !== 'chamfer') continue;
-    if ((f.line1Id === fid1 && f.line2Id === fid2) ||
-        (f.line1Id === fid2 && f.line2Id === fid1)) {
-      return f;
-    }
-  }
-  return null;
-}
-
 /** Rect → 4 line EntityInits (caller is responsible for feature wiring). */
 function explodeRect(r: RectEntity): EntityInit[] {
   const xl = Math.min(r.x1, r.x2), xr = Math.max(r.x1, r.x2);
@@ -6714,15 +6664,18 @@ function handleFilletClick(worldPt: Pt): void {
 export function applyFillet(radius: number): void {
   const tc = runtime.toolCtx;
   if (!tc || state.tool !== 'fillet') return;
-  const l1 = tc.entity1, c1 = tc.click1, l2 = tc.entity2, c2 = tc.click2;
-  if (!l1 || l1.type !== 'line' || !c1 || !l2 || l2.type !== 'line' || !c2) {
+  const origL1 = tc.entity1 as LineEntity | undefined;
+  const c1 = tc.click1 as Pt | undefined;
+  const origL2 = tc.entity2 as LineEntity | undefined;
+  const c2 = tc.click2 as Pt | undefined;
+  if (!origL1 || origL1.type !== 'line' || !c1 || !origL2 || origL2.type !== 'line' || !c2) {
     toast('Erst zwei Linien wählen');
     return;
   }
   if (radius <= 0) { toast('Radius muss > 0 sein'); return; }
 
-  const f1 = featureForEntity(l1.id);
-  const f2 = featureForEntity(l2.id);
+  const f1 = featureForEntity(origL1.id);
+  const f2 = featureForEntity(origL2.id);
   const resetPick = () => {
     runtime.toolCtx = { step: 'pick1' };
     state.selection.clear();
@@ -6731,65 +6684,53 @@ export function applyFillet(radius: number): void {
     render();
   };
 
-  // ── Case A: both sub-entities of the SAME FilletFeature → update radius ──
-  if (f1 && f2 && f1.id === f2.id && f1.kind === 'fillet') {
-    pushUndo();
-    f1.radius = radius;
-    lastFilletRadius = radius;
-    evaluateTimeline({ changedFeatures: [f1.id] });
-    updateStats();
+  if (!f1 || f1.kind !== 'line' || !f2 || f2.kind !== 'line') {
+    toast('Verrundung nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
     resetPick();
     return;
   }
 
-  // ── Case B: plain line features → create non-destructive FilletFeature ───
-  if (f1 && f1.kind === 'line' && f2 && f2.kind === 'line') {
-    // Check for an existing FilletFeature between these two source lines and
-    // delete it first so we don't stack a second one on top (re-fillet corner).
-    const existingFillet = findExistingFilletFeature(f1.id, f2.id);
-    if (existingFillet) {
-      // Validate geometry with the full source lines before committing.
-      const result = computeFillet(l1, c1, l2, c2, radius);
-      if ('error' in result) { toast(result.error); resetPick(); return; }
-      pushUndo();
-      // Delete old FilletFeature — deleteFeatures cascade will unhide sources.
-      deleteFeatures([existingFillet.id]);
-    } else {
-      const result = computeFillet(l1, c1, l2, c2, radius);
-      if ('error' in result) { toast(result.error); resetPick(); return; }
-      pushUndo();
-    }
+  // Detect an existing fillet arc so we can re-fillet with a new radius.
+  const existing = findExistingFilletBetween(origL1, origL2);
 
-    const P = lineIntersectionInfinite(l1, l2);
-    if (!P) { toast('Linien sind parallel'); return; }
-    const cut1End = pickLineCutEnd(l1, c1, P);
-    const cut2End = pickLineCutEnd(l2, c2, P);
-
-    lastFilletRadius = radius;
-    // Hide both source lines.
-    const srcF1 = state.features.find(f => f.id === f1.id);
-    const srcF2 = state.features.find(f => f.id === f2.id);
-    if (srcF1) srcF1.hidden = true;
-    if (srcF2) srcF2.hidden = true;
-    // Push FilletFeature — evaluator produces trimmed l1, l2, and arc.
-    state.features.push({
-      id: newFeatureId(),
-      kind: 'fillet',
-      layer: l1.layer,
-      line1Id: f1.id,
-      line2Id: f2.id,
-      cut1End,
-      cut2End,
-      radius,
-    } as Feature);
-    evaluateTimeline();
-    updateStats();
-    resetPick();
-    return;
+  // For geometry computation, extend already-trimmed lines back to their
+  // intersection P when re-filleting a corner.
+  let geomL1 = origL1, geomL2 = origL2;
+  if (existing) {
+    const P = lineIntersectionInfinite(origL1, origL2);
+    if (!P) { toast('Linien sind parallel'); resetPick(); return; }
+    geomL1 = extendLineEndTo(origL1, existing.l1TrimEnd, P);
+    geomL2 = extendLineEndTo(origL2, existing.l2TrimEnd, P);
   }
 
-  // ── Case C: unsupported configuration (sub-entity of a different modifier)
-  toast('Verrundung nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
+  const result = computeFillet(geomL1, c1, geomL2, c2, radius);
+  if ('error' in result) { toast(result.error); resetPick(); return; }
+
+  // Which feature-end (p1=0 / p2=1) is the "kept" end on each original line.
+  const keptEnd1 = keptEndOfLine(origL1, { x: result.newL1.x1, y: result.newL1.y1 });
+  const keptEnd2 = keptEndOfLine(origL2, { x: result.newL2.x1, y: result.newL2.y1 });
+
+  pushUndo();
+
+  // For re-fillet: remove the old arc before placing the new one.
+  if (existing) {
+    deleteFeatures([existing.arcFeatureId]);
+  }
+
+  // Destructively trim both lines in-place (move the cut endpoint to T1/T2).
+  if (!replaceLineEndPreservingRef(f1.id, keptEnd1, result.t1, origL1.layer)) {
+    replaceFeatureFromInit(f1.id, entityInit(result.newL1));
+  }
+  if (!replaceLineEndPreservingRef(f2.id, keptEnd2, result.t2, origL2.layer)) {
+    replaceFeatureFromInit(f2.id, entityInit(result.newL2));
+  }
+
+  // Add the fillet arc as a new first-class feature (snappable, selectable).
+  state.features.push(featureFromEntityInit(result.arc));
+
+  lastFilletRadius = radius;
+  evaluateTimeline();
+  updateStats();
   resetPick();
 }
 
@@ -6864,15 +6805,18 @@ function handleChamferClick(worldPt: Pt): void {
 export function applyChamfer(distance: number): void {
   const tc = runtime.toolCtx;
   if (!tc || state.tool !== 'chamfer') return;
-  const l1 = tc.entity1, c1 = tc.click1, l2 = tc.entity2, c2 = tc.click2;
-  if (!l1 || l1.type !== 'line' || !c1 || !l2 || l2.type !== 'line' || !c2) {
+  const origL1 = tc.entity1 as LineEntity | undefined;
+  const c1 = tc.click1 as Pt | undefined;
+  const origL2 = tc.entity2 as LineEntity | undefined;
+  const c2 = tc.click2 as Pt | undefined;
+  if (!origL1 || origL1.type !== 'line' || !c1 || !origL2 || origL2.type !== 'line' || !c2) {
     toast('Erst zwei Linien wählen');
     return;
   }
   if (distance <= 0) { toast('Abstand muss > 0 sein'); return; }
 
-  const f1 = featureForEntity(l1.id);
-  const f2 = featureForEntity(l2.id);
+  const f1 = featureForEntity(origL1.id);
+  const f2 = featureForEntity(origL2.id);
   const resetPick = () => {
     runtime.toolCtx = { step: 'pick1' };
     state.selection.clear();
@@ -6881,58 +6825,35 @@ export function applyChamfer(distance: number): void {
     render();
   };
 
-  // ── Case A: both sub-entities of the SAME ChamferFeature → update distance
-  if (f1 && f2 && f1.id === f2.id && f1.kind === 'chamfer') {
-    pushUndo();
-    f1.distance = distance;
-    lastChamferDist = distance;
-    evaluateTimeline({ changedFeatures: [f1.id] });
-    updateStats();
+  if (!f1 || f1.kind !== 'line' || !f2 || f2.kind !== 'line') {
+    toast('Fase nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
     resetPick();
     return;
   }
 
-  // ── Case B: plain line features → create non-destructive ChamferFeature ──
-  if (f1 && f1.kind === 'line' && f2 && f2.kind === 'line') {
-    const result = computeChamfer(l1, c1, l2, c2, distance);
-    if ('error' in result) { toast(result.error); resetPick(); return; }
+  const result = computeChamfer(origL1, c1, origL2, c2, distance);
+  if ('error' in result) { toast(result.error); resetPick(); return; }
 
-    const existingChamfer = findExistingChamferFeature(f1.id, f2.id);
-    if (existingChamfer) {
-      pushUndo();
-      deleteFeatures([existingChamfer.id]);
-    } else {
-      pushUndo();
-    }
+  // Which feature-end (p1=0 / p2=1) is the "kept" end on each line.
+  const keptEnd1 = keptEndOfLine(origL1, { x: result.newL1.x1, y: result.newL1.y1 });
+  const keptEnd2 = keptEndOfLine(origL2, { x: result.newL2.x1, y: result.newL2.y1 });
 
-    const P = lineIntersectionInfinite(l1, l2);
-    if (!P) { toast('Linien sind parallel'); return; }
-    const cut1End = pickLineCutEnd(l1, c1, P);
-    const cut2End = pickLineCutEnd(l2, c2, P);
+  pushUndo();
 
-    lastChamferDist = distance;
-    const srcF1 = state.features.find(f => f.id === f1.id);
-    const srcF2 = state.features.find(f => f.id === f2.id);
-    if (srcF1) srcF1.hidden = true;
-    if (srcF2) srcF2.hidden = true;
-    state.features.push({
-      id: newFeatureId(),
-      kind: 'chamfer',
-      layer: l1.layer,
-      line1Id: f1.id,
-      line2Id: f2.id,
-      cut1End,
-      cut2End,
-      distance,
-    } as Feature);
-    evaluateTimeline();
-    updateStats();
-    resetPick();
-    return;
+  // Destructively trim both lines in-place (move the cut endpoint to T1/T2).
+  if (!replaceLineEndPreservingRef(f1.id, keptEnd1, result.t1, origL1.layer)) {
+    replaceFeatureFromInit(f1.id, entityInit(result.newL1));
+  }
+  if (!replaceLineEndPreservingRef(f2.id, keptEnd2, result.t2, origL2.layer)) {
+    replaceFeatureFromInit(f2.id, entityInit(result.newL2));
   }
 
-  // ── Case C: unsupported
-  toast('Fase nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
+  // Add the chamfer line as a new first-class feature (snappable, selectable).
+  state.features.push(featureFromEntityInit(entityInit(result.cut)));
+
+  lastChamferDist = distance;
+  evaluateTimeline();
+  updateStats();
   resetPick();
 }
 
@@ -7679,82 +7600,6 @@ function trimCutterTs(target: LineEntity): { t: number; entityId: number }[] {
   return out;
 }
 
-/**
- * Re-trim one segment of an existing ClipFeature.
- * `hit` is the sub-entity line that was clicked (t values from
- * trimCutterTs are relative to hit's endpoints). We convert them back
- * to the original source-line t space and update the ClipFeature's
- * segments array non-destructively.
- */
-function handleRetrimClip(
-  hit: LineEntity,
-  clip: { id: string; sourceId: string; segments: ClipSegment[] },
-  segIdx: number,
-  worldPt: Pt,
-): void {
-  const seg = clip.segments[segIdx];
-  const a: Pt = { x: hit.x1, y: hit.y1 };
-  const b: Pt = { x: hit.x2, y: hit.y2 };
-  const abX = b.x - a.x, abY = b.y - a.y;
-  const L2 = abX * abX + abY * abY;
-  if (L2 < 1e-12) return;
-  const tClickSub = ((worldPt.x - a.x) * abX + (worldPt.y - a.y) * abY) / L2;
-
-  // Convert sub-entity t values to original-line t space.
-  const tRange = seg.tEnd - seg.tStart;
-  const tClickOrig = seg.tStart + tClickSub * tRange;
-
-  const cuttersSub = trimCutterTs(hit).filter(c => c.t > 1e-6 && c.t < 1 - 1e-6);
-  const cutters = cuttersSub.map(c => ({
-    t: seg.tStart + c.t * tRange,
-    entityId: c.entityId,
-  }));
-
-  let tLow = seg.tStart, tHigh = seg.tEnd;
-  let hasLow = false, hasHigh = false;
-  let cutterLow: { t: number; entityId: number } | null = null;
-  let cutterHigh: { t: number; entityId: number } | null = null;
-  for (const c of cutters) {
-    if (c.t < tClickOrig) {
-      if (!hasLow || c.t > tLow) { tLow = c.t; hasLow = true; cutterLow = c; }
-    } else {
-      if (!hasHigh || c.t < tHigh) { tHigh = c.t; hasHigh = true; cutterHigh = c; }
-    }
-  }
-
-  // Build the replacement segments for this slot.
-  const replacements: ClipSegment[] = [];
-  if (hasLow) {
-    const endCutterId = cutterLow ? (featureForEntity(cutterLow.entityId)?.id ?? null) : null;
-    replacements.push({ tStart: seg.tStart, tEnd: tLow, startCutterId: seg.startCutterId, endCutterId });
-  }
-  if (hasHigh) {
-    const startCutterId = cutterHigh ? (featureForEntity(cutterHigh.entityId)?.id ?? null) : null;
-    replacements.push({ tStart: tHigh, tEnd: seg.tEnd, startCutterId, endCutterId: seg.endCutterId });
-  }
-
-  const clipFeat = state.features.find(f => f.id === clip.id);
-  if (!clipFeat || clipFeat.kind !== 'clip') return;
-
-  pushUndo();
-  const newSegs = [
-    ...clipFeat.segments.slice(0, segIdx),
-    ...replacements,
-    ...clipFeat.segments.slice(segIdx + 1),
-  ];
-  if (newSegs.length === 0) {
-    // All segments gone — remove the ClipFeature (cascade will unhide source).
-    deleteFeatures([clip.id]);
-  } else {
-    clipFeat.segments = newSegs;
-    evaluateTimeline();
-  }
-  state.selection.delete(hit.id);
-  updateStats();
-  updateSelStatus();
-  render();
-}
-
 function handleTrimClick(worldPt: Pt): void {
   const hit = hitTest(worldPt);
   if (!hit) { toast('Nichts getroffen'); return; }
@@ -7762,20 +7607,9 @@ function handleTrimClick(worldPt: Pt): void {
   if (hit.type === 'arc')    { handleTrimArcClick(hit, worldPt); return; }
   if (hit.type !== 'line') { toast('Nur Linien, Kreise und Bögen können gestutzt werden'); return; }
 
-  // ── Re-trim an already-clipped segment ────────────────────────────────
-  const clipInfo = resolveClipSubEntity(hit.id);
-  if (clipInfo) {
-    handleRetrimClip(hit, clipInfo.feat, clipInfo.segIdx, worldPt);
-    return;
-  }
-
-  // ── Standard non-destructive trim for plain line features ─────────────
   const fid = featureForEntity(hit.id)?.id;
   if (!fid) return;
   const ownerFeat = featureForEntity(hit.id);
-  // If this entity is a sub-entity of a Mirror/Array/Rotate, fall through
-  // to the destructive path so we don't accidentally clip a copy that has
-  // no parametric meaning on its own.
   if (ownerFeat && ownerFeat.kind !== 'line') {
     toast('Stutzen von Kopien noch nicht unterstützt');
     return;
@@ -7814,48 +7648,88 @@ function handleTrimClick(worldPt: Pt): void {
     return;
   }
 
-  // Build surviving segments for the ClipFeature.
-  const segments: ClipSegment[] = [];
-  if (hasLow) {
-    const endCutterId = cutterLow ? (featureForEntity(cutterLow.entityId)?.id ?? null) : null;
-    segments.push({ tStart: 0, tEnd: tLow, startCutterId: null, endCutterId });
-  }
-  if (hasHigh) {
-    const startCutterId = cutterHigh ? (featureForEntity(cutterHigh.entityId)?.id ?? null) : null;
-    segments.push({ tStart: tHigh, tEnd: 1, startCutterId, endCutterId: null });
-  }
+  // Original PointRefs for parametric linking of the new cut endpoints.
+  const prevFeat = state.features.find(f => f.id === fid);
+  const p1Ref: PointRef = (prevFeat && prevFeat.kind === 'line')
+    ? prevFeat.p1 : { kind: 'abs', x: numE(a.x), y: numE(a.y) };
+  const p2Ref: PointRef = (prevFeat && prevFeat.kind === 'line')
+    ? prevFeat.p2 : { kind: 'abs', x: numE(b.x), y: numE(b.y) };
 
-  if (!segments.length) {
-    // Fully consumed between two flanking cutters.
+  if (hasLow && !hasHigh) {
+    // ── Endpoint trim: keep the p1 end, move p2 to the tLow cut point ─────
+    const cutPt: Pt = { x: a.x + tLow * abX, y: a.y + tLow * abY };
+    const cutterEnt = cutterLow
+      ? (state.entities.find(e => e.id === cutterLow!.entityId) ?? null) : null;
+    const targetFid = cutterEnt ? (featureForEntity(cutterEnt.id)?.id ?? null) : null;
+    const cutRef = (cutterEnt && targetFid)
+      ? buildRayHitCutOverride(p1Ref, a, cutPt, cutterEnt, targetFid) : null;
     pushUndo();
-    deleteFeatures([fid]);
+    replaceLineEndPreservingRef(fid, 0, cutPt, hit.layer, cutRef);
     state.selection.delete(hit.id);
     evaluateTimeline();
     updateStats();
     updateSelStatus();
-    toast('Linie entfernt');
     render();
-    return;
-  }
 
-  pushUndo();
-  // Hide the source feature so it stays in ctx (keeps PointRefs alive) but
-  // is no longer rendered or hit-testable.
-  const srcFeat = state.features.find(f => f.id === fid);
-  if (srcFeat) srcFeat.hidden = true;
-  // Emit the ClipFeature — evaluator will produce sub-entities for each segment.
-  state.features.push({
-    id: newFeatureId(),
-    kind: 'clip',
-    layer: hit.layer,
-    sourceId: fid,
-    segments,
-  } as Feature);
-  state.selection.delete(hit.id);
-  evaluateTimeline();
-  updateStats();
-  updateSelStatus();
-  render();
+  } else if (!hasLow && hasHigh) {
+    // ── Endpoint trim: keep the p2 end, move p1 to the tHigh cut point ────
+    const cutPt: Pt = { x: a.x + tHigh * abX, y: a.y + tHigh * abY };
+    const cutterEnt = cutterHigh
+      ? (state.entities.find(e => e.id === cutterHigh!.entityId) ?? null) : null;
+    const targetFid = cutterEnt ? (featureForEntity(cutterEnt.id)?.id ?? null) : null;
+    const cutRef = (cutterEnt && targetFid)
+      ? buildRayHitCutOverride(p2Ref, b, cutPt, cutterEnt, targetFid) : null;
+    pushUndo();
+    replaceLineEndPreservingRef(fid, 1, cutPt, hit.layer, cutRef);
+    state.selection.delete(hit.id);
+    evaluateTimeline();
+    updateStats();
+    updateSelStatus();
+    render();
+
+  } else {
+    // ── Middle trim: remove the clicked segment, keep two flanking pieces ──
+    const lowPt:  Pt = { x: a.x + tLow  * abX, y: a.y + tLow  * abY };
+    const highPt: Pt = { x: a.x + tHigh * abX, y: a.y + tHigh * abY };
+
+    const lowCutEnt  = cutterLow
+      ? (state.entities.find(e => e.id === cutterLow!.entityId)  ?? null) : null;
+    const highCutEnt = cutterHigh
+      ? (state.entities.find(e => e.id === cutterHigh!.entityId) ?? null) : null;
+    const lowTargetFid  = lowCutEnt  ? (featureForEntity(lowCutEnt.id)?.id  ?? null) : null;
+    const highTargetFid = highCutEnt ? (featureForEntity(highCutEnt.id)?.id ?? null) : null;
+
+    // rayHit ref for segment 1's cut end: ray from p1 toward lowPt.
+    const lowCutRef = (lowCutEnt && lowTargetFid)
+      ? buildRayHitCutOverride(p1Ref, a, lowPt, lowCutEnt, lowTargetFid) : null;
+    // rayHit ref for segment 2's cut end: ray from p2 toward highPt.
+    const highCutRef = (highCutEnt && highTargetFid)
+      ? buildRayHitCutOverride(p2Ref, b, highPt, highCutEnt, highTargetFid) : null;
+
+    pushUndo();
+
+    // Segment 1: p1 (kept) → lowPt (cut). Shorten the existing feature.
+    replaceLineEndPreservingRef(fid, 0, lowPt, hit.layer, lowCutRef);
+
+    // Segment 2: highPt (cut) → p2 (kept). New first-class line feature.
+    const useHighRef = !!highCutRef && runtime.parametricMode && highCutRef.kind !== 'abs';
+    const newP1: PointRef = useHighRef
+      ? highCutRef! : { kind: 'abs', x: numE(highPt.x), y: numE(highPt.y) };
+    const newFeat: LineFeature = {
+      id: newFeatureId(),
+      kind: 'line',
+      layer: hit.layer,
+      p1: newP1,
+      p2: p2Ref,
+    };
+    state.features.push(newFeat);
+
+    state.selection.delete(hit.id);
+    evaluateTimeline();
+    updateStats();
+    updateSelStatus();
+    render();
+  }
 }
 
 /**
