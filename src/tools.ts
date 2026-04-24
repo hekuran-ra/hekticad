@@ -2810,36 +2810,51 @@ function handleLineClick(p: Pt): void {
         endPt = rayHit.pt;
         endRef = rayHit.ref;
       } else {
-        let length: number;
-        if (snap) {
-          length = lengthToSnapAxis(tc.p1, tc.lockedDir, { x: snap.x, y: snap.y });
+        // Before falling back to a baked polar distance, try to get a
+        // feature-backed ref from the snap (intersection, endpoint, mid,
+        // center). If one exists, use the exact snap position + that ref so
+        // the endpoint tracks the snapped feature when variables change.
+        // This is the fix for "type angle, click intersection/endpoint →
+        // parametric link broken": those snap types have no `edge` field so
+        // the rayHit path above is skipped, but snapToPointRef still returns
+        // a live ref for them.
+        const snapRef = (runtime.parametricMode && snap)
+          ? snapToPointRef(snap, { x: snap.x, y: snap.y }) : null;
+        if (snapRef && snapRef.kind !== 'abs') {
+          endPt  = { x: snap!.x, y: snap!.y };
+          endRef = snapRef;
         } else {
-          // Project the incoming click onto the locked direction. For mouse
-          // clicks `p` equals the cursor position, so this matches the old
-          // behaviour exactly; for cmdbar-driven clicks (useSnap=false, p =
-          // tc.p1 + dir*typedLength) the projection recovers the typed length
-          // instead of silently falling back to the cursor. Previously this
-          // path read `state.mouseWorld` directly, which caused the "typed 50,
-          // got cursor distance" bug after locking the angle.
-          const ap = sub(p, tc.p1);
-          length = dot(ap, tc.lockedDir);
+          let length: number;
+          if (snap) {
+            length = lengthToSnapAxis(tc.p1, tc.lockedDir, { x: snap.x, y: snap.y });
+          } else {
+            // Project the incoming click onto the locked direction. For mouse
+            // clicks `p` equals the cursor position, so this matches the old
+            // behaviour exactly; for cmdbar-driven clicks (useSnap=false, p =
+            // tc.p1 + dir*typedLength) the projection recovers the typed length
+            // instead of silently falling back to the cursor. Previously this
+            // path read `state.mouseWorld` directly, which caused the "typed 50,
+            // got cursor distance" bug after locking the angle.
+            const ap = sub(p, tc.p1);
+            length = dot(ap, tc.lockedDir);
+          }
+          if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
+          endPt = add(tc.p1, scale(tc.lockedDir, length));
+          // Store the endpoint parametrically as polar-from-p1 so that when p1Ref
+          // links to a feature (e.g. rect corner), the line swings rigidly with
+          // it when that feature's variables change — preserving the typed angle
+          // and length. Without this the endpoint would be flat abs coords and
+          // the line would break the instant p1's source moved.
+          // Free-draw mode: plain abs endpoint, no implicit link to p1.
+          endRef = runtime.parametricMode
+            ? {
+                kind: 'polar',
+                from: p1RefParam,
+                angle: numE(angleDegAbs),
+                distance: numE(length),
+              }
+            : { kind: 'abs', x: numE(endPt.x), y: numE(endPt.y) };
         }
-        if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
-        endPt = add(tc.p1, scale(tc.lockedDir, length));
-        // Store the endpoint parametrically as polar-from-p1 so that when p1Ref
-        // links to a feature (e.g. rect corner), the line swings rigidly with
-        // it when that feature's variables change — preserving the typed angle
-        // and length. Without this the endpoint would be flat abs coords and
-        // the line would break the instant p1's source moved.
-        // Free-draw mode: plain abs endpoint, no implicit link to p1.
-        endRef = runtime.parametricMode
-          ? {
-              kind: 'polar',
-              from: p1RefParam,
-              angle: numE(angleDegAbs),
-              distance: numE(length),
-            }
-          : { kind: 'abs', x: numE(endPt.x), y: numE(endPt.y) };
       }
     } else {
       endPt = maybeOrtho(tc.p1, p);
@@ -2929,17 +2944,28 @@ export function handlePolylineClick(p: Pt): void {
       pt  = rayHitResult.pt;
       ref = rayHitResult.ref;
     } else {
-      let length: number;
-      if (snap) {
-        length = lengthToSnapAxis(prevPt, tc.lockedDir, { x: snap.x, y: snap.y });
+      // Same fix as handleLineClick: try a feature-backed snap ref before
+      // falling back to a baked polar distance. Intersection and endpoint
+      // snaps have no `edge` so rayHit is skipped, but they do resolve via
+      // snapToPointRef → use the live ref so the vertex tracks the feature.
+      const snapRef = (runtime.parametricMode && snap)
+        ? snapToPointRef(snap, { x: snap.x, y: snap.y }) : null;
+      if (snapRef && snapRef.kind !== 'abs') {
+        pt  = { x: snap!.x, y: snap!.y };
+        ref = snapRef;
       } else {
-        length = dot(sub(p, prevPt), tc.lockedDir);
+        let length: number;
+        if (snap) {
+          length = lengthToSnapAxis(prevPt, tc.lockedDir, { x: snap.x, y: snap.y });
+        } else {
+          length = dot(sub(p, prevPt), tc.lockedDir);
+        }
+        if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
+        pt = add(prevPt, scale(tc.lockedDir, length));
+        ref = runtime.parametricMode
+          ? { kind: 'polar', from: prevRef, angle: numE(angleDegAbs), distance: numE(length) }
+          : { kind: 'abs', x: numE(pt.x), y: numE(pt.y) };
       }
-      if (length < 1e-6) { toast('Klick auf die andere Seite oder Länge eintippen'); return; }
-      pt = add(prevPt, scale(tc.lockedDir, length));
-      ref = runtime.parametricMode
-        ? { kind: 'polar', from: prevRef, angle: numE(angleDegAbs), distance: numE(length) }
-        : { kind: 'abs', x: numE(pt.x), y: numE(pt.y) };
     }
   } else {
     // ── Free-direction path (original logic) ─────────────────────────────
@@ -4071,32 +4097,49 @@ function handleDivideXLineClick(worldPt: Pt): void {
 /**
  * Emit n-1 perpendicular xlines that divide the given line into n equal
  * segments. All emitted under a single undo step.
+ *
+ * Parametric anchor: each xline's base point is stored as a `polar` ref
+ * from the source line's p1 PointRef (same direction as the line, at
+ * distance i/n·L).  When the source line translates because a variable
+ * changes, every division xline follows automatically.  Rotation / scaling
+ * of the source line is not tracked (the angle and distance are baked in at
+ * creation time), but translation — the most common parametric change — is
+ * handled correctly.  Falls back to abs when the source line's feature or
+ * p1 ref is not accessible (e.g. sub-entity of a modifier).
  */
 function applyDivideXLine(l: LineEntity, n: number): void {
   if (!Number.isInteger(n) || n < 2 || n > 200) {
     toast('Anzahl 2-200'); return;
   }
-  // Persist the N used for this operation so the next activation defaults
-  // to it (matches fillet/chamfer's "remember last" behaviour).
   lastDivideCount = n;
   const dx = l.x2 - l.x1, dy = l.y2 - l.y1;
   const L = Math.hypot(dx, dy);
   if (L < 1e-9) { toast('Linie zu kurz'); return; }
   const ux = dx / L, uy = dy / L;
-  // Perpendicular direction for the xline — any non-colinear direction works
-  // (an xline extends both ways), so we just take the left-normal.
   const nx = -uy, ny = ux;
+  // Angle from p1 toward p2, in degrees — stored in the polar ref so the
+  // xline anchor stays on the correct point even after p1 translates.
+  const angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
+
+  // Retrieve the source line feature's p1 PointRef for parametric anchoring.
+  const lineFid = featureForEntity(l.id)?.id ?? null;
+  const lineFeat = lineFid ? state.features.find(f => f.id === lineFid) : null;
+  const p1Ref: PointRef | null = (lineFeat && lineFeat.kind === 'line') ? lineFeat.p1 : null;
+
   const layer = hilfslinieLayer();
   pushUndo();
   for (let i = 1; i < n; i++) {
     const t = i / n;
-    const px = l.x1 + dx * t;
-    const py = l.y1 + dy * t;
+    const segDist = t * L;
+    // Use a polar ref so the anchor tracks p1 when the source line moves.
+    const pRef: PointRef = (p1Ref && runtime.parametricMode)
+      ? { kind: 'polar', from: p1Ref, angle: numE(angleDeg), distance: numE(segDist) }
+      : { kind: 'abs', x: numE(l.x1 + dx * t), y: numE(l.y1 + dy * t) };
     state.features.push({
       id: newFeatureId(),
       kind: 'xline',
       layer,
-      p: { kind: 'abs', x: numE(px), y: numE(py) },
+      p: pRef,
       dx: numE(nx),
       dy: numE(ny),
     });
@@ -4120,6 +4163,13 @@ function applyDivideCircleXLines(c: CircleEntity, n: number): void {
   if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
   lastDivideCount = n;
   if (c.r < 1e-9) { toast('Kreis zu klein'); return; }
+
+  // Build a parametric center ref so the xlines track the circle when it moves.
+  const circleFid = featureForEntity(c.id)?.id ?? null;
+  const centerRef: PointRef = (circleFid && runtime.parametricMode)
+    ? { kind: 'center', feature: circleFid }
+    : { kind: 'abs', x: numE(c.cx), y: numE(c.cy) };
+
   const layer = hilfslinieLayer();
   pushUndo();
   for (let i = 0; i < n; i++) {
@@ -4131,7 +4181,7 @@ function applyDivideCircleXLines(c: CircleEntity, n: number): void {
       layer,
       // Anchor at the centre — the xline then points through the i-th division
       // point on the circumference along (dx, dy).
-      p: { kind: 'abs', x: numE(c.cx), y: numE(c.cy) },
+      p: centerRef,
       dx: numE(dx),
       dy: numE(dy),
     });
@@ -4157,6 +4207,13 @@ function applyDivideArcXLines(a: ArcEntity, n: number): void {
   let sweep = a.a2 - a.a1;
   while (sweep <= 0) sweep += Math.PI * 2;
   if (sweep > Math.PI * 2) sweep -= Math.PI * 2;
+
+  // Build a parametric center ref so the xlines track the arc when it moves.
+  const arcFid = featureForEntity(a.id)?.id ?? null;
+  const centerRef: PointRef = (arcFid && runtime.parametricMode)
+    ? { kind: 'center', feature: arcFid }
+    : { kind: 'abs', x: numE(a.cx), y: numE(a.cy) };
+
   const layer = hilfslinieLayer();
   pushUndo();
   for (let i = 1; i < n; i++) {
@@ -4167,7 +4224,7 @@ function applyDivideArcXLines(a: ArcEntity, n: number): void {
       id: newFeatureId(),
       kind: 'xline',
       layer,
-      p: { kind: 'abs', x: numE(a.cx), y: numE(a.cy) },
+      p: centerRef,
       dx: numE(dx),
       dy: numE(dy),
     });
@@ -4189,6 +4246,13 @@ function applyDivideEllipseXLines(e: EllipseEntity, n: number): void {
   lastDivideCount = n;
   if (e.rx < 1e-9 || e.ry < 1e-9) { toast('Ellipse zu klein'); return; }
   const cos = Math.cos(e.rot), sin = Math.sin(e.rot);
+
+  // Build a parametric center ref so the xlines track the ellipse when it moves.
+  const ellipseFid = featureForEntity(e.id)?.id ?? null;
+  const centerRef: PointRef = (ellipseFid && runtime.parametricMode)
+    ? { kind: 'center', feature: ellipseFid }
+    : { kind: 'abs', x: numE(e.cx), y: numE(e.cy) };
+
   const layer = hilfslinieLayer();
   pushUndo();
   for (let i = 0; i < n; i++) {
@@ -4205,7 +4269,7 @@ function applyDivideEllipseXLines(e: EllipseEntity, n: number): void {
       id: newFeatureId(),
       kind: 'xline',
       layer,
-      p: { kind: 'abs', x: numE(e.cx), y: numE(e.cy) },
+      p: centerRef,
       dx: numE(dx / L),
       dy: numE(dy / L),
     });
