@@ -622,12 +622,94 @@ export type CrossMirrorFeature = FeatureBase & {
   keepOriginal: true;
 };
 
+// ────────────────────────────────────────────────────────────────────────────
+// Non-destructive modifier features — Clip / Fillet / Chamfer
+//
+// These replace the old in-place rewrite approach (which lost PointRef bindings
+// on the source features). Instead:
+//   • The source feature(s) are marked `hidden` on commit so they stay in
+//     `evaluateTimeline`'s ctx — all downstream PointRefs (dims, connected
+//     lines, etc.) keep resolving.
+//   • The modifier re-computes and emits its visible sub-entities on every eval,
+//     so changes to variables automatically re-flow through the modifier.
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * One surviving piece of a clipped / trimmed source entity.
+ * `tStart`/`tEnd` ∈ [0, 1] along the source's natural parameterisation
+ * (line: p1→p2 distance; arc: fraction of CCW sweep from a1→a2).
+ * `startCutterId`/`endCutterId` record which cutter feature produced each
+ * boundary — reserved for future live re-intersection when the cutter moves;
+ * currently stored but not yet used in evaluation.
+ */
+export type ClipSegment = {
+  tStart: number;
+  tEnd:   number;
+  startCutterId: string | null;
+  endCutterId:   string | null;
+};
+
+/**
+ * Clip (trim) modifier — keeps zero-or-more segments of `sourceId` visible
+ * while the source itself is hidden in the timeline.
+ *
+ * Supports line, arc, and circle sources.  Circle sources are immediately
+ * promoted to arc semantics (tStart/tEnd as angle fractions on [0, 2π)) so
+ * a trimmed circle becomes an arc.
+ */
+export type ClipFeature = FeatureBase & {
+  kind: 'clip';
+  /** Feature id of the source entity being clipped. Hidden on commit. */
+  sourceId: string;
+  /** Surviving visible intervals. Empty = source fully clipped (invisible). */
+  segments: ClipSegment[];
+};
+
+/**
+ * Fillet modifier — rounds the corner where `line1Id` and `line2Id` meet.
+ * Both source lines are hidden on commit; the evaluator re-emits trimmed
+ * versions plus the connecting arc on every timeline pass so the corner
+ * re-flows when variables change (e.g. the lines grow or rotate).
+ *
+ * `cut1End` / `cut2End`: which endpoint of each line is the "cut" (trimmed)
+ * end — 1 = p1, 2 = p2.  The opposite end is the "kept" end and remains
+ * unchanged in the emitted copy.
+ */
+export type FilletFeature = FeatureBase & {
+  kind: 'fillet';
+  line1Id: string;
+  line2Id: string;
+  /** Which endpoint of line1 is the corner end (1 = p1, 2 = p2). */
+  cut1End: 1 | 2;
+  /** Which endpoint of line2 is the corner end (1 = p1, 2 = p2). */
+  cut2End: 1 | 2;
+  /** Fillet radius in world units. Stored as a plain number so future
+   *  variable-driven radius can be added without breaking old files. */
+  radius: number;
+};
+
+/**
+ * Chamfer modifier — bevels the corner where `line1Id` and `line2Id` meet.
+ * Identical semantics to `FilletFeature` except the connector is a straight
+ * cut line instead of an arc.
+ */
+export type ChamferFeature = FeatureBase & {
+  kind: 'chamfer';
+  line1Id: string;
+  line2Id: string;
+  cut1End: 1 | 2;
+  cut2End: 1 | 2;
+  /** Equal chamfer distance along each line from the intersection. */
+  distance: number;
+};
+
 export type Feature =
   | LineFeature | PolylineFeature | RectFeature | CircleFeature | ArcFeature
   | EllipseFeature | SplineFeature | XLineFeature | ParallelXLineFeature
   | AxisParallelXLineFeature
   | TextFeature | DimFeature | HatchFeature
-  | MirrorFeature | ArrayFeature | RotateFeature | CrossMirrorFeature;
+  | MirrorFeature | ArrayFeature | RotateFeature | CrossMirrorFeature
+  | ClipFeature | FilletFeature | ChamferFeature;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Tool identity + per-tool state

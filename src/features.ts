@@ -1,5 +1,6 @@
 import type {
-  ArrayFeature, CrossMirrorFeature, Entity, EntityInit, Expr, Feature, FeatureEdgeRef, LineEntity, MirrorAxis,
+  ArrayFeature, ChamferFeature, ClipFeature, CrossMirrorFeature,
+  Entity, EntityInit, Expr, Feature, FeatureEdgeRef, FilletFeature, LineEntity, MirrorAxis,
   MirrorFeature, PointRef, Pt, RotateFeature, XLineEntity,
 } from './types';
 import type { Grip } from './grips';
@@ -198,6 +199,17 @@ export function featureDependencies(f: Feature): Set<string> {
     case 'crossMirror':
       for (const sid of f.sourceIds) out.add(sid);
       collectRefTargets(f.center, out);
+      break;
+    case 'clip':
+      out.add(f.sourceId);
+      break;
+    case 'fillet':
+      out.add(f.line1Id);
+      out.add(f.line2Id);
+      break;
+    case 'chamfer':
+      out.add(f.line1Id);
+      out.add(f.line2Id);
       break;
   }
   return out;
@@ -491,6 +503,30 @@ export function modifierOutputInfo(
       return { modFid, sourceFid: parts[0], cell: { col, row } };
     }
     return { modFid, sourceFid: sub };
+  }
+  return null;
+}
+
+/**
+ * Resolve a sub-entity that belongs to a ClipFeature to its owning feature
+ * and segment index. Used by the trim tool to handle re-trimming an already-
+ * clipped segment without creating a nested ClipFeature.
+ *
+ * Returns null for entities that don't belong to a ClipFeature.
+ */
+export function resolveClipSubEntity(
+  entityId: number,
+): { feat: ClipFeature; segIdx: number } | null {
+  const modFid = entityToModifier.get(entityId);
+  if (!modFid) return null;
+  const feat = state.features.find(f => f.id === modFid);
+  if (!feat || feat.kind !== 'clip') return null;
+  const prefix = `${modFid}#seg`;
+  for (const [key, eid] of subEntityIds) {
+    if (eid !== entityId) continue;
+    if (!key.startsWith(prefix)) continue;
+    const n = parseInt(key.slice(prefix.length), 10);
+    if (!isNaN(n)) return { feat, segIdx: n };
   }
   return null;
 }
@@ -808,6 +844,236 @@ function buildCrossMirrorEntities(f: CrossMirrorFeature, ctx: EvalCtx): Entity[]
   return out;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Clip / Fillet / Chamfer modifier builders
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Interpolate a point along a line at parameter t ∈ [0,1]. */
+function lerpLine(e: LineEntity, t: number): Pt {
+  return { x: e.x1 + (e.x2 - e.x1) * t, y: e.y1 + (e.y2 - e.y1) * t };
+}
+
+/**
+ * Emit the surviving sub-entities of a ClipFeature.
+ * Each segment becomes one entity (line or arc piece); the entities share the
+ * same layer as the source.  Sub-entity ids are keyed `${clipFid}#seg${i}` for
+ * stability across re-evals.
+ */
+function buildClipEntities(f: ClipFeature, ctx: EvalCtx): Entity[] {
+  const src = ctx.get(f.sourceId);
+  if (!src) return [];
+  const out: Entity[] = [];
+
+  for (let i = 0; i < f.segments.length; i++) {
+    const seg = f.segments[i];
+    const id  = allocSubEntityId(f.id, `seg${i}`);
+
+    if (src.type === 'line') {
+      const p1 = lerpLine(src, seg.tStart);
+      const p2 = lerpLine(src, seg.tEnd);
+      out.push({ id, type: 'line', layer: src.layer, x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y });
+
+    } else if (src.type === 'arc') {
+      // t ∈ [0,1] mapped to angle fraction along CCW sweep (a1 → a2).
+      const twoPi = Math.PI * 2;
+      let sweep = src.a2 - src.a1;
+      while (sweep <= 0) sweep += twoPi;
+      if (sweep > twoPi) sweep -= twoPi;
+      const a1 = src.a1 + sweep * seg.tStart;
+      const a2 = src.a1 + sweep * seg.tEnd;
+      out.push({ id, type: 'arc', layer: src.layer,
+        cx: src.cx, cy: src.cy, r: src.r, a1, a2 });
+
+    } else if (src.type === 'circle') {
+      // Circle clipped → arc.  tStart/tEnd are angle fractions on [0, 2π).
+      const a1 = Math.PI * 2 * seg.tStart;
+      const a2 = Math.PI * 2 * seg.tEnd;
+      out.push({ id, type: 'arc', layer: src.layer,
+        cx: src.cx, cy: src.cy, r: src.r, a1, a2 });
+    }
+    // Other source types (rect, polyline, etc.) are not yet supported — skip.
+  }
+  return out;
+}
+
+/**
+ * Compute fillet geometry from two live line entities and a radius.
+ * Returns the trimmed endpoints + arc params, or null if impossible.
+ * Mirrors the logic in `computeFillet` in tools.ts but operates on
+ * LineEntity values directly (no click-side picking needed).
+ */
+function computeFilletGeometry(
+  l1: LineEntity, cut1End: 1 | 2,
+  l2: LineEntity, cut2End: 1 | 2,
+  radius: number,
+): { newL1End: Pt; newL2End: Pt; arc: { cx: number; cy: number; r: number; a1: number; a2: number } } | null {
+  // The "cut end" is the one near the corner; the opposite is "kept".
+  const kept1: Pt = cut1End === 1 ? { x: l1.x2, y: l1.y2 } : { x: l1.x1, y: l1.y1 };
+  const cut1:  Pt = cut1End === 1 ? { x: l1.x1, y: l1.y1 } : { x: l1.x2, y: l1.y2 };
+  const kept2: Pt = cut2End === 1 ? { x: l2.x2, y: l2.y2 } : { x: l2.x1, y: l2.y1 };
+  const cut2:  Pt = cut2End === 1 ? { x: l2.x1, y: l2.y1 } : { x: l2.x2, y: l2.y2 };
+
+  // Direction vectors from kept → cut (toward the corner).
+  const len1 = Math.hypot(cut1.x - kept1.x, cut1.y - kept1.y);
+  const len2 = Math.hypot(cut2.x - kept2.x, cut2.y - kept2.y);
+  if (len1 < 1e-9 || len2 < 1e-9) return null;
+  const u1: Pt = { x: (cut1.x - kept1.x) / len1, y: (cut1.y - kept1.y) / len1 };
+  const u2: Pt = { x: (cut2.x - kept2.x) / len2, y: (cut2.y - kept2.y) / len2 };
+
+  // Infinite intersection of the two lines.
+  const denom = u1.x * u2.y - u1.y * u2.x;
+  if (Math.abs(denom) < 1e-9) return null;   // parallel
+  const dx = kept2.x - kept1.x, dy = kept2.y - kept1.y;
+  const t1 = (dx * u2.y - dy * u2.x) / denom;
+  const P: Pt = { x: kept1.x + u1.x * t1, y: kept1.y + u1.y * t1 };
+
+  // Half-angle bisector → fillet centre.
+  const cosA = u1.x * (-u2.x) + u1.y * (-u2.y);
+  const angle = Math.acos(Math.max(-1, Math.min(1, cosA)));
+  if (angle < 1e-4 || angle > Math.PI - 1e-4) return null;
+  const tanHalf = Math.tan(angle / 2);
+  if (tanHalf < 1e-9) return null;
+  const d = radius / tanHalf;  // distance from P to each tangent point along each line
+
+  // Check the lines are long enough.
+  if (d > Math.hypot(P.x - kept1.x, P.y - kept1.y) + 1e-6) return null;
+  if (d > Math.hypot(P.x - kept2.x, P.y - kept2.y) + 1e-6) return null;
+
+  const T1: Pt = { x: P.x - u1.x * d, y: P.y - u1.y * d };  // tangent on l1
+  const T2: Pt = { x: P.x - u2.x * d, y: P.y - u2.y * d };  // tangent on l2
+
+  // Fillet centre: offset from P toward the bisector by radius/sin(angle/2).
+  const bis: Pt = { x: u1.x - u2.x, y: u1.y - u2.y };
+  const bisLen = Math.hypot(bis.x, bis.y);
+  if (bisLen < 1e-9) return null;
+  const bisN: Pt = { x: bis.x / bisLen, y: bis.y / bisLen };
+  const distCenter = radius / Math.sin(angle / 2);
+  const C: Pt = { x: P.x - bisN.x * distCenter, y: P.y - bisN.y * distCenter };
+
+  // Arc angles — from C to each tangent point, CCW.
+  let a1 = Math.atan2(T1.y - C.y, T1.x - C.x);
+  let a2 = Math.atan2(T2.y - C.y, T2.x - C.x);
+  // Ensure the arc sweeps CCW and stays under 180°.
+  let sweep = a2 - a1;
+  while (sweep < 0) sweep += Math.PI * 2;
+  if (sweep > Math.PI) { const tmp = a1; a1 = a2; a2 = tmp; }
+
+  return { newL1End: T1, newL2End: T2, arc: { cx: C.x, cy: C.y, r: radius, a1, a2 } };
+}
+
+/**
+ * Emit the three sub-entities of a FilletFeature (trimmed line1, trimmed
+ * line2, fillet arc).  Sub-entity keys: `l1`, `l2`, `arc`.
+ */
+function buildFilletEntities(f: FilletFeature, ctx: EvalCtx): Entity[] {
+  const src1 = ctx.get(f.line1Id);
+  const src2 = ctx.get(f.line2Id);
+  if (!src1 || src1.type !== 'line') return [];
+  if (!src2 || src2.type !== 'line') return [];
+
+  const geom = computeFilletGeometry(src1, f.cut1End, src2, f.cut2End, f.radius);
+  if (!geom) return [];
+
+  const idL1  = allocSubEntityId(f.id, 'l1');
+  const idL2  = allocSubEntityId(f.id, 'l2');
+  const idArc = allocSubEntityId(f.id, 'arc');
+
+  // Trimmed line1: kept end → tangent point.
+  const kept1: Pt = f.cut1End === 1 ? { x: src1.x2, y: src1.y2 } : { x: src1.x1, y: src1.y1 };
+  const l1: Entity = {
+    id: idL1, type: 'line', layer: src1.layer,
+    x1: kept1.x, y1: kept1.y,
+    x2: geom.newL1End.x, y2: geom.newL1End.y,
+  };
+
+  // Trimmed line2: kept end → tangent point.
+  const kept2: Pt = f.cut2End === 1 ? { x: src2.x2, y: src2.y2 } : { x: src2.x1, y: src2.y1 };
+  const l2: Entity = {
+    id: idL2, type: 'line', layer: src2.layer,
+    x1: kept2.x, y1: kept2.y,
+    x2: geom.newL2End.x, y2: geom.newL2End.y,
+  };
+
+  const arc: Entity = {
+    id: idArc, type: 'arc', layer: f.layer,
+    cx: geom.arc.cx, cy: geom.arc.cy, r: geom.arc.r,
+    a1: geom.arc.a1, a2: geom.arc.a2,
+  };
+
+  return [l1, l2, arc];
+}
+
+/**
+ * Compute chamfer geometry from two live line entities and a distance.
+ * Returns the trimmed endpoints + cut line endpoints, or null if impossible.
+ */
+function computeChamferGeometry(
+  l1: LineEntity, cut1End: 1 | 2,
+  l2: LineEntity, cut2End: 1 | 2,
+  distance: number,
+): { newL1End: Pt; newL2End: Pt } | null {
+  const kept1: Pt = cut1End === 1 ? { x: l1.x2, y: l1.y2 } : { x: l1.x1, y: l1.y1 };
+  const cut1:  Pt = cut1End === 1 ? { x: l1.x1, y: l1.y1 } : { x: l1.x2, y: l1.y2 };
+  const kept2: Pt = cut2End === 1 ? { x: l2.x2, y: l2.y2 } : { x: l2.x1, y: l2.y1 };
+  const cut2:  Pt = cut2End === 1 ? { x: l2.x1, y: l2.y1 } : { x: l2.x2, y: l2.y2 };
+
+  const len1 = Math.hypot(cut1.x - kept1.x, cut1.y - kept1.y);
+  const len2 = Math.hypot(cut2.x - kept2.x, cut2.y - kept2.y);
+  if (len1 < 1e-9 || len2 < 1e-9) return null;
+  const u1: Pt = { x: (cut1.x - kept1.x) / len1, y: (cut1.y - kept1.y) / len1 };
+  const u2: Pt = { x: (cut2.x - kept2.x) / len2, y: (cut2.y - kept2.y) / len2 };
+
+  // Infinite intersection.
+  const denom = u1.x * u2.y - u1.y * u2.x;
+  if (Math.abs(denom) < 1e-9) return null;
+  const dx = kept2.x - kept1.x, dy = kept2.y - kept1.y;
+  const t1val = (dx * u2.y - dy * u2.x) / denom;
+  const P: Pt = { x: kept1.x + u1.x * t1val, y: kept1.y + u1.y * t1val };
+
+  if (distance > Math.hypot(P.x - kept1.x, P.y - kept1.y) + 1e-6) return null;
+  if (distance > Math.hypot(P.x - kept2.x, P.y - kept2.y) + 1e-6) return null;
+
+  const T1: Pt = { x: P.x - u1.x * distance, y: P.y - u1.y * distance };
+  const T2: Pt = { x: P.x - u2.x * distance, y: P.y - u2.y * distance };
+  return { newL1End: T1, newL2End: T2 };
+}
+
+/**
+ * Emit the three sub-entities of a ChamferFeature (trimmed line1, trimmed
+ * line2, cut line).  Sub-entity keys: `l1`, `l2`, `cut`.
+ */
+function buildChamferEntities(f: ChamferFeature, ctx: EvalCtx): Entity[] {
+  const src1 = ctx.get(f.line1Id);
+  const src2 = ctx.get(f.line2Id);
+  if (!src1 || src1.type !== 'line') return [];
+  if (!src2 || src2.type !== 'line') return [];
+
+  const geom = computeChamferGeometry(src1, f.cut1End, src2, f.cut2End, f.distance);
+  if (!geom) return [];
+
+  const idL1  = allocSubEntityId(f.id, 'l1');
+  const idL2  = allocSubEntityId(f.id, 'l2');
+  const idCut = allocSubEntityId(f.id, 'cut');
+
+  const kept1: Pt = f.cut1End === 1 ? { x: src1.x2, y: src1.y2 } : { x: src1.x1, y: src1.y1 };
+  const kept2: Pt = f.cut2End === 1 ? { x: src2.x2, y: src2.y2 } : { x: src2.x1, y: src2.y1 };
+
+  const l1: Entity = {
+    id: idL1, type: 'line', layer: src1.layer,
+    x1: kept1.x, y1: kept1.y, x2: geom.newL1End.x, y2: geom.newL1End.y,
+  };
+  const l2: Entity = {
+    id: idL2, type: 'line', layer: src2.layer,
+    x1: kept2.x, y1: kept2.y, x2: geom.newL2End.x, y2: geom.newL2End.y,
+  };
+  const cut: Entity = {
+    id: idCut, type: 'line', layer: f.layer,
+    x1: geom.newL1End.x, y1: geom.newL1End.y,
+    x2: geom.newL2End.x, y2: geom.newL2End.y,
+  };
+  return [l1, l2, cut];
+}
+
 /**
  * Evaluate one feature. Returns the single entity it produces, or null if
  * the feature is ill-defined (e.g. parallelXLine referencing a deleted line).
@@ -944,6 +1210,10 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
     case 'array':
     case 'rotate':
     case 'crossMirror':
+    // Non-destructive modifiers handled via their own evaluateTimeline branch.
+    case 'clip':
+    case 'fillet':
+    case 'chamfer':
       return null;
   }
 }
@@ -1045,6 +1315,12 @@ function featureReferencesAnyParam(f: Feature, changed: Set<string>): boolean {
       return pRefs(f.center) || eRefs(f.angle);
     case 'crossMirror':
       return pRefs(f.center) || eRefs(f.angle);
+    // Clip/Fillet/Chamfer store numeric constants (radius, distance, t) and
+    // feature-id strings — no Exprs reference params directly.
+    case 'clip':
+    case 'fillet':
+    case 'chamfer':
+      return false;
   }
 }
 
@@ -1183,6 +1459,48 @@ export function evaluateTimeline(opts?: {
           aliveSubKeys.add(`${f.id}#${sid}@${v}`);
         }
       }
+      if (!f.hidden) for (const e of outputs) out.push(e);
+      continue;
+    }
+    if (f.kind === 'clip') {
+      let outputs: Entity[];
+      if (!isDirty && cachedModifierOutputs.has(f.id)) {
+        outputs = cachedModifierOutputs.get(f.id)!;
+      } else {
+        outputs = buildClipEntities(f, ctx);
+        cachedModifierOutputs.set(f.id, outputs);
+      }
+      for (let i = 0; i < f.segments.length; i++) {
+        aliveSubKeys.add(`${f.id}#seg${i}`);
+      }
+      if (!f.hidden) for (const e of outputs) out.push(e);
+      continue;
+    }
+    if (f.kind === 'fillet') {
+      let outputs: Entity[];
+      if (!isDirty && cachedModifierOutputs.has(f.id)) {
+        outputs = cachedModifierOutputs.get(f.id)!;
+      } else {
+        outputs = buildFilletEntities(f, ctx);
+        cachedModifierOutputs.set(f.id, outputs);
+      }
+      aliveSubKeys.add(`${f.id}#l1`);
+      aliveSubKeys.add(`${f.id}#l2`);
+      aliveSubKeys.add(`${f.id}#arc`);
+      if (!f.hidden) for (const e of outputs) out.push(e);
+      continue;
+    }
+    if (f.kind === 'chamfer') {
+      let outputs: Entity[];
+      if (!isDirty && cachedModifierOutputs.has(f.id)) {
+        outputs = cachedModifierOutputs.get(f.id)!;
+      } else {
+        outputs = buildChamferEntities(f, ctx);
+        cachedModifierOutputs.set(f.id, outputs);
+      }
+      aliveSubKeys.add(`${f.id}#l1`);
+      aliveSubKeys.add(`${f.id}#l2`);
+      aliveSubKeys.add(`${f.id}#cut`);
       if (!f.hidden) for (const e of outputs) out.push(e);
       continue;
     }
@@ -1400,6 +1718,35 @@ export function deleteFeatures(ids: Iterable<string>): { removed: number; hidden
     }
   }
 
+  // When a clip/fillet/chamfer modifier is killed, its hidden source(s) should
+  // be un-hidden again — they become the surviving geometry.
+  for (const id of kill) {
+    const f = state.features.find(x => x.id === id);
+    if (!f) continue;
+    if (f.kind === 'clip') {
+      const src = state.features.find(x => x.id === f.sourceId);
+      if (src && src.hidden) {
+        // Only un-hide if no other surviving clip still references the source.
+        const stillUsed = state.features.some(
+          x => x.id !== id && !kill.has(x.id) && x.kind === 'clip' && x.sourceId === f.sourceId
+        );
+        if (!stillUsed) src.hidden = false;
+      }
+    }
+    if (f.kind === 'fillet' || f.kind === 'chamfer') {
+      for (const srcId of [f.line1Id, f.line2Id]) {
+        const src = state.features.find(x => x.id === srcId);
+        if (!src || !src.hidden) continue;
+        const stillUsed = state.features.some(
+          x => x.id !== id && !kill.has(x.id) &&
+            (x.kind === 'fillet' || x.kind === 'chamfer') &&
+            (x.line1Id === srcId || x.line2Id === srcId)
+        );
+        if (!stillUsed) src.hidden = false;
+      }
+    }
+  }
+
   state.features = state.features.filter(f => !kill.has(f.id));
   evaluateTimeline();
 
@@ -1464,6 +1811,15 @@ function collectFeatureRefs(f: Feature): string[] {
       for (const sid of f.sourceIds) out.push(sid);
       out.push(...collectRefs(f.center));
       break;
+    case 'clip':
+      out.push(f.sourceId);
+      break;
+    case 'fillet':
+      out.push(f.line1Id, f.line2Id);
+      break;
+    case 'chamfer':
+      out.push(f.line1Id, f.line2Id);
+      break;
   }
   return out;
 }
@@ -1501,6 +1857,9 @@ export function featureLabel(f: Feature): string {
     case 'array':    return f.mode === 'matrix' ? 'Matrix-Kopie' : 'Reihenkopie';
     case 'rotate':   return 'Rotieren';
     case 'crossMirror': return f.variant === 'quarter' ? 'Symmetrie 1/4' : 'Symmetrie 1/2';
+    case 'clip':    return 'Trimmen';
+    case 'fillet':  return 'Verrundung';
+    case 'chamfer': return 'Fase';
   }
 }
 
@@ -1555,6 +1914,12 @@ export function featureDetail(f: Feature): string {
       }
       return `${n} × 1/4 · ${exprLabel(f.angle)}°`;
     }
+    case 'clip':
+      return `${f.segments.length} Seg. ← ${f.sourceId.slice(0, 4)}`;
+    case 'fillet':
+      return `r = ${f.radius.toFixed(2)} · ${f.line1Id.slice(0, 4)} × ${f.line2Id.slice(0, 4)}`;
+    case 'chamfer':
+      return `d = ${f.distance.toFixed(2)} · ${f.line1Id.slice(0, 4)} × ${f.line2Id.slice(0, 4)}`;
   }
 }
 
