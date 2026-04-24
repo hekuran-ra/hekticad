@@ -406,6 +406,11 @@ function centerOf(e: Entity): Pt {
 
 function midOf(e: Entity): Pt {
   if (e.type === 'line') return { x: (e.x1 + e.x2) / 2, y: (e.y1 + e.y2) / 2 };
+  if (e.type === 'arc') {
+    // Midpoint of arc = point at the halfway angle between a1 and a2.
+    const aMid = (e.a1 + e.a2) / 2;
+    return { x: e.cx + Math.cos(aMid) * e.r, y: e.cy + Math.sin(aMid) * e.r };
+  }
   return { x: NaN, y: NaN };
 }
 
@@ -982,7 +987,10 @@ function buildFilletEntities(f: FilletFeature, ctx: EvalCtx): Entity[] {
 
   const idL1  = allocSubEntityId(f.id, 'l1');
   const idL2  = allocSubEntityId(f.id, 'l2');
-  const idArc = allocSubEntityId(f.id, 'arc');
+  // Arc gets the FilletFeature's *primary* entity id so it appears in ctx and
+  // entityToFeature — making it a first-class, snappable feature rather than
+  // an anonymous sub-entity that lives only in entityToModifier.
+  const idArc = allocEntityId(f.id);
 
   // Trimmed line1: kept end → tangent point.
   const kept1: Pt = f.cut1End === 1 ? { x: src1.x2, y: src1.y2 } : { x: src1.x1, y: src1.y1 };
@@ -1059,7 +1067,9 @@ function buildChamferEntities(f: ChamferFeature, ctx: EvalCtx): Entity[] {
 
   const idL1  = allocSubEntityId(f.id, 'l1');
   const idL2  = allocSubEntityId(f.id, 'l2');
-  const idCut = allocSubEntityId(f.id, 'cut');
+  // Cut line gets the ChamferFeature's *primary* entity id — same rationale
+  // as the fillet arc: makes it snappable and reachable via ctx.
+  const idCut = allocEntityId(f.id);
 
   const kept1: Pt = f.cut1End === 1 ? { x: src1.x2, y: src1.y2 } : { x: src1.x1, y: src1.y1 };
   const kept2: Pt = f.cut2End === 1 ? { x: src2.x2, y: src2.y2 } : { x: src2.x1, y: src2.y1 };
@@ -1492,8 +1502,15 @@ export function evaluateTimeline(opts?: {
       }
       aliveSubKeys.add(`${f.id}#l1`);
       aliveSubKeys.add(`${f.id}#l2`);
-      aliveSubKeys.add(`${f.id}#arc`);
+      // Arc uses featureEntityIds (not subEntityIds), so no aliveSubKeys entry.
       if (!f.hidden) for (const e of outputs) out.push(e);
+      // Put the arc into ctx keyed by the FilletFeature id so downstream
+      // features can snap to it (endpoint / mid / center PointRefs resolve
+      // through ctx.get(filletFid) → arc entity).
+      const arcPrimaryId = featureEntityIds.get(f.id);
+      const arcEnt = arcPrimaryId !== undefined
+        ? (outputs.find(e => e.id === arcPrimaryId) ?? null) : null;
+      if (arcEnt) ctx.set(f.id, arcEnt);
       continue;
     }
     if (f.kind === 'chamfer') {
@@ -1506,8 +1523,13 @@ export function evaluateTimeline(opts?: {
       }
       aliveSubKeys.add(`${f.id}#l1`);
       aliveSubKeys.add(`${f.id}#l2`);
-      aliveSubKeys.add(`${f.id}#cut`);
+      // Cut line uses featureEntityIds (not subEntityIds).
       if (!f.hidden) for (const e of outputs) out.push(e);
+      // Same ctx registration for the chamfer line.
+      const cutPrimaryId = featureEntityIds.get(f.id);
+      const cutEnt = cutPrimaryId !== undefined
+        ? (outputs.find(e => e.id === cutPrimaryId) ?? null) : null;
+      if (cutEnt) ctx.set(f.id, cutEnt);
       continue;
     }
     let e: Entity | null;

@@ -6450,6 +6450,22 @@ function keptEndOfLine(old: LineEntity, keptPt: Pt): 0 | 1 {
   return d0 <= d1 ? 0 : 1;
 }
 
+/**
+ * Given a line, the user's click position, and the infinite-line intersection P,
+ * return which endpoint is the "cut" (corner-adjacent) end.
+ * Returns 1 (x1,y1 is the cut end) or 2 (x2,y2 is the cut end).
+ * The kept end is the one on the SAME side of P as the click.
+ */
+function pickLineCutEnd(line: LineEntity, clickPt: Pt, P: Pt): 1 | 2 {
+  const a = { x: line.x1, y: line.y1 };
+  const b = { x: line.x2, y: line.y2 };
+  const d = sub(clickPt, P);
+  // kept = the endpoint whose vector from P aligns most with d
+  const keptIsA = dot(sub(a, P), d) > dot(sub(b, P), d);
+  // If A (x1,y1) is kept → x2,y2 is cut → cutEnd = 2
+  return keptIsA ? 2 : 1;
+}
+
 let lastFilletRadius = 10;
 
 export function setFilletRadius(r: number): void { lastFilletRadius = r; }
@@ -6664,18 +6680,15 @@ function handleFilletClick(worldPt: Pt): void {
 export function applyFillet(radius: number): void {
   const tc = runtime.toolCtx;
   if (!tc || state.tool !== 'fillet') return;
-  const origL1 = tc.entity1 as LineEntity | undefined;
-  const c1 = tc.click1 as Pt | undefined;
-  const origL2 = tc.entity2 as LineEntity | undefined;
-  const c2 = tc.click2 as Pt | undefined;
-  if (!origL1 || origL1.type !== 'line' || !c1 || !origL2 || origL2.type !== 'line' || !c2) {
+  const l1 = tc.entity1, c1 = tc.click1, l2 = tc.entity2, c2 = tc.click2;
+  if (!l1 || l1.type !== 'line' || !c1 || !l2 || l2.type !== 'line' || !c2) {
     toast('Erst zwei Linien wählen');
     return;
   }
   if (radius <= 0) { toast('Radius muss > 0 sein'); return; }
 
-  const f1 = featureForEntity(origL1.id);
-  const f2 = featureForEntity(origL2.id);
+  const f1 = featureForEntity(l1.id);
+  const f2 = featureForEntity(l2.id);
   const resetPick = () => {
     runtime.toolCtx = { step: 'pick1' };
     state.selection.clear();
@@ -6684,53 +6697,56 @@ export function applyFillet(radius: number): void {
     render();
   };
 
-  if (!f1 || f1.kind !== 'line' || !f2 || f2.kind !== 'line') {
-    toast('Verrundung nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
+  // ── Case A: both entities belong to the SAME FilletFeature → update radius ─
+  if (f1 && f2 && f1.id === f2.id && f1.kind === 'fillet') {
+    pushUndo();
+    f1.radius = radius;
+    lastFilletRadius = radius;
+    evaluateTimeline({ changedFeatures: [f1.id] });
+    updateStats();
     resetPick();
     return;
   }
 
-  // Detect an existing fillet arc so we can re-fillet with a new radius.
-  const existing = findExistingFilletBetween(origL1, origL2);
+  // ── Case B: plain line features → non-destructive FilletFeature ───────────
+  // Source lines are hidden (they remain in ctx so PointRefs stay live) and
+  // the FilletFeature evaluator produces the trimmed lines + arc on every
+  // evaluateTimeline call — keeping everything parametric when variables change.
+  // The arc is registered as a first-class entity (featureEntityIds + ctx), so
+  // users can snap to its endpoints, midpoint, and center.
+  if (f1 && f1.kind === 'line' && f2 && f2.kind === 'line') {
+    const result = computeFillet(l1, c1, l2, c2, radius);
+    if ('error' in result) { toast(result.error); resetPick(); return; }
 
-  // For geometry computation, extend already-trimmed lines back to their
-  // intersection P when re-filleting a corner.
-  let geomL1 = origL1, geomL2 = origL2;
-  if (existing) {
-    const P = lineIntersectionInfinite(origL1, origL2);
+    const P = lineIntersectionInfinite(l1, l2);
     if (!P) { toast('Linien sind parallel'); resetPick(); return; }
-    geomL1 = extendLineEndTo(origL1, existing.l1TrimEnd, P);
-    geomL2 = extendLineEndTo(origL2, existing.l2TrimEnd, P);
+    const cut1End = pickLineCutEnd(l1, c1, P);
+    const cut2End = pickLineCutEnd(l2, c2, P);
+
+    pushUndo();
+    lastFilletRadius = radius;
+    const srcF1 = state.features.find(f => f.id === f1.id);
+    const srcF2 = state.features.find(f => f.id === f2.id);
+    if (srcF1) srcF1.hidden = true;
+    if (srcF2) srcF2.hidden = true;
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'fillet',
+      layer: l1.layer,
+      line1Id: f1.id,
+      line2Id: f2.id,
+      cut1End,
+      cut2End,
+      radius,
+    } as Feature);
+    evaluateTimeline();
+    updateStats();
+    resetPick();
+    return;
   }
 
-  const result = computeFillet(geomL1, c1, geomL2, c2, radius);
-  if ('error' in result) { toast(result.error); resetPick(); return; }
-
-  // Which feature-end (p1=0 / p2=1) is the "kept" end on each original line.
-  const keptEnd1 = keptEndOfLine(origL1, { x: result.newL1.x1, y: result.newL1.y1 });
-  const keptEnd2 = keptEndOfLine(origL2, { x: result.newL2.x1, y: result.newL2.y1 });
-
-  pushUndo();
-
-  // For re-fillet: remove the old arc before placing the new one.
-  if (existing) {
-    deleteFeatures([existing.arcFeatureId]);
-  }
-
-  // Destructively trim both lines in-place (move the cut endpoint to T1/T2).
-  if (!replaceLineEndPreservingRef(f1.id, keptEnd1, result.t1, origL1.layer)) {
-    replaceFeatureFromInit(f1.id, entityInit(result.newL1));
-  }
-  if (!replaceLineEndPreservingRef(f2.id, keptEnd2, result.t2, origL2.layer)) {
-    replaceFeatureFromInit(f2.id, entityInit(result.newL2));
-  }
-
-  // Add the fillet arc as a new first-class feature (snappable, selectable).
-  state.features.push(featureFromEntityInit(result.arc));
-
-  lastFilletRadius = radius;
-  evaluateTimeline();
-  updateStats();
+  // ── Case C: unsupported configuration
+  toast('Verrundung nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
   resetPick();
 }
 
@@ -6805,18 +6821,15 @@ function handleChamferClick(worldPt: Pt): void {
 export function applyChamfer(distance: number): void {
   const tc = runtime.toolCtx;
   if (!tc || state.tool !== 'chamfer') return;
-  const origL1 = tc.entity1 as LineEntity | undefined;
-  const c1 = tc.click1 as Pt | undefined;
-  const origL2 = tc.entity2 as LineEntity | undefined;
-  const c2 = tc.click2 as Pt | undefined;
-  if (!origL1 || origL1.type !== 'line' || !c1 || !origL2 || origL2.type !== 'line' || !c2) {
+  const l1 = tc.entity1, c1 = tc.click1, l2 = tc.entity2, c2 = tc.click2;
+  if (!l1 || l1.type !== 'line' || !c1 || !l2 || l2.type !== 'line' || !c2) {
     toast('Erst zwei Linien wählen');
     return;
   }
   if (distance <= 0) { toast('Abstand muss > 0 sein'); return; }
 
-  const f1 = featureForEntity(origL1.id);
-  const f2 = featureForEntity(origL2.id);
+  const f1 = featureForEntity(l1.id);
+  const f2 = featureForEntity(l2.id);
   const resetPick = () => {
     runtime.toolCtx = { step: 'pick1' };
     state.selection.clear();
@@ -6825,35 +6838,51 @@ export function applyChamfer(distance: number): void {
     render();
   };
 
-  if (!f1 || f1.kind !== 'line' || !f2 || f2.kind !== 'line') {
-    toast('Fase nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
+  // ── Case A: both entities belong to the SAME ChamferFeature → update dist ─
+  if (f1 && f2 && f1.id === f2.id && f1.kind === 'chamfer') {
+    pushUndo();
+    f1.distance = distance;
+    lastChamferDist = distance;
+    evaluateTimeline({ changedFeatures: [f1.id] });
+    updateStats();
     resetPick();
     return;
   }
 
-  const result = computeChamfer(origL1, c1, origL2, c2, distance);
-  if ('error' in result) { toast(result.error); resetPick(); return; }
+  // ── Case B: plain line features → non-destructive ChamferFeature ──────────
+  if (f1 && f1.kind === 'line' && f2 && f2.kind === 'line') {
+    const result = computeChamfer(l1, c1, l2, c2, distance);
+    if ('error' in result) { toast(result.error); resetPick(); return; }
 
-  // Which feature-end (p1=0 / p2=1) is the "kept" end on each line.
-  const keptEnd1 = keptEndOfLine(origL1, { x: result.newL1.x1, y: result.newL1.y1 });
-  const keptEnd2 = keptEndOfLine(origL2, { x: result.newL2.x1, y: result.newL2.y1 });
+    const P = lineIntersectionInfinite(l1, l2);
+    if (!P) { toast('Linien sind parallel'); resetPick(); return; }
+    const cut1End = pickLineCutEnd(l1, c1, P);
+    const cut2End = pickLineCutEnd(l2, c2, P);
 
-  pushUndo();
-
-  // Destructively trim both lines in-place (move the cut endpoint to T1/T2).
-  if (!replaceLineEndPreservingRef(f1.id, keptEnd1, result.t1, origL1.layer)) {
-    replaceFeatureFromInit(f1.id, entityInit(result.newL1));
+    pushUndo();
+    lastChamferDist = distance;
+    const srcF1 = state.features.find(f => f.id === f1.id);
+    const srcF2 = state.features.find(f => f.id === f2.id);
+    if (srcF1) srcF1.hidden = true;
+    if (srcF2) srcF2.hidden = true;
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'chamfer',
+      layer: l1.layer,
+      line1Id: f1.id,
+      line2Id: f2.id,
+      cut1End,
+      cut2End,
+      distance,
+    } as Feature);
+    evaluateTimeline();
+    updateStats();
+    resetPick();
+    return;
   }
-  if (!replaceLineEndPreservingRef(f2.id, keptEnd2, result.t2, origL2.layer)) {
-    replaceFeatureFromInit(f2.id, entityInit(result.newL2));
-  }
 
-  // Add the chamfer line as a new first-class feature (snappable, selectable).
-  state.features.push(featureFromEntityInit(entityInit(result.cut)));
-
-  lastChamferDist = distance;
-  evaluateTimeline();
-  updateStats();
+  // ── Case C: unsupported
+  toast('Fase nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
   resetPick();
 }
 
