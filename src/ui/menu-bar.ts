@@ -21,7 +21,7 @@
  */
 
 import { state } from '../state';
-import { clearAll, loadJson, saveJson } from '../io';
+import { clearAll, importDrawing, loadJson, saveJson } from '../io';
 import { showExportDialog } from './export-dialog';
 import { showCompanySettings } from './company-settings';
 import { showDimStyleDialog } from './dim-style-dialog';
@@ -132,14 +132,21 @@ function toolShortcutLabel(toolId: string): string {
   return getShortcutKey(String(def.id), def.key);
 }
 
-// Stub — wired up when the import dialog lands in a later phase. Until then,
-// the menu item and header button both call this and show a placeholder toast.
-function showImportDialogStub(): void {
-  toast('Import-Dialog kommt in einer späteren Phase');
-}
-
+/**
+ * Open the platform file picker to import a DXF / SVG / PDF / EPS / HCAD
+ * file. Format is detected from the extension; everything is brought in at
+ * 1:1 scale, absolute coordinates, source-file layers preserved (mapped onto
+ * existing layers by name where possible). HCAD files are merged additively
+ * — features + parameters from the second file are appended with remapped
+ * IDs so they coexist with whatever the user already has open.
+ *
+ * Kept named `showImportDialog` for back-compat with the menu wiring; the
+ * "dialog" is now the OS file picker itself, since the import flow has no
+ * extra options to configure (the user explicitly requested the simplest
+ * possible flow — `abs ist okay`).
+ */
 export function showImportDialog(): void {
-  showImportDialogStub();
+  void importDrawing();
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -154,7 +161,7 @@ const MENUS: Record<MenuId, { label: string; entries: MenuEntry[] }> = {
       { id: 'file:open',     label: 'Öffnen…',      shortcut: '',             action: () => { void loadJson(); } },
       { id: 'file:save',     label: 'Speichern',    shortcut: 'Strg+S',       action: () => saveJson() },
       'separator',
-      { id: 'file:import',   label: 'Importieren…', shortcut: 'Strg+Shift+I', action: () => showImportDialogStub() },
+      { id: 'file:import',   label: 'Importieren…', shortcut: 'Strg+Shift+I', action: () => showImportDialog() },
       { id: 'file:export',   label: 'Exportieren…', shortcut: 'Strg+Shift+E', action: () => { void showExportDialog(); } },
       'separator',
       { id: 'file:clear',    label: 'Alles löschen',                          action: () => { void clearAll(); } },

@@ -916,13 +916,30 @@ export type ExportOptions =
   | { format: 'eps'; filename?: string }
   | { format: 'svg'; filename?: string };
 
+/** Supported import sources. `hcad` merges another HektikCad file into the
+ *  current drawing (additive), preserving its features + parameters; the others
+ *  are flat-geometry imports that produce features with abs PointRefs. */
+export type ImportFormat = 'dxf' | 'svg' | 'pdf' | 'eps' | 'hcad';
+
 /**
- * Result returned by every import parser. `skipped` counts entities the
- * parser recognised but chose not to import (text, hatches, splines in
- * phase 1, etc.) — shown to the user as a toast.
+ * Result returned by every flat-geometry import parser (DXF / SVG / PDF / EPS).
+ * `entities` carry layer indices that point into the parser-local `layers`
+ * array — the import dispatcher remaps those indices to `state.layers`,
+ * creating any source layers that don't already exist by name.
+ *
+ * `skipped` counts entities the parser recognised but chose not to import
+ * (TEXT in early phases, HATCH, SPLINE, INSERT, etc.) — shown to the user as
+ * a toast so they know what's missing.
+ *
+ * The HCAD-merge flow doesn't go through this type — it operates directly on
+ * features + parameters and is dispatched separately in `importDrawing`.
  */
 export type ImportResult = {
   entities: EntityInit[];
+  /** Source layers, in the order the parser encountered them. Entity `layer`
+   *  indices reference this array — the dispatcher maps them onto the live
+   *  state layers (find-by-name or create new). */
+  layers: Layer[];
   /** Per-category skip counters. Any key with count > 0 surfaces in the toast. */
   skipped: {
     text?: number;
@@ -934,5 +951,5 @@ export type ImportResult = {
   /** Source filename (for the confirmation toast). */
   filename: string;
   /** Detected source format — lets the toast say "DXF" vs "EPS" vs "PDF". */
-  format: Exclude<ExportFormat, 'svg'>;
+  format: Exclude<ImportFormat, 'hcad'>;
 };

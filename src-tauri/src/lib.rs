@@ -89,6 +89,18 @@ async fn read_file_text(path: String) -> Result<String, String> {
     .map_err(|e| format!("Datei lesen fehlgeschlagen: {e}"))
 }
 
+/// Read raw bytes of a file. Mirrors `read_file_text` but for binary formats
+/// (PDF, future image formats) the import flow needs whole-file access for.
+/// Returns the bytes as `Vec<u8>` which Tauri marshals to the frontend as a
+/// JS array — the caller wraps it in `Uint8Array` to get a typed buffer.
+#[tauri::command]
+async fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
+  tauri::async_runtime::spawn_blocking(move || std::fs::read(&path))
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("Datei lesen fehlgeschlagen: {e}"))
+}
+
 /// Direct write to an already-known path — used by the frontend's Ctrl+S
 /// fast path when the drawing already has a bound file (previously opened
 /// or previously saved-as). Skips the Save-As dialog so successive saves
@@ -190,6 +202,7 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       save_bytes_dialog,
       read_file_text,
+      read_file_bytes,
       write_file_bytes,
       get_pending_opens,
       menu::set_menu_check
