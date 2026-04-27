@@ -315,6 +315,84 @@ export function createParameter(name: string, value: number, meaning?: string): 
   return p;
 }
 
+/**
+ * Reorder + re-evaluate `state.parameters` in topological order so that any
+ * parameter whose `formula` references other parameters reads their freshly
+ * recomputed values. Idempotent and cheap (parameter count is small).
+ *
+ * Cycle handling: if a cycle exists (A.formula references B and B.formula
+ * references A), the cycle members keep their last cached `value` and the
+ * cycle is logged to the console via `console.warn`. This matches how
+ * `topoSortFeatures` handles feature cycles — the system stays alive but the
+ * computed values may be stale until the user breaks the cycle.
+ *
+ * Called from `evaluateTimeline` (in features.ts) so feature evaluation
+ * always sees fresh parameter values, and from the param-edit UI after a
+ * value or formula change so the panel reflects new computed values
+ * immediately.
+ */
+export function recomputeParameters(): void {
+  const params = state.parameters;
+  if (params.length === 0) return;
+  const indexById = new Map<string, number>();
+  for (let i = 0; i < params.length; i++) indexById.set(params[i].id, i);
+
+  // Build dependency edges: param i depends on every param id its formula
+  // references (via `refs` for formulas, `id` for direct param refs).
+  const deps: Set<number>[] = params.map(() => new Set());
+  for (let i = 0; i < params.length; i++) {
+    const f = params[i].formula;
+    if (!f) continue;
+    if (f.kind === 'param') {
+      const di = indexById.get(f.id);
+      if (di != null && di !== i) deps[i].add(di);
+    } else if (f.kind === 'formula') {
+      for (const refId of f.refs) {
+        const di = indexById.get(refId);
+        if (di != null && di !== i) deps[i].add(di);
+      }
+    }
+  }
+
+  // Kahn's topo sort.
+  const indeg = params.map((_, i) => deps[i].size);
+  const ready: number[] = [];
+  for (let i = 0; i < params.length; i++) if (indeg[i] === 0) ready.push(i);
+  const dependents: number[][] = params.map(() => []);
+  for (let i = 0; i < params.length; i++) for (const d of deps[i]) dependents[d].push(i);
+
+  const order: number[] = [];
+  while (ready.length) {
+    let minPos = 0;
+    for (let k = 1; k < ready.length; k++) if (ready[k] < ready[minPos]) minPos = k;
+    const idx = ready.splice(minPos, 1)[0];
+    order.push(idx);
+    for (const dep of dependents[idx]) {
+      indeg[dep]--;
+      if (indeg[dep] === 0) ready.push(dep);
+    }
+  }
+
+  if (order.length !== params.length) {
+    const stuckNames: string[] = [];
+    for (let i = 0; i < params.length; i++) if (indeg[i] > 0) stuckNames.push(params[i].name);
+    console.warn('[recomputeParameters] cycle detected — stuck:', stuckNames);
+    // Don't return — still evaluate the parameters that aren't part of the
+    // cycle. Stuck params keep their cached `value`.
+    for (let i = 0; i < params.length; i++) if (!order.includes(i)) order.push(i);
+  }
+
+  // Evaluate in topo order. Skip params whose formula resolves to NaN —
+  // keep the cached value so the drawing keeps drawing instead of all
+  // dependent geometry collapsing.
+  for (const idx of order) {
+    const p = params[idx];
+    if (!p.formula) continue;
+    const v = evalExpr(p.formula);
+    if (Number.isFinite(v)) p.value = v;
+  }
+}
+
 export function updateParameter(id: string, patch: Partial<Omit<Parameter, 'id'>>): void {
   const p = state.parameters.find(x => x.id === id);
   if (!p) return;
@@ -335,6 +413,12 @@ export function isParameterReferenced(id: string): boolean {
     if (e.kind === 'formula') return e.refs.includes(id);
     return false;
   };
+  // Other parameters' formulas can reference this parameter — block delete
+  // when any do, otherwise the dependent variable goes broken on next
+  // recompute.
+  for (const p of state.parameters) {
+    if (p.id !== id && p.formula && inExpr(p.formula)) return true;
+  }
   // All Exprs transitively contained by a PointRef (polar carries angle +
   // distance and can nest another PointRef as `from`).
   const inPtRef = (pt: import('./types').PointRef): boolean => {

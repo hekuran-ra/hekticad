@@ -176,10 +176,26 @@ function drawCrosshair(w: number, h: number): void {
   // Label next to the crosshair. During drafting, show the tool-specific
   // readout (B/H for rect, R for circle, ∠+L for line/polyline, etc.) so the
   // label always mirrors the cmdbar input fields. Idle / no tool-specific
-  // info — fall back to world X/Y.
+  // info — fall back to delta from the active tool anchor (last click), or
+  // world X/Y when no anchor exists. The delta fallback keeps the spatial
+  // information close to "what the user intends to do next" rather than
+  // forcing them to subtract two world coordinates in their head.
   const world = runtime.lastSnap ?? state.mouseWorld;
   const info = getDraftInfo();
-  const label = info ?? `${world.x.toFixed(2)},  ${world.y.toFixed(2)}`;
+  let label: string;
+  if (info) {
+    label = info;
+  } else {
+    const tc = runtime.toolCtx;
+    const anchor = tc?.p1 ?? tc?.click1 ?? tc?.basePt ?? null;
+    if (anchor) {
+      const dx = world.x - anchor.x;
+      const dy = world.y - anchor.y;
+      label = `Δ ${dx.toFixed(2)},  ${dy.toFixed(2)}`;
+    } else {
+      label = `${world.x.toFixed(2)},  ${world.y.toFixed(2)}`;
+    }
+  }
   ctx.globalAlpha = 0.6;
   ctx.font = '10px "Space Mono", monospace';
   ctx.fillStyle = color;
@@ -469,13 +485,36 @@ function drawShape(e: Entity | EntityShape): void {
 function drawDim(e: DimEntity | Extract<EntityShape, { type: 'dim' }>): void {
   if (e.dimKind === 'angular') { drawAngularDim(e); return; }
   if (e.dimKind === 'radius' || e.dimKind === 'diameter') { drawRadialDim(e); return; }
-  const dx = e.p2.x - e.p1.x, dy = e.p2.y - e.p1.y;
-  const L = Math.hypot(dx, dy);
-  if (L < 1e-9) return;
-  const nx = -dy / L, ny = dx / L;
-  const sd = (e.offset.x - e.p1.x) * nx + (e.offset.y - e.p1.y) * ny;
-  const a = { x: e.p1.x + nx * sd, y: e.p1.y + ny * sd };
-  const b = { x: e.p2.x + nx * sd, y: e.p2.y + ny * sd };
+  // Linear dim: three sub-modes selected via `linearAxis`.
+  //   - aligned (default): dim line parallel to p1→p2, label = √(dx²+dy²)
+  //   - horizontal: dim line horizontal at offset.y, label = |dx|
+  //   - vertical:   dim line vertical at offset.x,  label = |dy|
+  // The two axis-locked variants project p1/p2 onto the chosen axis and
+  // route extension lines perpendicular to that axis. Cleanly degenerates
+  // when the user picked an offset that's collinear with p1→p2.
+  const axis = e.linearAxis ?? 'aligned';
+  let a: Pt;
+  let b: Pt;
+  let L: number;
+  if (axis === 'horizontal') {
+    a = { x: e.p1.x, y: e.offset.y };
+    b = { x: e.p2.x, y: e.offset.y };
+    L = Math.abs(e.p2.x - e.p1.x);
+    if (L < 1e-9) return;
+  } else if (axis === 'vertical') {
+    a = { x: e.offset.x, y: e.p1.y };
+    b = { x: e.offset.x, y: e.p2.y };
+    L = Math.abs(e.p2.y - e.p1.y);
+    if (L < 1e-9) return;
+  } else {
+    const dx = e.p2.x - e.p1.x, dy = e.p2.y - e.p1.y;
+    L = Math.hypot(dx, dy);
+    if (L < 1e-9) return;
+    const nx = -dy / L, ny = dx / L;
+    const sd = (e.offset.x - e.p1.x) * nx + (e.offset.y - e.p1.y) * ny;
+    a = { x: e.p1.x + nx * sd, y: e.p1.y + ny * sd };
+    b = { x: e.p2.x + nx * sd, y: e.p2.y + ny * sd };
+  }
 
   const aS = worldToScreen(a), bS = worldToScreen(b);
   const p1S = worldToScreen(e.p1), p2S = worldToScreen(e.p2);

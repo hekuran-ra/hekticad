@@ -5,7 +5,7 @@ import type {
 } from './types';
 import type { Grip } from './grips';
 import { state } from './state';
-import { evalExpr, exprLabel } from './params';
+import { evalExpr, exprLabel, recomputeParameters } from './params';
 import { intersectLines } from './snap';
 
 export function newFeatureId(): string {
@@ -263,7 +263,18 @@ export function featureDependsOn(candidateFid: string, rootFid: string): boolean
  *
  * Returns true iff the order actually changed.
  */
+/** Module-level signal set whenever the most recent topoSortFeatures() call
+ *  detected a dependency cycle. Callers (trim/extend) read this via
+ *  `lastTopoSortCycle()` to decide whether to fall back to abs coords and
+ *  warn the user. Reset to false on every entry into topoSortFeatures. */
+let topoSortCycleFlag = false;
+
+export function lastTopoSortCycle(): boolean {
+  return topoSortCycleFlag;
+}
+
 export function topoSortFeatures(): boolean {
+  topoSortCycleFlag = false;
   const feats = state.features;
   const n = feats.length;
   if (n < 2) return false;
@@ -312,7 +323,18 @@ export function topoSortFeatures(): boolean {
 
   // Cycle — bail out and leave order unchanged. Shouldn't happen in practice
   // (the feature graph is meant to be a DAG) but guard against silent damage.
-  if (outOrder.length !== n) return false;
+  // Log to console so a developer running the app sees the diagnostic; the
+  // user-visible toast is the caller's responsibility (each editor knows
+  // best how to recover, e.g. trim falls back to abs coords).
+  if (outOrder.length !== n) {
+    const stuckIds: string[] = [];
+    for (let i = 0; i < n; i++) {
+      if (indeg[i] > 0) stuckIds.push(feats[i].id);
+    }
+    console.warn('[topoSortFeatures] cycle detected — features stuck:', stuckIds);
+    topoSortCycleFlag = true;
+    return false;
+  }
 
   // Already sorted?
   let changed = false;
@@ -1298,7 +1320,13 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
       if (!ref) return null;
       const base = xlineBaseOf(ref);
       if (!base) return null;
-      const d = evalExpr(f.distance);
+      // Distance is always treated as a magnitude — the side field is the
+      // sole source of truth for which side the parallel sits on. Without
+      // the abs() guard, a user-typed negative formula (e.g. via a variable
+      // that flips negative) silently flipped the xline to the opposite
+      // side without updating `side`, leading to surprising "wrong side"
+      // jumps when an unrelated variable changed sign.
+      const d = Math.abs(evalExpr(f.distance));
       const nx = -base.dy, ny = base.dx;
       return {
         id, type: 'xline', layer: f.layer,
@@ -1316,7 +1344,9 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
       //
       // The distance expression stays live: editing the underlying variable
       // re-evaluates this feature on the next `evaluateTimeline()`.
-      const d = evalExpr(f.distance);
+      // Same |distance| guard as `parallelXLine` — the side is the
+      // authoritative side selector, magnitude lives in distance.
+      const d = Math.abs(evalExpr(f.distance));
       const dx = f.axis === 'x' ? 1 : 0;
       const dy = f.axis === 'x' ? 0 : 1;
       const nx = -dy, ny = dx;  // perp(dir)
@@ -1391,6 +1421,7 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
         textHeight: evalExpr(f.textHeight),
         ...(f.style ? { style: f.style } : {}),
         ...(f.textAlign ? { textAlign: f.textAlign } : {}),
+        ...(f.linearAxis ? { linearAxis: f.linearAxis } : {}),
       };
     }
     case 'hatch': {
@@ -1597,13 +1628,51 @@ export function evaluateTimeline(opts?: {
 }): void {
   const fullRebuild = !opts;
 
+  // Recompute formula-driven parameter values FIRST. A param whose formula
+  // references another param needs the dependency evaluated before its own
+  // value is read by feature Exprs. `recomputeParameters` is idempotent and
+  // cheap (params count is small) so we run it on every timeline pass —
+  // even when only features changed, because a feature change might cascade
+  // to a parameter update via the parameter-edit UI.
+  recomputeParameters();
+
+  // When the user explicitly changed a parameter, also invalidate every
+  // parameter that depends on it (transitively) so feature dirty-set
+  // propagation picks up the right downstream features.
+  let effectiveChangedParams: Set<string> | null = null;
+  if (opts?.changedParams) {
+    effectiveChangedParams = new Set<string>(opts.changedParams);
+    // BFS over parameter dependents: any param whose formula references
+    // anything in the changed set is itself "changed".
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const p of state.parameters) {
+        if (!p.formula || effectiveChangedParams.has(p.id)) continue;
+        if (p.formula.kind === 'param') {
+          if (effectiveChangedParams.has(p.formula.id)) {
+            effectiveChangedParams.add(p.id);
+            grew = true;
+          }
+        } else if (p.formula.kind === 'formula') {
+          for (const r of p.formula.refs) {
+            if (effectiveChangedParams.has(r)) {
+              effectiveChangedParams.add(p.id);
+              grew = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Build the dirty-feature set.
   const dirty = new Set<string>();
   if (opts?.changedFeatures) for (const id of opts.changedFeatures) dirty.add(id);
-  if (opts?.changedParams) {
-    const cp = new Set<string>(opts.changedParams);
+  if (effectiveChangedParams) {
     for (const f of state.features) {
-      if (featureReferencesAnyParam(f, cp)) dirty.add(f.id);
+      if (featureReferencesAnyParam(f, effectiveChangedParams)) dirty.add(f.id);
     }
   }
   // Propagate downstream in a single forward pass: because the timeline is
@@ -1648,6 +1717,16 @@ export function evaluateTimeline(opts?: {
         }
       }
       if (!f.hidden) for (const e of outputs) out.push(e);
+      // Register the modifier's PRIMARY output in ctx so PointRefs that
+      // happen to name the modifier feature resolve to a real entity (the
+      // first mirrored copy) instead of NaN. Imperfect when there are many
+      // sources — the user clicked one specific copy, but the snap layer
+      // returned a ref to the modifier itself; without ctx registration
+      // every such ref produced NaN. With this, `endpoint(mirrorFid, end)`
+      // at least resolves to the first copy's endpoint, and follows it
+      // when the source moves. Future: a `modifierOutput` PointRef variant
+      // disambiguates which copy by sub-key.
+      if (outputs.length > 0) ctx.set(f.id, outputs[0]);
       continue;
     }
     if (f.kind === 'array') {
@@ -1677,6 +1756,10 @@ export function evaluateTimeline(opts?: {
         }
       }
       if (!f.hidden) for (const e of outputs) out.push(e);
+      // Same ctx registration as mirror — register the array's first cell so
+      // refs to the modifier feature resolve. See the mirror branch above
+      // for the design rationale.
+      if (outputs.length > 0) ctx.set(f.id, outputs[0]);
       continue;
     }
     if (f.kind === 'rotate') {
@@ -1694,6 +1777,8 @@ export function evaluateTimeline(opts?: {
         }
       }
       if (!f.hidden) for (const e of outputs) out.push(e);
+      // Same ctx registration — first rotated copy.
+      if (outputs.length > 0) ctx.set(f.id, outputs[0]);
       continue;
     }
     if (f.kind === 'crossMirror') {
@@ -1718,6 +1803,8 @@ export function evaluateTimeline(opts?: {
         }
       }
       if (!f.hidden) for (const e of outputs) out.push(e);
+      // Same ctx registration — first cross-mirror variant.
+      if (outputs.length > 0) ctx.set(f.id, outputs[0]);
       continue;
     }
     if (f.kind === 'clip') {
@@ -1732,6 +1819,9 @@ export function evaluateTimeline(opts?: {
         aliveSubKeys.add(`${f.id}#seg${i}`);
       }
       if (!f.hidden) for (const e of outputs) out.push(e);
+      // Same ctx registration — first clipped segment. Snaps to clip
+      // outputs now produce resolvable endpoint/mid refs.
+      if (outputs.length > 0) ctx.set(f.id, outputs[0]);
       continue;
     }
     if (f.kind === 'fillet') {
@@ -2018,9 +2108,31 @@ export function deleteFeatures(ids: Iterable<string>): { removed: number; hidden
   }
 
   state.features = state.features.filter(f => !kill.has(f.id));
+
+  // Cascade-delete dimension features whose anchors point at features we
+  // just removed. Without this they become "zombie" dims with NaN geometry
+  // and dangling refs. Dim features hidden by the survivor pass earlier
+  // are kept (they don't contribute geometry until un-hidden), but truly
+  // dangling dims (no resolvable target) are pruned.
+  const liveIds = new Set(state.features.map(f => f.id));
+  const dimsToKill: string[] = [];
+  for (const f of state.features) {
+    if (f.kind !== 'dim') continue;
+    const refs = collectFeatureRefs(f);
+    let dangling = false;
+    for (const r of refs) {
+      if (!liveIds.has(r)) { dangling = true; break; }
+    }
+    if (dangling) dimsToKill.push(f.id);
+  }
+  if (dimsToKill.length > 0) {
+    const dimKillSet = new Set(dimsToKill);
+    state.features = state.features.filter(f => !dimKillSet.has(f.id));
+  }
+
   evaluateTimeline();
 
-  return { removed: kill.size, hidden: hide.size };
+  return { removed: kill.size + dimsToKill.length, hidden: hide.size };
 }
 
 /** Restore a hidden feature so it renders + becomes selectable again. */

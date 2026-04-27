@@ -157,10 +157,27 @@ export function getDraftInfo(): string | null {
     return `Abstand ${fmt(Math.hypot(tc.click1.x - tc.click2.x, tc.click1.y - tc.click2.y))}`;
   }
 
-  // Xline (Hilfslinie) — angle from anchor.
+  // Xline (Hilfslinie) — angle from anchor PLUS Δx/Δy relative to the
+  // first-click anchor. The user explicitly asked for relative coords:
+  // "die position müsste immer im verhältniss zum letzten klick sein".
+  // Falling back to absolute world XY (the default at the bottom of this
+  // function) made it hard to read off the offset from the anchor — now
+  // each helpline shows where it lands relative to the point it was
+  // started from.
   if (tool === 'xline' && tc.p1) {
+    const dx = world.x - tc.p1.x;
+    const dy = world.y - tc.p1.y;
     const { ang } = angleLen(tc.p1, world, tc);
-    return `∠ ${ang.toFixed(1)}°`;
+    return `Δx ${fmt(dx)}  Δy ${fmt(dy)}  ∠ ${ang.toFixed(1)}°`;
+  }
+  // Parallel xline at distance-from-reference step — the bottom-bar
+  // already shows angle/length info via the line tool, but for parallel
+  // mode we want Versatz (perpendicular distance) which is what the user
+  // is about to commit. Falls back to absolute when no ref is picked yet.
+  if (tool === 'xline' && tc.base && tc.dir) {
+    const px = world.x - tc.base.x, py = world.y - tc.base.y;
+    const perp = Math.abs(-tc.dir.y * px + tc.dir.x * py);
+    return `Versatz ${fmt(perp)}`;
   }
 
   // Angle measurement — angle at vertex.

@@ -9,12 +9,13 @@ import { dom } from './dom';
 import {
   renderLayers, setPrompt, setTip, syncDimPicker, toast, updateSelStatus, updateStats,
 } from './ui';
-import { pushUndo } from './undo';
+import { pushUndo, undo as undoLast } from './undo';
 import { evalExpr } from './params';
 import {
   addFeatureFromInit, AXIS_X_ID, AXIS_Y_ID, deleteFeatures, entityIdForFeature,
   evaluateTimeline, featureDependsOn, featureForEntity, featureFromEntityInit,
-  modifierOutputInfo, newFeatureId, replaceFeatureFromInit, topoSortFeatures,
+  lastTopoSortCycle, modifierOutputInfo, newFeatureId, replaceFeatureFromInit,
+  topoSortFeatures,
 } from './features';
 import { showConfirm } from './modal';
 import { layoutText } from './textlayout';
@@ -90,6 +91,21 @@ function snapToPointRef(snap: SnapPoint | null, fallback: Pt): PointRef {
   if (!snap?.entityId) return abs(pt);
   const feat = featureForEntity(snap.entityId);
   if (!feat) return abs(pt);
+  // Modifier-output snap (mirror / array / rotate / crossMirror / clip):
+  // featureForEntity returns the MODIFIER itself for sub-entity ids, so a
+  // ref like `endpoint(modifierFid, end)` resolves through ctx to the
+  // modifier's PRIMARY output (per C1) — which is some arbitrary copy, not
+  // the specific cell the user clicked. Returning that ref produces a
+  // dimension that visually attaches to the wrong copy when the modifier
+  // has more than one output. Until a `modifierOutput` PointRef variant
+  // disambiguates the sub-key, fall back to abs so the dim/line is at
+  // least frozen at the clicked world point. Single-source single-output
+  // modifiers (mirror of one line, array 1×1) still benefit from C1's ctx
+  // registration through other refs, just not through this snap path.
+  if (feat.kind === 'mirror' || feat.kind === 'array' || feat.kind === 'rotate'
+      || feat.kind === 'crossMirror' || feat.kind === 'clip') {
+    return abs(pt);
+  }
   const fid = feat.id;
   if (snap.type === 'center') return { kind: 'center', feature: fid };
   if (snap.type === 'mid')    return { kind: 'mid',    feature: fid };
@@ -466,6 +482,27 @@ function featureEdgeForCutter(cutter: Entity, hitPt: Pt): FeatureEdgeRef | null 
  * Returns `null` when the cutter isn't rayHit-resolvable (circle/arc) or when
  * cut/kept coincide — caller should fall back to an abs PointRef.
  */
+/**
+ * Run `topoSortFeatures` and surface a cycle to the user if one was created
+ * by the just-applied edit. On cycle: roll the edit back via `undoLast`,
+ * toast, and return false. The caller should then bail out of any
+ * follow-up timeline eval or render — the state is already restored.
+ *
+ * Used by trim / extend / extend-to where a parametric ref to a cutter
+ * feature could close a dependency cycle that was missed by the prior
+ * one-hop guard in `buildRayHitCutOverride`.
+ */
+function topoSortOrUndo(toastMsg: string): boolean {
+  topoSortFeatures();
+  if (lastTopoSortCycle()) {
+    undoLast();
+    toast(toastMsg);
+    render();
+    return false;
+  }
+  return true;
+}
+
 function buildRayHitCutOverride(
   keptRef: PointRef,
   keptPt: Pt,
@@ -544,8 +581,12 @@ export const TOOLS: ToolDef[] = [
   // ── Hilfen ──
   { id: 'xline',      label: 'Hilfslinie',    key: 'H', group: 'guide',
     icon: '<line x1="1" y1="19" x2="21" y2="3" stroke-dasharray="3.5 2.5" stroke-linecap="round"/>' },
-  { id: 'dim',        label: 'Bemaßung',      key: 'D', group: 'guide',
-    icon: '<path d="M4 5 L4 11 M18 5 L18 11"/><path d="M4 8 L18 8"/><path d="M6 6 L4 8 L6 10 M16 6 L18 8 L16 10" fill="currentColor" stroke="none"/><path d="M4 15 L18 15" stroke-dasharray="2.5 2"/>' },
+  { id: 'dim',        label: 'Bemaßung Punkt-zu-Punkt', key: 'D', group: 'guide',
+    icon: '<path d="M4 18 L18 4"/><path d="M2 16 L4 18 L6 14 M14 6 L18 4 L16 8" fill="currentColor" stroke="none"/>' },
+  { id: 'dim_h',      label: 'Bemaßung horizontal', key: '5', group: 'guide',
+    icon: '<path d="M4 5 L4 11 M18 5 L18 11"/><path d="M4 8 L18 8"/><path d="M6 6 L4 8 L6 10 M16 6 L18 8 L16 10" fill="currentColor" stroke="none"/>' },
+  { id: 'dim_v',      label: 'Bemaßung vertikal',   key: '6', group: 'guide',
+    icon: '<path d="M5 4 L11 4 M5 18 L11 18"/><path d="M8 4 L8 18"/><path d="M6 6 L8 4 L10 6 M6 16 L8 18 L10 16" fill="currentColor" stroke="none"/>' },
   { id: 'ref_circle', label: 'Hilfskreis',    key: 'K', group: 'guide',
     icon: '<circle cx="11" cy="11" r="7" stroke-dasharray="3 2"/><path d="M11 4.5 L11 17.5 M4.5 11 L17.5 11" stroke-width="0.8" opacity="0.45" stroke-dasharray="1 1.5"/><circle cx="11" cy="11" r="1" fill="currentColor" stroke="none"/>' },
   { id: 'angle',      label: 'Winkel bemaßen', key: 'W', group: 'guide',
@@ -2105,16 +2146,25 @@ export function setTool(id: ToolId): void {
     // entered in a modal editor — never in the bottom cmdbar.
     runtime.toolCtx = { step: 'pt', textHeight: lastTextHeight };
     setPrompt('Text: klicken (Standardhöhe) oder Rahmen aufziehen');
-  } else if (id === 'dim') {
+  } else if (id === 'dim' || id === 'dim_h' || id === 'dim_v') {
+    // Three linear-dim variants share the same click handler; the only
+    // difference is the `linearAxis` baked into the resulting feature on
+    // commit (see `commitDim`). Chain/auto modes are still available on
+    // the aligned variant only — for horizontal/vertical we always start
+    // in single-pick mode because the chain mode UX (clicking many points
+    // in a row) doesn't translate cleanly to one-axis projections.
     const dm = runtime.dimMode;
-    runtime.toolCtx = (dm === 'chain' || dm === 'auto')
-      ? { step: 'collect', pts: [], ptRefs: [] }
-      : { step: 'pick1' };
-    setPrompt(
-      dm === 'auto'  ? 'Erste Linie klicken (automatische Erkennung dazwischen)' :
-      dm === 'chain' ? 'Erster Punkt der Kette' :
-                       'Erster Messpunkt'
-    );
+    if (id === 'dim' && (dm === 'chain' || dm === 'auto')) {
+      runtime.toolCtx = { step: 'collect', pts: [], ptRefs: [] };
+      setPrompt(dm === 'auto'
+        ? 'Erste Linie klicken (automatische Erkennung dazwischen)'
+        : 'Erster Punkt der Kette');
+    } else {
+      runtime.toolCtx = { step: 'pick1' };
+      setPrompt(id === 'dim_h' ? 'Horizontal-Bemaßung: erster Messpunkt'
+              : id === 'dim_v' ? 'Vertikal-Bemaßung: erster Messpunkt'
+              : 'Erster Messpunkt');
+    }
   } else if (id === 'point') {
     runtime.toolCtx = { step: 'pt' };
     setPrompt('Punkt setzen');
@@ -2853,7 +2903,9 @@ function dispatchClick(p: Pt, worldPt: Pt, shiftKey: boolean): void {
   if (state.tool === 'extend_to'){ handleExtendToClick(worldPt); return; }
   if (state.tool === 'trim')     { handleTrimClick(worldPt); return; }
   if (state.tool === 'text')     { handleTextClick(p); return; }
-  if (state.tool === 'dim')      { handleDimClick(p); return; }
+  if (state.tool === 'dim' || state.tool === 'dim_h' || state.tool === 'dim_v') {
+    handleDimClick(p); return;
+  }
   if (state.tool === 'ref_circle') { handleRefCircleClick(p); return; }
   if (state.tool === 'angle')    { handleAngleClick(p); return; }
   if (state.tool === 'radius')   { handleRadiusClick(p); return; }
@@ -6622,15 +6674,25 @@ export function updatePreview(): void {
         setTip(`Abstand ${d.toFixed(2)}`);
       }
     }
-  } else if (state.tool === 'dim' && tc.click1 && tc.click2 && tc.step === 'place') {
+  } else if ((state.tool === 'dim' || state.tool === 'dim_h' || state.tool === 'dim_v')
+             && tc.click1 && tc.click2 && tc.step === 'place') {
+    const previewAxis = state.tool === 'dim_h' ? 'horizontal'
+                      : state.tool === 'dim_v' ? 'vertical'
+                      : 'aligned';
     tc.preview = {
       type: 'dim',
       p1: { x: tc.click1.x, y: tc.click1.y },
       p2: { x: tc.click2.x, y: tc.click2.y },
       offset: { x: p.x, y: p.y },
       textHeight: lastTextHeight,
+      ...(previewAxis !== 'aligned' ? { linearAxis: previewAxis } : {}),
     };
-    setTip(`Distanz ${dist(tc.click1, tc.click2).toFixed(2)}`);
+    // Tip text reflects the projected length the user will commit to.
+    let tipLen: number;
+    if (previewAxis === 'horizontal') tipLen = Math.abs(tc.click2.x - tc.click1.x);
+    else if (previewAxis === 'vertical') tipLen = Math.abs(tc.click2.y - tc.click1.y);
+    else tipLen = dist(tc.click1, tc.click2);
+    setTip(`Distanz ${tipLen.toFixed(2)}`);
   }
   // Chain / Auto mode — live preview. As the user collects reference
   // points, the preview shows all N-1 dims sharing the cursor's position
@@ -7347,7 +7409,7 @@ function handleExtendClick(worldPt: Pt): void {
   if (!replaceLineEndPreservingRef(fid, anchorEnd, newEnd, hit.layer, cutRefOverride)) {
     replaceFeatureFromInit(fid, entityInit(newLine));
   }
-  topoSortFeatures();
+  if (!topoSortOrUndo('Verlängerung würde einen Abhängigkeits-Zyklus erzeugen')) return;
   evaluateTimeline();
   render();
 }
@@ -7450,7 +7512,7 @@ function handleExtendToClick(worldPt: Pt): void {
         : { ...src, x1: ip.x, y1: ip.y };
       replaceFeatureFromInit(fid, entityInit(newLine));
     }
-    topoSortFeatures();
+    if (!topoSortOrUndo('Verlängerung würde einen Abhängigkeits-Zyklus erzeugen')) return;
     evaluateTimeline();
     updateStats();
     state.selection.clear();
@@ -7598,6 +7660,13 @@ function commitDim(
   p1Ref: PointRef, p2Ref: PointRef, offsetPt: Pt,
 ): void {
   const absPt = (pt: Pt): PointRef => ({ kind: 'abs', x: numE(pt.x), y: numE(pt.y) });
+  // Linear axis taken from the active tool: dim_h → horizontal, dim_v →
+  // vertical, anything else (the legacy `dim` and chain/auto submodes) →
+  // aligned. We omit the field when aligned so old saves keep producing
+  // identical JSON — the renderer treats undefined as aligned.
+  const axis = state.tool === 'dim_h' ? 'horizontal'
+             : state.tool === 'dim_v' ? 'vertical'
+             : 'aligned';
   state.features.push({
     id: newFeatureId(),
     kind: 'dim',
@@ -7607,6 +7676,7 @@ function commitDim(
     offset: absPt(offsetPt),
     textHeight: numE(lastTextHeight),
     ...(runtime.dimStyle ? { style: runtime.dimStyle } : {}),
+    ...(axis !== 'aligned' ? { linearAxis: axis } : {}),
   });
 }
 
@@ -8055,19 +8125,54 @@ function handleTrimClick(worldPt: Pt): void {
   const fid = featureForEntity(hit.id)?.id;
   if (!fid) return;
   const ownerFeat = featureForEntity(hit.id);
-  if (ownerFeat && ownerFeat.kind !== 'line') {
-    toast('Stutzen von Kopien noch nicht unterstützt');
-    return;
+  // Detach-then-trim: when the user clicks a modifier output (mirror copy,
+  // array cell, fillet sub-segment, etc.) we can't trim the source feature
+  // — the user clicked a specific copy, not the original. Instead we
+  // "detach" that copy into a fresh independent line feature with the
+  // copy's current world coordinates as abs PointRefs, then proceed with
+  // normal trim on it. The modifier still produces all its other copies;
+  // only the one that was clicked becomes a real, user-owned line.
+  // Standard "explode before edit" UX. Affected modifier kinds: mirror,
+  // array, rotate, crossMirror, clip, fillet sides, chamfer sides.
+  const isModifierCopy = !!ownerFeat && ownerFeat.kind !== 'line';
+  let workingHit: LineEntity = hit;
+  let workingFid: string = fid;
+  let detachedAlreadyPushed = false;
+  if (isModifierCopy) {
+    pushUndo();
+    detachedAlreadyPushed = true;
+    const detachedFeat: LineFeature = {
+      id: newFeatureId(),
+      kind: 'line',
+      layer: hit.layer,
+      p1: { kind: 'abs', x: numE(hit.x1), y: numE(hit.y1) },
+      p2: { kind: 'abs', x: numE(hit.x2), y: numE(hit.y2) },
+    };
+    state.features.push(detachedFeat);
+    evaluateTimeline();
+    const detachedEntity = state.entities.find(e => {
+      const fForE = featureForEntity(e.id);
+      return fForE?.id === detachedFeat.id && e.type === 'line';
+    });
+    if (!detachedEntity || detachedEntity.type !== 'line') {
+      toast('Stutzen-Detach fehlgeschlagen');
+      undoLast();
+      render();
+      return;
+    }
+    workingHit = detachedEntity as LineEntity;
+    workingFid = detachedFeat.id;
+    toast('Kopie gelöst und gestutzt');
   }
 
-  const a: Pt = { x: hit.x1, y: hit.y1 };
-  const b: Pt = { x: hit.x2, y: hit.y2 };
+  const a: Pt = { x: workingHit.x1, y: workingHit.y1 };
+  const b: Pt = { x: workingHit.x2, y: workingHit.y2 };
   const abX = b.x - a.x, abY = b.y - a.y;
   const L2 = abX * abX + abY * abY;
   if (L2 < 1e-12) return;
   const tClick = ((worldPt.x - a.x) * abX + (worldPt.y - a.y) * abY) / L2;
 
-  const cutters = trimCutterTs(hit).filter(c => c.t > 1e-6 && c.t < 1 - 1e-6);
+  const cutters = trimCutterTs(workingHit).filter(c => c.t > 1e-6 && c.t < 1 - 1e-6);
   let tLow = 0, tHigh = 1;
   let hasLow = false, hasHigh = false;
   let cutterLow: { t: number; entityId: number } | null = null;
@@ -8080,11 +8185,16 @@ function handleTrimClick(worldPt: Pt): void {
     }
   }
 
+  // Each branch below mutates state. If we already pushed undo for the
+  // detach step, skip the per-branch pushUndo so the user's first undo
+  // reverts both detach + trim (a single conceptual operation).
+  const maybePushUndo = (): void => { if (!detachedAlreadyPushed) pushUndo(); };
+
   if (!hasLow && !hasHigh) {
     // No intersections → works as a targeted delete.
-    pushUndo();
-    deleteFeatures([fid]);
-    state.selection.delete(hit.id);
+    maybePushUndo();
+    deleteFeatures([workingFid]);
+    state.selection.delete(workingHit.id);
     evaluateTimeline();
     updateStats();
     updateSelStatus();
@@ -8094,7 +8204,7 @@ function handleTrimClick(worldPt: Pt): void {
   }
 
   // Original PointRefs for parametric linking of the new cut endpoints.
-  const prevFeat = state.features.find(f => f.id === fid);
+  const prevFeat = state.features.find(f => f.id === workingFid);
   const p1Ref: PointRef = (prevFeat && prevFeat.kind === 'line')
     ? prevFeat.p1 : { kind: 'abs', x: numE(a.x), y: numE(a.y) };
   const p2Ref: PointRef = (prevFeat && prevFeat.kind === 'line')
@@ -8107,14 +8217,14 @@ function handleTrimClick(worldPt: Pt): void {
       ? (state.entities.find(e => e.id === cutterLow!.entityId) ?? null) : null;
     const targetFid = cutterEnt ? (featureForEntity(cutterEnt.id)?.id ?? null) : null;
     const cutRef = (cutterEnt && targetFid)
-      ? buildRayHitCutOverride(p1Ref, a, cutPt, cutterEnt, targetFid, fid) : null;
-    pushUndo();
-    replaceLineEndPreservingRef(fid, 0, cutPt, hit.layer, cutRef);
+      ? buildRayHitCutOverride(p1Ref, a, cutPt, cutterEnt, targetFid, workingFid) : null;
+    maybePushUndo();
+    replaceLineEndPreservingRef(workingFid, 0, cutPt, workingHit.layer, cutRef);
     // The rewritten line may now depend on a cutter that was created AFTER
     // it — reorder the timeline so dependencies evaluate first, otherwise
     // the rayHit target is missing from ctx and the endpoint collapses to NaN.
-    topoSortFeatures();
-    state.selection.delete(hit.id);
+    if (!topoSortOrUndo('Stutzen würde einen Abhängigkeits-Zyklus erzeugen')) return;
+    state.selection.delete(workingHit.id);
     evaluateTimeline();
     updateStats();
     updateSelStatus();
@@ -8127,11 +8237,11 @@ function handleTrimClick(worldPt: Pt): void {
       ? (state.entities.find(e => e.id === cutterHigh!.entityId) ?? null) : null;
     const targetFid = cutterEnt ? (featureForEntity(cutterEnt.id)?.id ?? null) : null;
     const cutRef = (cutterEnt && targetFid)
-      ? buildRayHitCutOverride(p2Ref, b, cutPt, cutterEnt, targetFid, fid) : null;
-    pushUndo();
-    replaceLineEndPreservingRef(fid, 1, cutPt, hit.layer, cutRef);
-    topoSortFeatures();
-    state.selection.delete(hit.id);
+      ? buildRayHitCutOverride(p2Ref, b, cutPt, cutterEnt, targetFid, workingFid) : null;
+    maybePushUndo();
+    replaceLineEndPreservingRef(workingFid, 1, cutPt, workingHit.layer, cutRef);
+    if (!topoSortOrUndo('Stutzen würde einen Abhängigkeits-Zyklus erzeugen')) return;
+    state.selection.delete(workingHit.id);
     evaluateTimeline();
     updateStats();
     updateSelStatus();
@@ -8151,18 +8261,18 @@ function handleTrimClick(worldPt: Pt): void {
 
     // rayHit ref for segment 1's cut end: ray from p1 toward lowPt.
     const lowCutRef = (lowCutEnt && lowTargetFid)
-      ? buildRayHitCutOverride(p1Ref, a, lowPt, lowCutEnt, lowTargetFid, fid) : null;
+      ? buildRayHitCutOverride(p1Ref, a, lowPt, lowCutEnt, lowTargetFid, workingFid) : null;
     // rayHit ref for segment 2's cut end: ray from p2 toward highPt.
     // Segment 2 becomes a new feature — its own id doesn't yet exist, but it
     // starts out as a fresh line with the same dependencies as segment 1
-    // would have, so the same cycle check against `fid` applies.
+    // would have, so the same cycle check against `workingFid` applies.
     const highCutRef = (highCutEnt && highTargetFid)
-      ? buildRayHitCutOverride(p2Ref, b, highPt, highCutEnt, highTargetFid, fid) : null;
+      ? buildRayHitCutOverride(p2Ref, b, highPt, highCutEnt, highTargetFid, workingFid) : null;
 
-    pushUndo();
+    maybePushUndo();
 
     // Segment 1: p1 (kept) → lowPt (cut). Shorten the existing feature.
-    replaceLineEndPreservingRef(fid, 0, lowPt, hit.layer, lowCutRef);
+    replaceLineEndPreservingRef(workingFid, 0, lowPt, workingHit.layer, lowCutRef);
 
     // Segment 2: highPt (cut) → p2 (kept). New first-class line feature.
     const useHighRef = !!highCutRef && runtime.parametricMode && highCutRef.kind !== 'abs';
@@ -8171,14 +8281,14 @@ function handleTrimClick(worldPt: Pt): void {
     const newFeat: LineFeature = {
       id: newFeatureId(),
       kind: 'line',
-      layer: hit.layer,
+      layer: workingHit.layer,
       p1: newP1,
       p2: p2Ref,
     };
     state.features.push(newFeat);
 
-    topoSortFeatures();
-    state.selection.delete(hit.id);
+    if (!topoSortOrUndo('Stutzen würde einen Abhängigkeits-Zyklus erzeugen')) return;
+    state.selection.delete(workingHit.id);
     evaluateTimeline();
     updateStats();
     updateSelStatus();

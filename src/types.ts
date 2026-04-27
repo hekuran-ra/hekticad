@@ -24,7 +24,30 @@ export type Pt = { x: number; y: number };
 export type Parameter = {
   id: string;
   name: string;
+  /**
+   * Cached numeric value of this parameter. Always present — used by every
+   * downstream Expr evaluator. When `formula` is set, this field is
+   * recomputed from the formula every time `recomputeParameters()` runs
+   * (which `evaluateTimeline()` calls before walking features). When
+   * `formula` is unset, `value` is the user-typed constant and stays
+   * untouched until the user edits the parameter directly.
+   */
   value: number;
+  /**
+   * Optional formula that drives `value`. When set, the parameter is a
+   * "computed" variable: its value depends on other parameters via the
+   * Expr's AST (`kind: 'param'` / `kind: 'formula'`) and is recomputed
+   * topologically. When unset, the parameter is a plain constant. Stored
+   * as the same `Expr` shape used everywhere else so existing parsers,
+   * evaluators, and HCAD merge logic carry through unchanged.
+   *
+   * Example: `KL = W/4` is stored as `formula: { kind: 'formula', src: "W/4",
+   * ast: { t: 'bin', op: '/', a: { t: 'param', id: idOfW }, b: { t: 'num', v: 4 } }, refs: [idOfW] }`.
+   *
+   * Backward compat: legacy saves with no `formula` field still load — the
+   * parameter just has no driver and stays a constant.
+   */
+  formula?: Expr;
   meaning?: string;
 };
 
@@ -311,6 +334,8 @@ export type DimEntity       = EntityBase & {
   textHeight: number;
   style?: DimStyle;
   textAlign?: DimTextAlign;
+  /** Linear sub-mode. Undefined = `aligned` for legacy compatibility. */
+  linearAxis?: DimLinearAxis;
 };
 
 /**
@@ -521,6 +546,10 @@ export type DimFeature       = FeatureBase & {
   textHeight: Expr;
   style?: DimStyle;
   textAlign?: DimTextAlign;
+  /** Linear sub-mode (only meaningful when `dimKind` is undefined or `linear`).
+   *  Undefined = `aligned` for legacy. The render projects p1/p2 along the
+   *  axis when `horizontal`/`vertical`. */
+  linearAxis?: DimLinearAxis;
 };
 
 /** Hatch / fill feature — parametric source for a HatchEntity. `pts` holds the
@@ -733,12 +762,22 @@ export type ToolId =
   | 'select' | 'select_similar' | 'pan'
   | 'line' | 'polyline' | 'rect' | 'circle' | 'circle3' | 'arc3'
   | 'ellipse' | 'spline' | 'polygon' | 'text'
-  | 'xline' | 'dim'
+  | 'xline' | 'dim' | 'dim_h' | 'dim_v'
   | 'move' | 'copy' | 'rotate' | 'mirror' | 'cross_mirror' | 'stretch' | 'scale'
   | 'fillet' | 'chamfer' | 'extend' | 'extend_to' | 'trim' | 'offset' | 'line_offset' | 'delete'
   /* Design-file additions */
   | 'point' | 'axis' | 'ref_circle' | 'angle' | 'radius' | 'hatch' | 'fill'
   | 'divide_xline';
+
+/**
+ * Linear-dim axis variants. `aligned` is the classic point-to-point dim —
+ * the dim line runs parallel to the segment connecting p1 and p2 and the
+ * label shows the true (Pythagorean) distance. `horizontal` and `vertical`
+ * lock the dim line to a world axis and the label shows the X- or Y-
+ * projection of |p2 − p1|. Default for legacy dims (no field saved) is
+ * `aligned` so old drawings keep their look.
+ */
+export type DimLinearAxis = 'aligned' | 'horizontal' | 'vertical';
 
 /**
  * Mode of the "Linie versetzen" tool:

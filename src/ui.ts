@@ -804,7 +804,17 @@ export function updatePosStatus(x: number, y: number): void {
     // stays readable as plain text.
     html = info.replace(DRAFT_LABEL_RE, '<span class="st-dim">$1</span>');
   } else {
-    html = `X: <b>${x.toFixed(2)}</b>  Y: <b>${y.toFixed(2)}</b>`;
+    // No tool-specific info: prefer Δ from active anchor over absolute world
+    // X/Y. Mirrors the crosshair label so both readouts stay consistent.
+    const tc = runtime.toolCtx;
+    const anchor = tc?.p1 ?? tc?.click1 ?? tc?.basePt ?? null;
+    if (anchor) {
+      const dx = x - anchor.x;
+      const dy = y - anchor.y;
+      html = `<span class="st-dim">Δx</span> <b>${dx.toFixed(2)}</b>  <span class="st-dim">Δy</span> <b>${dy.toFixed(2)}</b>`;
+    } else {
+      html = `X: <b>${x.toFixed(2)}</b>  Y: <b>${y.toFixed(2)}</b>`;
+    }
   }
   dom.stPos.innerHTML = html;
 }
@@ -1264,32 +1274,75 @@ export function renderParameters(): void {
     valueWrap.className = 'param-value';
     const inp = document.createElement('input');
     inp.type = 'text';
-    inp.value = formatParamValue(p.value);
-    inp.title = 'Zahl oder Formel (z.B. L/2, 2*pi*R) — Enter zum Übernehmen';
+    // Display: formula source if present, else the cached value. Lets the
+    // user see and edit "W/4" rather than just the resulting number.
+    inp.value = p.formula
+      ? (p.formula.kind === 'formula' ? p.formula.src
+        : p.formula.kind === 'param'  ? (state.parameters.find(q => q.id === (p.formula as Extract<typeof p.formula, { kind: 'param' }>).id)?.name ?? '?')
+        : formatParamValue(p.value))
+      : formatParamValue(p.value);
+    inp.title = 'Zahl, andere Variable, oder Formel (z.B. W/2, 2*pi*R) — Enter zum Übernehmen';
 
-    // Commit the typed value. Accepts literal numbers AND formulas. Parameter
-    // values are stored as plain numbers (the parameter itself isn't a
-    // formula), so we parse, evaluate once, and persist the result.
-    // `fromEnter` short-circuits the stale-onchange dance: when Enter has
-    // already committed the value, the subsequent blur-driven onchange is a
-    // no-op on the fresh DOM.
+    // Commit the typed value. Three branches:
+    //   1. Plain number → store as constant, clear any existing formula.
+    //   2. Single param ref or formula referencing OTHER params → store as
+    //      formula, recompute cached value.
+    //   3. Self-referential formula (would create a cycle) → reject.
     let committed = false;
     const commit = (): void => {
       if (committed) return;
       const r = parseExprInput(inp.value);
-      let v: number | null = null;
-      if (r && r.kind === 'expr') v = evalExpr(r.expr);
-      if (v == null || !Number.isFinite(v)) {
+      if (!r || r.kind !== 'expr') {
         inp.value = formatParamValue(p.value);
         toast('Ungültige Eingabe');
         return;
       }
+      const expr = r.expr;
+      // Self-reference cycle check: a parameter's formula referencing itself
+      // (directly or transitively) creates an unsolvable cycle. Detect by
+      // seeing if `p.id` appears in this expression's refs OR transitively
+      // via other parameters' formulas.
+      const refsCycle = (e: Expr, seen: Set<string>): boolean => {
+        if (e.kind === 'param') {
+          if (e.id === p.id) return true;
+          if (seen.has(e.id)) return false;
+          seen.add(e.id);
+          const dep = state.parameters.find(q => q.id === e.id);
+          return !!(dep && dep.formula && refsCycle(dep.formula, seen));
+        }
+        if (e.kind === 'formula') {
+          for (const refId of e.refs) {
+            if (refId === p.id) return true;
+            if (seen.has(refId)) continue;
+            seen.add(refId);
+            const dep = state.parameters.find(q => q.id === refId);
+            if (dep && dep.formula && refsCycle(dep.formula, seen)) return true;
+          }
+        }
+        return false;
+      };
+      if (refsCycle(expr, new Set())) {
+        inp.value = formatParamValue(p.value);
+        toast('Zyklus erkannt — Variable kann sich nicht selbst referenzieren');
+        return;
+      }
+      const v = evalExpr(expr);
+      if (!Number.isFinite(v)) {
+        inp.value = formatParamValue(p.value);
+        toast('Formel ergibt keinen gültigen Wert');
+        return;
+      }
       committed = true;
-      updateParameter(p.id, { value: v });
-      // Fast-path: tell evaluateTimeline exactly which param changed. Features
-      // whose Exprs don't reference this param keep their cached entity, so a
-      // slider-like rapid edit on one variable doesn't rebuild the whole
-      // drawing.
+      // Decide whether to store as formula or as plain constant.
+      const storeFormula = expr.kind !== 'num';
+      if (storeFormula) {
+        updateParameter(p.id, { value: v, formula: expr });
+      } else {
+        updateParameter(p.id, { value: v, formula: undefined });
+      }
+      // Fast-path: tell evaluateTimeline exactly which param changed.
+      // recomputeParameters runs first inside evaluateTimeline so any
+      // dependent parameters' values catch up before features evaluate.
       evaluateTimeline({ changedParams: [p.id] });
       render();
       renderParameters();
