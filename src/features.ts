@@ -388,12 +388,51 @@ export function linkedEntityIds(selectedEntityIds: Iterable<number>): Set<number
  * persistent truth — reassigning it is what survives timeline re-evaluation.
  * Returns true on success, false if the entity or its feature cannot be found
  * or its current layer is locked (locked-layer geometry stays put).
+ *
+ * For modifier sub-outputs (fillet/chamfer trimmed lines, mirror copies, etc.)
+ * the entity itself has no independent feature — it is produced by the parent
+ * modifier.  For fillet/chamfer the trimmed line inherits its layer from the
+ * hidden source line, so we redirect to the source.  For mirror/array/rotate/
+ * crossMirror we change the source feature's layer so all its copies follow.
  */
 export function moveEntityToLayer(entityId: number, layerIndex: number): boolean {
+  if (layerIndex < 0 || layerIndex >= state.layers.length) return false;
+
+  // Modifier sub-output?  Route the layer change to the right source feature.
+  const info = modifierOutputInfo(entityId);
+  if (info) {
+    const modFeat = state.features.find(f => f.id === info.modFid);
+    if (!modFeat) return false;
+
+    if (modFeat.kind === 'fillet' || modFeat.kind === 'chamfer') {
+      // Trimmed line l1 → source is line1Id; l2 → line2Id.  Arc gets the
+      // FilletFeature's own layer — fall through to the generic path.
+      const srcFid = info.sourceFid === 'l1' ? modFeat.line1Id
+                   : info.sourceFid === 'l2' ? modFeat.line2Id
+                   : null;
+      if (srcFid) {
+        const src = state.features.find(f => f.id === srcFid);
+        if (!src) return false;
+        if (state.layers[src.layer]?.locked) return false;
+        src.layer = layerIndex;
+        return true;
+      }
+    }
+
+    if (modFeat.kind === 'mirror' || modFeat.kind === 'array' ||
+        modFeat.kind === 'rotate' || modFeat.kind === 'crossMirror') {
+      // sourceFid is the actual source feature id for these modifiers.
+      const src = state.features.find(f => f.id === info.sourceFid);
+      if (!src) return false;
+      if (state.layers[src.layer]?.locked) return false;
+      src.layer = layerIndex;
+      return true;
+    }
+  }
+
   const feat = featureForEntity(entityId);
   if (!feat) return false;
   if (state.layers[feat.layer]?.locked) return false;
-  if (layerIndex < 0 || layerIndex >= state.layers.length) return false;
   feat.layer = layerIndex;
   return true;
 }
@@ -2055,11 +2094,19 @@ export function deleteFeatures(ids: Iterable<string>): { removed: number; hidden
 
   // First pass: which requested ids still have SURVIVING dependents? (A
   // "survivor" is any feature that is not itself being deleted.)
+  //
+  // NOTE: we do NOT skip hidden features here.  A hidden feature is very often
+  // an active fillet / chamfer / clip source — it is hidden precisely because
+  // the modifier owns it, but it is still fully evaluated and its geometry
+  // feeds the modifier's output.  Skipping it would let its dependencies be
+  // truly deleted, which silently corrupts the modifier's output (NaN geometry,
+  // disappearing lines).  Treating hidden features as real dependents means
+  // such xlines / source lines become hidden rather than deleted, which is the
+  // safe, non-destructive behaviour the user expects.
   const hide = new Set<string>();
   for (const id of requested) {
     for (const f of state.features) {
       if (requested.has(f.id)) continue;
-      if (f.hidden) continue; // hidden dependents don't count — they're dormant
       if (collectFeatureRefs(f).includes(id)) { hide.add(id); break; }
     }
   }
