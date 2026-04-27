@@ -60,13 +60,38 @@ function hitArc(p: Pt, e: { cx: number; cy: number; r: number; a1: number; a2: n
 function hitDim(p: Pt, e: DimEntity, tol: number): boolean {
   if (e.dimKind === 'angular') return hitAngularDim(p, e, tol);
   if (e.dimKind === 'radius' || e.dimKind === 'diameter') return hitRadialDim(p, e, tol);
-  const dx = e.p2.x - e.p1.x, dy = e.p2.y - e.p1.y;
-  const L = Math.hypot(dx, dy);
-  if (L < 1e-9) return false;
-  const nx = -dy / L, ny = dx / L;
-  const sd = (e.offset.x - e.p1.x) * nx + (e.offset.y - e.p1.y) * ny;
-  const a = { x: e.p1.x + nx * sd, y: e.p1.y + ny * sd };
-  const b = { x: e.p2.x + nx * sd, y: e.p2.y + ny * sd };
+
+  // Compute the dim-line endpoints (a, b) using the SAME axis logic as the
+  // renderer — the old code always used the "aligned" formula which was wrong
+  // for horizontal/vertical dims when p1 and p2 have different Y (or X).
+  const axis = e.linearAxis ?? 'aligned';
+  let a: Pt, b: Pt, L: number, ux: number, uy: number;
+  if (axis === 'horizontal') {
+    a = { x: e.p1.x, y: e.offset.y };
+    b = { x: e.p2.x, y: e.offset.y };
+    L = Math.abs(e.p2.x - e.p1.x);
+    if (L < 1e-9) return false;
+    ux = e.p2.x > e.p1.x ? 1 : -1;
+    uy = 0;
+  } else if (axis === 'vertical') {
+    a = { x: e.offset.x, y: e.p1.y };
+    b = { x: e.offset.x, y: e.p2.y };
+    L = Math.abs(e.p2.y - e.p1.y);
+    if (L < 1e-9) return false;
+    ux = 0;
+    uy = e.p2.y > e.p1.y ? 1 : -1;
+  } else {
+    const dx = e.p2.x - e.p1.x, dy = e.p2.y - e.p1.y;
+    L = Math.hypot(dx, dy);
+    if (L < 1e-9) return false;
+    const nx = -dy / L, ny = dx / L;
+    const sd = (e.offset.x - e.p1.x) * nx + (e.offset.y - e.p1.y) * ny;
+    a = { x: e.p1.x + nx * sd, y: e.p1.y + ny * sd };
+    b = { x: e.p2.x + nx * sd, y: e.p2.y + ny * sd };
+    ux = dx / L;
+    uy = dy / L;
+  }
+
   // 1) The dim line itself.
   if (distPtSeg(p, a, b) < tol) return true;
   // 2) The two extension lines (measurement point → dim line endpoint). Users
@@ -74,16 +99,18 @@ function hitDim(p: Pt, e: DimEntity, tol: number): boolean {
   //    geometry, so hitting these counts as selecting the dim.
   if (distPtSeg(p, e.p1, a) < tol) return true;
   if (distPtSeg(p, e.p2, b) < tol) return true;
-  // 3) The label — a band centered on the midpoint of (a,b), oriented along
-  //    the dim. Size is approximate: along-axis ≈ 4 × textHeight (covers a
-  //    typical number like "123.45"), perp-axis ≈ textHeight. Tolerance is
-  //    added so clicks just next to the text also register.
-  const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-  const ux = dx / L, uy = dy / L;
-  const along  = (p.x - mid.x) * ux + (p.y - mid.y) * uy;
-  const across = (p.x - mid.x) * nx + (p.y - mid.y) * ny;
-  const halfAlong  = Math.min(L, e.textHeight * 4) / 2 + tol;
-  const halfAcross = e.textHeight + tol;
+  // 3) The label — a generous band centered on the label position along a→b.
+  //    textAlign shifts the label: 'start' = 12 % from a, 'end' = 88 %, else mid.
+  //    Size: along-axis ≈ max(6×textHeight, L/2) so even a single-digit label is
+  //    easily clickable; perp-axis ≈ 2×textHeight covers the text cap height plus
+  //    some breathing room.
+  const t = e.textAlign === 'start' ? 0.12 : e.textAlign === 'end' ? 0.88 : 0.5;
+  const mid = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+  const nx2 = -uy, ny2 = ux; // normal (perpendicular to dim line)
+  const along  = (p.x - mid.x) * ux  + (p.y - mid.y) * uy;
+  const across = (p.x - mid.x) * nx2 + (p.y - mid.y) * ny2;
+  const halfAlong  = Math.max(e.textHeight * 3, L * 0.25) + tol;
+  const halfAcross = e.textHeight * 1.5 + tol;
   if (Math.abs(along) <= halfAlong && Math.abs(across) <= halfAcross) return true;
   return false;
 }

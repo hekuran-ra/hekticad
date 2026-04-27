@@ -8232,6 +8232,13 @@ function handleDimClick(p: Pt): void {
 
   // ── Single mode (default) ───────────────────────────────────────────
   if (tc.step === 'pick1') {
+    // dim_h / dim_v must be anchored to a real geometric entity (line, edge,
+    // snap point) — clicking empty canvas is rejected so accidental dims don't
+    // appear. The free-form `dim` tool keeps accepting any point.
+    if ((state.tool === 'dim_h' || state.tool === 'dim_v') && !dimClickIsOnPoint(p)) {
+      toast('Punkt auf einer Linie oder Kante klicken');
+      return;
+    }
     tc.click1 = p;
     // Capture the snap as a parametric PointRef so the dim tracks the
     // underlying feature when variables change (same mechanism the line tool
@@ -8244,6 +8251,11 @@ function handleDimClick(p: Pt): void {
   }
   if (tc.step === 'pick2' && tc.click1) {
     if (dist(tc.click1, p) < 1e-6) { toast('Punkte müssen unterschiedlich sein'); return; }
+    // Same entity-only guard for the second point.
+    if ((state.tool === 'dim_h' || state.tool === 'dim_v') && !dimClickIsOnPoint(p)) {
+      toast('Punkt auf einer Linie oder Kante klicken');
+      return;
+    }
     tc.click2 = p;
     if (!tc.ptRefs) tc.ptRefs = [null, null];
     tc.ptRefs[1] = snapToPointRef(runtime.lastSnap, p);
