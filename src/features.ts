@@ -1337,14 +1337,57 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
       };
     }
     case 'dim': {
+      const p1 = resolvePt(f.p1, ctx);
+      const p2 = resolvePt(f.p2, ctx);
+      const offset = resolvePt(f.offset, ctx);
+      let vertex = f.vertex ? resolvePt(f.vertex, ctx) : undefined;
+      let ray1   = f.ray1   ? resolvePt(f.ray1,   ctx) : undefined;
+      const ray2 = f.ray2   ? resolvePt(f.ray2,   ctx) : undefined;
+
+      // ── Smart resolution for radius / diameter dims ──
+      // When the user picks a circle/arc, the dim is committed with
+      // `vertex = center(featId)` and `ray1 = polar(from=vertex, angle, r)`
+      // where the polar's distance is a literal radius at commit time.
+      // To keep the displayed value live across variable / scale / fillet
+      // edits, we override ray1's distance to the source feature's CURRENT
+      // radius — taken from the live circle/arc entity in ctx. The leader
+      // direction (the polar's `angle`) stays as the user authored it, so
+      // the label position remains stable.
+      //
+      // Falls through to the resolved values when:
+      //   - the dim isn't radius/diameter,
+      //   - the vertex isn't a `center` PointRef (legacy abs dims),
+      //   - the target feature is gone or no longer a circle/arc.
+      // — i.e. nothing breaks for old or imported dims.
+      if ((f.dimKind === 'radius' || f.dimKind === 'diameter')
+        && f.vertex && f.vertex.kind === 'center' && vertex && ray1) {
+        const liveCircle = ctx.get(f.vertex.feature);
+        if (liveCircle && (liveCircle.type === 'circle' || liveCircle.type === 'arc')) {
+          const r = liveCircle.r;
+          // Use the original ray1 direction (from centre) but replace its
+          // length with the live radius. Falls back to ray1 unchanged if
+          // it sits exactly on the centre (degenerate).
+          let ux = ray1.x - vertex.x, uy = ray1.y - vertex.y;
+          const ul = Math.hypot(ux, uy);
+          if (ul >= 1e-9) {
+            ux /= ul; uy /= ul;
+            ray1 = { x: vertex.x + ux * r, y: vertex.y + uy * r };
+          }
+          // Also pin the centre to the live circle's centre so a centre
+          // shift propagates even when the dim's vertex PointRef happens
+          // to resolve through a chain of refs. (Cheap; nothing else
+          // could legitimately have moved.)
+          vertex = { x: liveCircle.cx, y: liveCircle.cy };
+        }
+      }
+
       return {
         id, type: 'dim', layer: f.layer,
         ...(f.dimKind ? { dimKind: f.dimKind } : {}),
-        p1: resolvePt(f.p1, ctx), p2: resolvePt(f.p2, ctx),
-        offset: resolvePt(f.offset, ctx),
-        ...(f.vertex ? { vertex: resolvePt(f.vertex, ctx) } : {}),
-        ...(f.ray1   ? { ray1:   resolvePt(f.ray1,   ctx) } : {}),
-        ...(f.ray2   ? { ray2:   resolvePt(f.ray2,   ctx) } : {}),
+        p1, p2, offset,
+        ...(vertex ? { vertex } : {}),
+        ...(ray1   ? { ray1   } : {}),
+        ...(ray2   ? { ray2   } : {}),
         textHeight: evalExpr(f.textHeight),
         ...(f.style ? { style: f.style } : {}),
         ...(f.textAlign ? { textAlign: f.textAlign } : {}),

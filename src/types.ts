@@ -825,6 +825,13 @@ export type ToolCtx = {
   /** Chain-dim carry-over: absolute offset point of the previous dim segment so
    *  successive clicks reuse the same dim line. Only used by the dim tool. */
   dimOffset?: Pt;
+  /**
+   * Target entity for parametric dim commit. Set by the radius/diameter tool
+   * after the user picks a circle/arc, so the placement-step commit knows
+   * which feature to attach `vertex = center(featId)` and the live-radius
+   * resolution to. Falls back to abs (legacy behaviour) when null/undefined.
+   */
+  targetEntityId?: number | null;
 };
 
 // ────────────────────────────────────────────────────────────────────────────

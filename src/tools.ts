@@ -3463,29 +3463,51 @@ function handleRefCircleClick(p: Pt): void {
  * Returns null when there aren't two suitable segments (e.g. only one line in
  * the scene, or the two nearest lines are parallel).
  */
-function findAnglePickLines(p: Pt): {
+/**
+ * Result of angular-dim line picking.
+ *
+ * `entity1Id` / `entity2Id` are the source entity IDs for the two picked
+ * candidates when they came from a `line` or `xline` (and ONLY then —
+ * polyline/rect edges don't expose a per-segment entity, so they fall back
+ * to absolute coords on commit). The handler walks them back to features via
+ * `featureForEntity` and builds an `intersection`-PointRef vertex plus
+ * `endpoint`-PointRef rays, so the dim follows the lines through any later
+ * variable / trim / move edits — matching the linear-dim behaviour.
+ */
+type AnglePickResult = {
   V: Pt; ray1: Pt; ray2: Pt; radius: number;
-} | null {
-  type Cand = { a: Pt; b: Pt; d: number };
+  /** Source entity ID of L1 (line/xline), or null for non-line edges. */
+  entity1Id: number | null;
+  /** Source entity ID of L2 (line/xline), or null for non-line edges. */
+  entity2Id: number | null;
+};
+
+function findAnglePickLines(p: Pt): AnglePickResult | null {
+  type Cand = {
+    a: Pt; b: Pt; d: number;
+    /** Source entity for parametric committal — null if the candidate is a
+     *  polyline segment / rect edge that the dim model can't link to. */
+    entityId: number | null;
+  };
   const candidates: Cand[] = [];
   for (const ent of state.entities) {
     const layer = state.layers[ent.layer];
     if (!layer || !layer.visible) continue;
     if (ent.type === 'line') {
       const a = { x: ent.x1, y: ent.y1 }, b = { x: ent.x2, y: ent.y2 };
-      candidates.push({ a, b, d: distPtSeg(p, a, b) });
+      candidates.push({ a, b, d: distPtSeg(p, a, b), entityId: ent.id });
     } else if (ent.type === 'xline') {
       const T = 1e6;
       const a = { x: ent.x1 - ent.dx * T, y: ent.y1 - ent.dy * T };
       const b = { x: ent.x1 + ent.dx * T, y: ent.y1 + ent.dy * T };
-      candidates.push({ a, b, d: distPtSeg(p, a, b) });
+      candidates.push({ a, b, d: distPtSeg(p, a, b), entityId: ent.id });
     } else if (ent.type === 'polyline') {
       for (let i = 1; i < ent.pts.length; i++) {
-        candidates.push({ a: ent.pts[i - 1], b: ent.pts[i], d: distPtSeg(p, ent.pts[i - 1], ent.pts[i]) });
+        candidates.push({ a: ent.pts[i - 1], b: ent.pts[i], d: distPtSeg(p, ent.pts[i - 1], ent.pts[i]), entityId: null });
       }
       if (ent.closed && ent.pts.length > 2) {
         const a = ent.pts[ent.pts.length - 1], b = ent.pts[0];
-        candidates.push({ a, b, d: distPtSeg(p, a, b) });
+        candidates.push({ a, b, d: distPtSeg(p, a, b), entityId: null });
       }
     } else if (ent.type === 'rect') {
       const xl = Math.min(ent.x1, ent.x2), xr = Math.max(ent.x1, ent.x2);
@@ -3496,7 +3518,7 @@ function findAnglePickLines(p: Pt): {
         [{ x: xr, y: yt }, { x: xl, y: yt }],
         [{ x: xl, y: yt }, { x: xl, y: yb }],
       ];
-      for (const [a, b] of edges) candidates.push({ a, b, d: distPtSeg(p, a, b) });
+      for (const [a, b] of edges) candidates.push({ a, b, d: distPtSeg(p, a, b), entityId: null });
     }
   }
   if (candidates.length < 2) return null;
@@ -3529,7 +3551,10 @@ function findAnglePickLines(p: Pt): {
     const s = ((p.x - V.x) * ux + (p.y - V.y) * uy) >= 0 ? 1 : -1;
     return { x: V.x + ux * s * R, y: V.y + uy * s * R };
   };
-  return { V, ray1: chooseRay(L1.a, L1.b), ray2: chooseRay(L2.a, L2.b), radius: R };
+  return {
+    V, ray1: chooseRay(L1.a, L1.b), ray2: chooseRay(L2.a, L2.b), radius: R,
+    entity1Id: L1.entityId, entity2Id: L2.entityId,
+  };
 }
 
 /** Build the Preview payload for the angle tool at cursor position p. */
@@ -3569,6 +3594,29 @@ function buildAnglePreview(p: Pt): { shape: EntityShape; deg: number } | null {
  * position disambiguates which of the four sectors around the crossing is
  * the one being dimensioned.
  */
+/**
+ * Commit an angular dim parametrically.
+ *
+ * When both picked candidates are line/xline entities we wire the dim's
+ * vertex / ray1 / ray2 to PointRefs that track those features:
+ *
+ *   vertex = intersection(line1Fid, line2Fid)
+ *   ray1   = endpoint(line1Fid, end)   ← end is whichever endpoint of line1
+ *                                         lies in the half-space the click
+ *                                         picked, so `ray1 - vertex` keeps
+ *                                         pointing into the measured sector
+ *                                         when the lines later move
+ *   ray2   = endpoint(line2Fid, end)
+ *
+ * The `offset` (label anchor) stays as an abs PointRef — it's a UI-only
+ * placement choice. p1/p2 are populated as legacy fallbacks; the renderer
+ * prefers vertex/ray1/ray2 for angular dims, but bounds / hit-test / older
+ * code paths still poke at p1/p2.
+ *
+ * If either pick is a polyline edge or rect side (no per-segment feature
+ * model), we fall back to abs PointRefs for that side — degraded, but the
+ * dim still draws. Mixed: one parametric, one abs — supported.
+ */
 function handleAngleClick(p: Pt): void {
   const pick = findAnglePickLines(p);
   if (!pick) {
@@ -3576,20 +3624,70 @@ function handleAngleClick(p: Pt): void {
     render();
     return;
   }
-  const { V, ray1, ray2 } = pick;
+  const { V, ray1, ray2, entity1Id, entity2Id } = pick;
+
+  // Walk entity IDs back to feature IDs. Only line features can host the
+  // intersection / endpoint refs we want; xlines could in principle but the
+  // angular dim's geometry depends on a finite ray direction (line endpoint),
+  // and xlines don't have one. So xline picks degrade to abs.
+  const featForLineEntity = (eid: number | null): { fid: string; line: { x1: number; y1: number; x2: number; y2: number } } | null => {
+    if (eid == null) return null;
+    const ent = state.entities.find(x => x.id === eid);
+    if (!ent || ent.type !== 'line') return null;
+    const f = featureForEntity(eid);
+    if (!f || f.kind !== 'line') return null;
+    return { fid: f.id, line: { x1: ent.x1, y1: ent.y1, x2: ent.x2, y2: ent.y2 } };
+  };
+  const f1 = featForLineEntity(entity1Id);
+  const f2 = featForLineEntity(entity2Id);
+
+  /**
+   * Decide which endpoint (0 or 1) of a line should anchor a ray, given
+   * that we want the resolved ray-tip to lie in the half-space the click
+   * picked. We use the same projection test the abs path uses (sign of
+   * dot product of click direction with the line direction).
+   */
+  const pickEnd = (line: { x1: number; y1: number; x2: number; y2: number }): 0 | 1 => {
+    const dx = line.x2 - line.x1, dy = line.y2 - line.y1;
+    const L = Math.hypot(dx, dy);
+    if (L < 1e-9) return 0;
+    const ux = dx / L, uy = dy / L;
+    const s = ((p.x - V.x) * ux + (p.y - V.y) * uy) >= 0 ? 1 : 0;
+    return s as 0 | 1;
+  };
+
+  const absRef = (pt: Pt): PointRef => ({ kind: 'abs', x: numE(pt.x), y: numE(pt.y) });
+
+  // Vertex: intersection of both line features when both are linkable.
+  const vertexRef: PointRef = (f1 && f2)
+    ? { kind: 'intersection', feature1: f1.fid, feature2: f2.fid }
+    : absRef(V);
+  // Rays: endpoint of each line in the picked direction, fall back to abs.
+  const ray1Ref: PointRef = f1
+    ? { kind: 'endpoint', feature: f1.fid, end: pickEnd(f1.line) }
+    : absRef(ray1);
+  const ray2Ref: PointRef = f2
+    ? { kind: 'endpoint', feature: f2.fid, end: pickEnd(f2.line) }
+    : absRef(ray2);
+
   pushUndo();
-  const init: EntityInit = {
-    type: 'dim',
+  state.features.push({
+    id: newFeatureId(),
+    kind: 'dim',
     dimKind: 'angular',
     layer: dimLayer(),
-    // Legacy fallback fields (used by bounds/hit/etc when angular-aware
-    // branches aren't hit). vertex/ray1/ray2 carry the authoritative geometry.
-    p1: V, p2: ray1, offset: p,
-    vertex: V, ray1, ray2,
-    textHeight: lastTextHeight,
+    // p1/p2 mirror vertex/ray1 so legacy code paths still see consistent
+    // values; the angular renderer reads vertex/ray1/ray2 first.
+    p1: vertexRef,
+    p2: ray1Ref,
+    offset: absRef(p),
+    vertex: vertexRef,
+    ray1: ray1Ref,
+    ray2: ray2Ref,
+    textHeight: numE(lastTextHeight),
     ...(runtime.dimStyle ? { style: runtime.dimStyle } : {}),
-  };
-  addFeatureFromInit(init);
+  });
+
   evaluateTimeline();
   updateStats();
   // Loop so the user can bemaß several angles in a row.
@@ -3606,20 +3704,27 @@ function handleAngleClick(p: Pt): void {
  * enough — the "close enough" check leans on the existing hit-test tolerance
  * so the pick feels the same as clicking any other entity.
  */
-function findNearestCircleLike(p: Pt): { cx: number; cy: number; r: number } | null {
-  let best: { cx: number; cy: number; r: number; d: number } | null = null;
+/**
+ * Pick result for the radius/diameter dim tool. `entityId` is the source
+ * circle/arc entity so the commit path can walk back to a feature and
+ * build a `center` PointRef — the dim then follows the circle/arc through
+ * variable / move / fillet / chamfer edits.
+ */
+type CirclePick = { cx: number; cy: number; r: number; entityId: number };
+
+function findNearestCircleLike(p: Pt): CirclePick | null {
+  let best: { pick: CirclePick; d: number } | null = null;
   for (const ent of state.entities) {
     const layer = state.layers[ent.layer];
     if (!layer || !layer.visible) continue;
-    if (ent.type === 'circle') {
+    if (ent.type === 'circle' || ent.type === 'arc') {
       const d = Math.abs(Math.hypot(p.x - ent.cx, p.y - ent.cy) - ent.r);
-      if (!best || d < best.d) best = { cx: ent.cx, cy: ent.cy, r: ent.r, d };
-    } else if (ent.type === 'arc') {
-      const d = Math.abs(Math.hypot(p.x - ent.cx, p.y - ent.cy) - ent.r);
-      if (!best || d < best.d) best = { cx: ent.cx, cy: ent.cy, r: ent.r, d };
+      if (!best || d < best.d) {
+        best = { pick: { cx: ent.cx, cy: ent.cy, r: ent.r, entityId: ent.id }, d };
+      }
     }
   }
-  return best;
+  return best ? best.pick : null;
 }
 
 /**
@@ -3673,6 +3778,17 @@ function buildRadiusPreview(p: Pt): { shape: EntityShape; value: number; mode: R
  * — switching it mid-tool via the picker changes what the next commit stores
  * but leaves any already-placed dims alone.
  */
+/**
+ * Radius / diameter tool — pick a circle/arc, place the label.
+ *
+ * Commit is parametric when the picked entity has a backing circle/arc
+ * feature: `vertex = center(featId)`, `ray1 = polar(from=vertex, angle, r)`
+ * with `r` left as a literal at commit time. The displayed value comes from
+ * the live circle's radius via the smart resolver in features.ts (so when a
+ * variable later changes the circle's radius, the dim updates), and the
+ * leader anchor follows the circle's centre. Falls back to fully-abs when
+ * the picked entity isn't feature-backed (e.g. imported geometry).
+ */
 function handleRadiusClick(p: Pt): void {
   const tc = runtime.toolCtx;
   if (!tc) return;
@@ -3686,6 +3802,7 @@ function handleRadiusClick(p: Pt): void {
       step: 'place',
       centerPt: { x: pick.cx, y: pick.cy },
       refLen: pick.r,
+      targetEntityId: pick.entityId,
     };
     setPrompt(runtime.radiusMode === 'diameter'
       ? 'Durchmesser: Beschriftung platzieren'
@@ -3695,22 +3812,57 @@ function handleRadiusClick(p: Pt): void {
   }
   if (tc.step === 'place' && tc.centerPt && tc.refLen != null) {
     const cx = tc.centerPt.x, cy = tc.centerPt.y, r = tc.refLen;
-    // Near-edge point along the center→click direction.
+    // Near-edge point along the center→click direction. The angle (degrees,
+    // CCW from +X) is what we bake into the polar PointRef so the leader
+    // direction stays stable even if the centre later moves.
     let ux = p.x - cx, uy = p.y - cy;
     const ul = Math.hypot(ux, uy);
     if (ul < 1e-9) { ux = 1; uy = 0; } else { ux /= ul; uy /= ul; }
     const edge: Pt = { x: cx + ux * r, y: cy + uy * r };
+    const angleDeg = Math.atan2(uy, ux) * 180 / Math.PI;
+
+    // Walk back to the source feature for parametric committal.
+    let circleFid: string | null = null;
+    if (tc.targetEntityId != null) {
+      const ent = state.entities.find(x => x.id === tc.targetEntityId);
+      if (ent && (ent.type === 'circle' || ent.type === 'arc')) {
+        const f = featureForEntity(tc.targetEntityId);
+        if (f && (f.kind === 'circle' || f.kind === 'arc')) circleFid = f.id;
+      }
+    }
+
+    const absRef = (pt: Pt): PointRef => ({ kind: 'abs', x: numE(pt.x), y: numE(pt.y) });
+    const vertexRef: PointRef = circleFid
+      ? { kind: 'center', feature: circleFid }
+      : absRef({ x: cx, y: cy });
+    const ray1Ref: PointRef = {
+      kind: 'polar',
+      from: vertexRef,
+      angle: numE(angleDeg),
+      // Distance is a literal — but the dim resolver in features.ts
+      // overrides it with the live circle radius for radius/diameter dims
+      // whose vertex is `center(featId)`. So this only matters as a fallback
+      // when the target feature is gone (e.g. user deleted the circle).
+      distance: numE(r),
+    };
+
     pushUndo();
-    const init: EntityInit = {
-      type: 'dim',
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'dim',
       dimKind: runtime.radiusMode,
       layer: dimLayer(),
-      p1: { x: cx, y: cy }, p2: edge, offset: p,
-      vertex: { x: cx, y: cy }, ray1: edge,
-      textHeight: lastTextHeight,
+      // p1/p2 mirror vertex/ray1 — radius dims read vertex/ray1 first but
+      // bounds + hit code still pokes at p1/p2.
+      p1: vertexRef,
+      p2: ray1Ref,
+      offset: absRef(p),
+      vertex: vertexRef,
+      ray1: ray1Ref,
+      textHeight: numE(lastTextHeight),
       ...(runtime.dimStyle ? { style: runtime.dimStyle } : {}),
-    };
-    addFeatureFromInit(init);
+    });
+
     evaluateTimeline();
     updateStats();
     runtime.toolCtx = { step: 'pickCircle' };
@@ -3718,6 +3870,8 @@ function handleRadiusClick(p: Pt): void {
       ? 'Durchmesser: Kreis/Bogen anklicken'
       : 'Radius: Kreis/Bogen anklicken');
     render();
+    void edge;  // edge is the legacy abs-fallback value; kept around in case
+                // a future refactor needs the immediate world point.
   }
 }
 
