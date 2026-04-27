@@ -4603,31 +4603,24 @@ function applyDivideXLine(l: LineEntity, n: number): void {
 }
 
 /**
- * Emit N **tangent** xlines around a full circle at equal angular intervals.
+ * Emit N radial **line segments** from the circle centre to each of the N
+ * equally-spaced division points on the circumference.
  *
- * Each xline is anchored at one of the N division points on the circumference
- * and runs PERPENDICULAR to the radius at that point — i.e. tangent to the
- * circle. With this, "teilen 5" produces 5 tangent helper lines marking 5
- * distinct division points around the circle. Earlier the tool emitted xlines
- * THROUGH THE CENTRE, but each such xline crosses the circle twice, so 5
- * xlines produced 10 division points — the user reported "es wird 10 mal
- * geteilt und nicht nur 5". Tangents touch the circle at exactly one point,
- * so the visible count matches what the user typed.
+ * "Teilen 5" → 5 segments, each touching the circumference at exactly one
+ * point.  Earlier versions emitted through-centre xlines (each crossing the
+ * circle twice → "10 statt 5") or tangent xlines (correct count but lines
+ * appeared as an external polygon).  Finite radial segments are unambiguous:
+ * N typed → N visible spokes, no duplicate intersections.
  *
- * Anchor (centre + cos/sin × r in local frame) is encoded as a `polar`
- * PointRef from the parametric centre, with angle and distance baked at
- * commit time. When the centre moves, the anchor follows; when the variable
- * driving the radius later changes, the literal-distance anchor stays put
- * (the tangent ends up off the circle until re-divided). Same trade-off the
- * original implementation accepted, kept for consistency.
+ * In parametric mode p1 tracks the circle centre via a `center` ref; p2 is a
+ * `polar` ref from the same centre at the division angle and the current
+ * radius.  Both refs re-evaluate when the circle moves or is resized.
  */
 function applyDivideCircleXLines(c: CircleEntity, n: number): void {
   if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
   lastDivideCount = n;
   if (c.r < 1e-9) { toast('Kreis zu klein'); return; }
 
-  // Build a parametric centre ref so the tangent xlines track the circle
-  // when it moves. The actual anchor is `polar(centre, angle, r)`.
   const circleFid = featureForEntity(c.id)?.id ?? null;
   const centerRef: PointRef = (circleFid && runtime.parametricMode)
     ? { kind: 'center', feature: circleFid }
@@ -4637,24 +4630,13 @@ function applyDivideCircleXLines(c: CircleEntity, n: number): void {
   pushUndo();
   for (let i = 0; i < n; i++) {
     const angDeg = (i / n) * 360;
-    const ang = (angDeg * Math.PI) / 180;
-    // Tangent direction at angle θ (CCW from +X) is (-sin θ, cos θ).
-    const tx = -Math.sin(ang);
-    const ty =  Math.cos(ang);
-    const anchor: PointRef = {
-      kind: 'polar',
-      from: centerRef,
-      angle: numE(angDeg),
-      distance: numE(c.r),
-    };
     state.features.push({
       id: newFeatureId(),
-      kind: 'xline',
+      kind: 'line',
       layer,
-      p: anchor,
-      dx: numE(tx),
-      dy: numE(ty),
-    });
+      p1: structuredClone(centerRef),
+      p2: { kind: 'polar', from: structuredClone(centerRef), angle: numE(angDeg), distance: numE(c.r) },
+    } as Feature);
   }
   evaluateTimeline();
   updateStats();
@@ -4662,23 +4644,23 @@ function applyDivideCircleXLines(c: CircleEntity, n: number): void {
 }
 
 /**
- * Emit N-1 **tangent** xlines that mark the internal division points of an
- * arc. Same rationale as `applyDivideCircleXLines` — using tangents avoids
- * the "double the user-typed count" surprise the through-centre approach
- * created. Endpoints aren't included (they're already on screen via the arc
- * itself), so the user gets exactly N-1 division markers between them.
+ * Emit N-1 radial **line segments** from the arc centre to each of the N-1
+ * interior division points of the arc.
+ *
+ * Arc endpoints are already visible, so only the interior marks are needed.
+ * Same approach as `applyDivideCircleXLines` — finite segments rather than
+ * xlines so the visible count matches the typed N exactly.
  */
 function applyDivideArcXLines(a: ArcEntity, n: number): void {
   if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
   lastDivideCount = n;
   if (a.r < 1e-9) { toast('Bogen zu klein'); return; }
   // Canonicalise sweep as in rendering: go CCW from a1, wrap to +2π when a2
-  // lies on the other side. Matches how ArcEntity arcs are drawn throughout.
+  // lies on the other side.
   let sweep = a.a2 - a.a1;
   while (sweep <= 0) sweep += Math.PI * 2;
   if (sweep > Math.PI * 2) sweep -= Math.PI * 2;
 
-  // Parametric centre.
   const arcFid = featureForEntity(a.id)?.id ?? null;
   const centerRef: PointRef = (arcFid && runtime.parametricMode)
     ? { kind: 'center', feature: arcFid }
@@ -4690,22 +4672,13 @@ function applyDivideArcXLines(a: ArcEntity, n: number): void {
     const t = i / n;
     const ang = a.a1 + sweep * t;
     const angDeg = (ang * 180) / Math.PI;
-    const tx = -Math.sin(ang);
-    const ty =  Math.cos(ang);
-    const anchor: PointRef = {
-      kind: 'polar',
-      from: centerRef,
-      angle: numE(angDeg),
-      distance: numE(a.r),
-    };
     state.features.push({
       id: newFeatureId(),
-      kind: 'xline',
+      kind: 'line',
       layer,
-      p: anchor,
-      dx: numE(tx),
-      dy: numE(ty),
-    });
+      p1: structuredClone(centerRef),
+      p2: { kind: 'polar', from: structuredClone(centerRef), angle: numE(angDeg), distance: numE(a.r) },
+    } as Feature);
   }
   evaluateTimeline();
   updateStats();
@@ -4713,11 +4686,13 @@ function applyDivideArcXLines(a: ArcEntity, n: number): void {
 }
 
 /**
- * Emit N radial xlines around an ellipse. Division is in parameter space
- * (equal Δt of 2π/N), not arc length — matching typical CAD "equal division"
- * behaviour on ellipses. Each xline anchors at the ellipse centre and points
- * toward the i-th parametric point, so it's effectively a radial construction
- * line through the centre (rotated by the ellipse's own `rot`).
+ * Emit N radial **line segments** from the ellipse centre to each of the N
+ * equally-spaced parametric division points on the perimeter.
+ *
+ * Division is in parameter space (equal Δt = 2π/N), matching typical CAD
+ * "equal angular division" behaviour.  Each segment runs from the centre to
+ * the i-th parametric point, giving exactly N visible spokes — no confusion
+ * about double-counting that infinite xlines would cause.
  */
 function applyDivideEllipseXLines(e: EllipseEntity, n: number): void {
   if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
@@ -4725,7 +4700,6 @@ function applyDivideEllipseXLines(e: EllipseEntity, n: number): void {
   if (e.rx < 1e-9 || e.ry < 1e-9) { toast('Ellipse zu klein'); return; }
   const cos = Math.cos(e.rot), sin = Math.sin(e.rot);
 
-  // Parametric centre — same as circle/arc.
   const ellipseFid = featureForEntity(e.id)?.id ?? null;
   const centerRef: PointRef = (ellipseFid && runtime.parametricMode)
     ? { kind: 'center', feature: ellipseFid }
@@ -4735,37 +4709,20 @@ function applyDivideEllipseXLines(e: EllipseEntity, n: number): void {
   pushUndo();
   for (let i = 0; i < n; i++) {
     const t = (i / n) * Math.PI * 2;
-    // Local ellipse point. Distance from centre is √((rx·cos t)²+(ry·sin t)²).
-    const lx = Math.cos(t) * e.rx;
-    const ly = Math.sin(t) * e.ry;
-    const dxLocal = lx * cos - ly * sin;
-    const dyLocal = lx * sin + ly * cos;
-    const dist = Math.hypot(dxLocal, dyLocal);
-    if (dist < 1e-9) continue;
-    // Tangent direction at parametric `t` is (−rx·sin t, ry·cos t) in local
-    // frame, then rotated into world. Same approach as circle/arc: emit a
-    // tangent xline at each division point so 5 typed = 5 visible markers.
-    const tlx = -Math.sin(t) * e.rx;
-    const tly =  Math.cos(t) * e.ry;
-    const tdx = tlx * cos - tly * sin;
-    const tdy = tlx * sin + tly * cos;
-    const tlen = Math.hypot(tdx, tdy);
-    if (tlen < 1e-9) continue;
-    const angDeg = (Math.atan2(dyLocal, dxLocal) * 180) / Math.PI;
-    const anchor: PointRef = {
-      kind: 'polar',
-      from: centerRef,
-      angle: numE(angDeg),
-      distance: numE(dist),
-    };
+    // World position of the i-th parametric point on the ellipse perimeter.
+    const lx = Math.cos(t) * e.rx, ly = Math.sin(t) * e.ry;
+    const dxWorld = lx * cos - ly * sin;
+    const dyWorld = lx * sin + ly * cos;
+    const d = Math.hypot(dxWorld, dyWorld);
+    if (d < 1e-9) continue;
+    const angDeg = (Math.atan2(dyWorld, dxWorld) * 180) / Math.PI;
     state.features.push({
       id: newFeatureId(),
-      kind: 'xline',
+      kind: 'line',
       layer,
-      p: anchor,
-      dx: numE(tdx / tlen),
-      dy: numE(tdy / tlen),
-    });
+      p1: structuredClone(centerRef),
+      p2: { kind: 'polar', from: structuredClone(centerRef), angle: numE(angDeg), distance: numE(d) },
+    } as Feature);
   }
   evaluateTimeline();
   updateStats();
@@ -6598,18 +6555,30 @@ export function updatePreview(): void {
           count = n - 1;
         }
       } else if (hit.type === 'circle' && hit.r > 1e-9) {
+        // Radial segments: centre → circumference. N spokes = N visible marks.
         for (let i = 0; i < n; i++) {
           const a = (i / n) * Math.PI * 2;
-          previews.push({ type: 'xline', x1: hit.cx, y1: hit.cy, dx: Math.cos(a), dy: Math.sin(a) });
+          previews.push({
+            type: 'line',
+            x1: hit.cx, y1: hit.cy,
+            x2: hit.cx + hit.r * Math.cos(a),
+            y2: hit.cy + hit.r * Math.sin(a),
+          });
         }
         count = n;
       } else if (hit.type === 'arc' && hit.r > 1e-9) {
         let sweep = hit.a2 - hit.a1;
         while (sweep <= 0) sweep += Math.PI * 2;
         if (sweep > Math.PI * 2) sweep -= Math.PI * 2;
+        // N-1 interior marks — endpoints already visible on the arc.
         for (let i = 1; i < n; i++) {
           const ang = hit.a1 + sweep * (i / n);
-          previews.push({ type: 'xline', x1: hit.cx, y1: hit.cy, dx: Math.cos(ang), dy: Math.sin(ang) });
+          previews.push({
+            type: 'line',
+            x1: hit.cx, y1: hit.cy,
+            x2: hit.cx + hit.r * Math.cos(ang),
+            y2: hit.cy + hit.r * Math.sin(ang),
+          });
         }
         count = n - 1;
       } else if (hit.type === 'ellipse' && hit.rx > 1e-9 && hit.ry > 1e-9) {
@@ -6618,8 +6587,13 @@ export function updatePreview(): void {
           const t = (i / n) * Math.PI * 2;
           const lx = Math.cos(t) * hit.rx, ly = Math.sin(t) * hit.ry;
           const ex = lx * cos - ly * sin, ey = lx * sin + ly * cos;
-          const L = Math.hypot(ex, ey);
-          if (L > 1e-9) previews.push({ type: 'xline', x1: hit.cx, y1: hit.cy, dx: ex / L, dy: ey / L });
+          if (Math.hypot(ex, ey) > 1e-9) {
+            previews.push({
+              type: 'line',
+              x1: hit.cx, y1: hit.cy,
+              x2: hit.cx + ex, y2: hit.cy + ey,
+            });
+          }
         }
         count = previews.length;
       }
@@ -7312,7 +7286,101 @@ export function applyFillet(radius: number): void {
     return;
   }
 
-  // ── Case C: unsupported configuration
+  // ── Case B2: at least one line is a modifier sub-output (fillet/mirror/clip/…)
+  // "Expand" the parent modifier(s): materialise their current sub-outputs as
+  // explicit independent features, hide the modifier, then apply the fillet
+  // normally on the newly-detached line features.  Parametricity of the parent
+  // modifier is intentionally dropped — the user wants to fillet what they see,
+  // and a live modifier can't be partially re-trimmed non-destructively.
+  //
+  // Guard: both from the SAME FilletFeature is handled by Case A above.
+  {
+    const needsExpand = (f: Feature | null): boolean => !f || f.kind !== 'line';
+    if (needsExpand(f1) || needsExpand(f2)) {
+      const result = computeFillet(l1, c1, l2, c2, radius);
+      if ('error' in result) { toast(result.error); resetPick(); return; }
+      const P = lineIntersectionInfinite(l1, l2);
+      if (!P) { toast('Linien sind parallel'); resetPick(); return; }
+      const cut1End = pickLineCutEnd(l1, c1, P);
+      const cut2End = pickLineCutEnd(l2, c2, P);
+
+      // Tracks entity-id → new free feature-id so siblings materialised in one
+      // expandModifier call are reused rather than duplicated in the next call.
+      const expandedIds = new Map<number, string>();
+
+      const expandModifier = (l: LineEntity, f: Feature | null): string => {
+        // Already a plain line feature — use it directly.
+        if (f && f.kind === 'line') return f.id;
+        // Already materialised as a sibling in a prior call — reuse.
+        if (expandedIds.has(l.id)) return expandedIds.get(l.id)!;
+
+        // Materialise sibling sub-outputs and hide the parent modifier.
+        if (f && !f.hidden) {
+          const siblings = state.entities.filter(
+            e => e.id !== l.id && featureForEntity(e.id)?.id === f.id,
+          );
+          for (const sib of siblings) {
+            if (sib.type === 'line') {
+              const sf = featureFromEntityInit({
+                type: 'line', layer: sib.layer,
+                x1: (sib as LineEntity).x1, y1: (sib as LineEntity).y1,
+                x2: (sib as LineEntity).x2, y2: (sib as LineEntity).y2,
+              });
+              state.features.push(sf);
+              expandedIds.set(sib.id, sf.id);
+            } else if (sib.type === 'arc') {
+              const a = sib as ArcEntity;
+              state.features.push(featureFromEntityInit({
+                type: 'arc', layer: a.layer,
+                cx: a.cx, cy: a.cy, r: a.r, a1: a.a1, a2: a.a2,
+              }));
+            } else if (sib.type === 'circle') {
+              const ci = sib as CircleEntity;
+              state.features.push(featureFromEntityInit({
+                type: 'circle', layer: ci.layer,
+                cx: ci.cx, cy: ci.cy, r: ci.r,
+              }));
+            }
+          }
+          f.hidden = true;
+        }
+
+        // Create a free LineFeature for the picked entity (abs coords).
+        const nf = featureFromEntityInit({
+          type: 'line', layer: l.layer,
+          x1: l.x1, y1: l.y1, x2: l.x2, y2: l.y2,
+        });
+        state.features.push(nf);
+        expandedIds.set(l.id, nf.id);
+        return nf.id;
+      };
+
+      pushUndo();
+      lastFilletRadius = radius;
+      const line1Id = expandModifier(l1, f1);
+      const line2Id = expandModifier(l2, f2);
+      const srcF1 = state.features.find(f => f.id === line1Id);
+      const srcF2 = state.features.find(f => f.id === line2Id);
+      if (srcF1) srcF1.hidden = true;
+      if (srcF2) srcF2.hidden = true;
+      state.features.push({
+        id: newFeatureId(),
+        kind: 'fillet',
+        layer: l1.layer,
+        line1Id,
+        line2Id,
+        cut1End,
+        cut2End,
+        radius,
+      } as Feature);
+      evaluateTimeline();
+      updateStats();
+      resetPick();
+      return;
+    }
+  }
+
+  // ── Case C: unsupported configuration (should never reach here now)
   toast('Verrundung nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
   resetPick();
 }
@@ -7448,7 +7516,87 @@ export function applyChamfer(distance: number): void {
     return;
   }
 
-  // ── Case C: unsupported
+  // ── Case B2: at least one line is a modifier sub-output → expand + chamfer ──
+  // Mirror of the fillet Case B2 logic: expand the parent modifier(s) into
+  // explicit features, then apply the chamfer on the detached line features.
+  {
+    const needsExpand = (f: Feature | null): boolean => !f || f.kind !== 'line';
+    if (needsExpand(f1) || needsExpand(f2)) {
+      const result = computeChamfer(l1, c1, l2, c2, distance);
+      if ('error' in result) { toast(result.error); resetPick(); return; }
+      const P = lineIntersectionInfinite(l1, l2);
+      if (!P) { toast('Linien sind parallel'); resetPick(); return; }
+      const cut1End = pickLineCutEnd(l1, c1, P);
+      const cut2End = pickLineCutEnd(l2, c2, P);
+
+      const expandedIds = new Map<number, string>();
+      const expandModifier = (l: LineEntity, f: Feature | null): string => {
+        if (f && f.kind === 'line') return f.id;
+        if (expandedIds.has(l.id)) return expandedIds.get(l.id)!;
+        if (f && !f.hidden) {
+          const siblings = state.entities.filter(
+            e => e.id !== l.id && featureForEntity(e.id)?.id === f.id,
+          );
+          for (const sib of siblings) {
+            if (sib.type === 'line') {
+              const sf = featureFromEntityInit({
+                type: 'line', layer: sib.layer,
+                x1: (sib as LineEntity).x1, y1: (sib as LineEntity).y1,
+                x2: (sib as LineEntity).x2, y2: (sib as LineEntity).y2,
+              });
+              state.features.push(sf);
+              expandedIds.set(sib.id, sf.id);
+            } else if (sib.type === 'arc') {
+              const a = sib as ArcEntity;
+              state.features.push(featureFromEntityInit({
+                type: 'arc', layer: a.layer,
+                cx: a.cx, cy: a.cy, r: a.r, a1: a.a1, a2: a.a2,
+              }));
+            } else if (sib.type === 'circle') {
+              const ci = sib as CircleEntity;
+              state.features.push(featureFromEntityInit({
+                type: 'circle', layer: ci.layer,
+                cx: ci.cx, cy: ci.cy, r: ci.r,
+              }));
+            }
+          }
+          f.hidden = true;
+        }
+        const nf = featureFromEntityInit({
+          type: 'line', layer: l.layer,
+          x1: l.x1, y1: l.y1, x2: l.x2, y2: l.y2,
+        });
+        state.features.push(nf);
+        expandedIds.set(l.id, nf.id);
+        return nf.id;
+      };
+
+      pushUndo();
+      lastChamferDist = distance;
+      const line1Id = expandModifier(l1, f1);
+      const line2Id = expandModifier(l2, f2);
+      const srcF1 = state.features.find(f => f.id === line1Id);
+      const srcF2 = state.features.find(f => f.id === line2Id);
+      if (srcF1) srcF1.hidden = true;
+      if (srcF2) srcF2.hidden = true;
+      state.features.push({
+        id: newFeatureId(),
+        kind: 'chamfer',
+        layer: l1.layer,
+        line1Id,
+        line2Id,
+        cut1End,
+        cut2End,
+        distance,
+      } as Feature);
+      evaluateTimeline();
+      updateStats();
+      resetPick();
+      return;
+    }
+  }
+
+  // ── Case C: unsupported (should never reach here now)
   toast('Fase nur zwischen zwei einfachen Linien oder Rechteck-Kanten möglich');
   resetPick();
 }
