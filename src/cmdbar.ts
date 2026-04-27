@@ -22,7 +22,7 @@ import {
   makeParallelXLine, makeXLineThroughRef, promptDivideCount,
   setPolygonSides, cancelTool,
 } from './tools';
-import { createParameter, evalExpr, findParamByName, parseExprInput } from './params';
+import { createParameter, evalExpr, findParamByName, parseExprInput, updateParameter } from './params';
 import { ensureParametricModeOn } from './parametric-mode';
 import { evaluateTimeline, newFeatureId } from './features';
 import { pushUndo } from './undo';
@@ -502,12 +502,19 @@ async function parseValueInput(raw: string, meaningHint?: string): Promise<CmdVa
     const hint = isBareIdent ? meaningHint : undefined;
     const valRaw = await showPrompt({
       title: `Neue Variable: ${r.name}`,
-      message: 'Wert eingeben (Zahl oder Formel).',
-      validate: (v) => Number.isFinite(parseFloat(v.replace(',', '.'))) ? null : 'Zahl erwartet',
+      message: 'Zahl, andere Variable oder Formel (z.B. W/2, 2*pi*R).',
+      validate: (v) => {
+        const rr = parseExprInput(v.trim());
+        if (!rr || rr.kind !== 'expr') return 'Ungültige Eingabe';
+        const n = evalExpr(rr.expr);
+        return Number.isFinite(n) ? null : 'Formel ergibt keine gültige Zahl';
+      },
     });
     if (valRaw == null) return null;
-    const val = parseFloat(valRaw.replace(',', '.'));
-    if (!Number.isFinite(val)) { toast('Ungültige Zahl'); return null; }
+    const parsedVal = parseExprInput(valRaw.trim());
+    if (!parsedVal || parsedVal.kind !== 'expr') { toast('Ungültige Eingabe'); return null; }
+    const val = evalExpr(parsedVal.expr);
+    if (!Number.isFinite(val)) { toast('Formel ergibt keine gültige Zahl'); return null; }
     const meaning = await showPrompt({
       title: `Bedeutung von ${r.name}`,
       message: hint ? `Optional — z.B. ${hint}` : 'Optional — wofür steht diese Variable?',
@@ -516,7 +523,13 @@ async function parseValueInput(raw: string, meaningHint?: string): Promise<CmdVa
     }) ?? '';
     const existing = findParamByName(r.name);
     if (!existing) {
-      createParameter(r.name, val, meaning.trim() || undefined);
+      const created = createParameter(r.name, val, meaning.trim() || undefined);
+      // If the user typed a formula (not just a number) at the value prompt,
+      // attach it as a driving formula so the new variable updates when
+      // referenced parameters change.
+      if (parsedVal.expr.kind !== 'num') {
+        updateParameter(created.id, { formula: parsedVal.expr });
+      }
       // Typing an unknown identifier in a measurement prompt is an implicit
       // opt-in to parametric mode — switch it on so the dimension actually
       // binds to the variable (instead of baking in the current numeric value).

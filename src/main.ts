@@ -26,7 +26,7 @@ import {
   ensureAxisFeatures, evaluateTimeline, featureForEntity,
   replaceFeatureFromInit,
 } from './features';
-import { createParameter, findParamByName, parseExprInput } from './params';
+import { createParameter, evalExpr, findParamByName, parseExprInput, updateParameter } from './params';
 import { ensureParametricModeOn } from './parametric-mode';
 import { applyBundledDefaultsIfUnset, applyUserDefaultsAtStartup } from './user-defaults';
 import { pushUndo, redo, undo } from './undo';
@@ -940,20 +940,39 @@ btnAddParam.onclick = async () => {
   });
   if (!name || !name.trim()) return;
   const trimmed = name.trim();
+  // Wert-Eingabe akzeptiert jetzt Zahlen UND Formeln (wie das Wertefeld einer
+  // bestehenden Variable in der Sidebar). Pure Zahl → konstante Variable.
+  // Formel mit Referenz auf andere Variablen → driving formula, wird bei jeder
+  // evaluateTimeline() neu berechnet. Vermeidet "Zahl erwartet" wenn der User
+  // direkt z.B. `X*2` als Initialwert tippen will.
   const valRaw = await showPrompt({
     title: `Wert für ${trimmed}`,
+    message: 'Zahl, andere Variable oder Formel (z.B. W/2, 2*pi*R).',
     defaultValue: '0',
-    validate: (v) => Number.isFinite(parseFloat(v.replace(',', '.'))) ? null : 'Zahl erwartet',
+    validate: (v) => {
+      const r = parseExprInput(v.trim());
+      if (!r || r.kind !== 'expr') return 'Ungültige Eingabe';
+      const n = evalExpr(r.expr);
+      return Number.isFinite(n) ? null : 'Formel ergibt keine gültige Zahl';
+    },
   });
   if (valRaw == null) return;
-  const val = parseFloat(valRaw.replace(',', '.'));
-  if (!Number.isFinite(val)) { toast('Ungültige Zahl'); return; }
+  const parsed = parseExprInput(valRaw.trim());
+  if (!parsed || parsed.kind !== 'expr') { toast('Ungültige Eingabe'); return; }
+  const val = evalExpr(parsed.expr);
+  if (!Number.isFinite(val)) { toast('Formel ergibt keine gültige Zahl'); return; }
   const meaning = await showPrompt({
     title: `Bedeutung von ${trimmed}`,
     message: 'Optional — wofür steht diese Variable?',
     placeholder: 'z.B. Länge',
   }) ?? '';
-  createParameter(trimmed, val, meaning.trim() || undefined);
+  // Create with the evaluated number. If the input was a formula referencing
+  // other parameters, attach it via updateParameter so future variable
+  // changes propagate. Pure-numeric input → leave formula undefined (constant).
+  const created = createParameter(trimmed, val, meaning.trim() || undefined);
+  if (parsed.expr.kind !== 'num') {
+    updateParameter(created.id, { formula: parsed.expr });
+  }
   // Creating a variable implies the user wants parametric behaviour — if they
   // hadn't already enabled it, turn it on now (with a toast so the mode
   // change is visible).
