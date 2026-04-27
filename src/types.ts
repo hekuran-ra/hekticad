@@ -491,6 +491,25 @@ type FeatureBase = {
 
 export type LineFeature      = FeatureBase & { kind: 'line';      p1: PointRef; p2: PointRef };
 export type PolylineFeature  = FeatureBase & { kind: 'polyline';  pts: PointRef[]; closed: boolean };
+/**
+ * Regular polygon feature — center + radius + side count + start angle, all
+ * Expr-driven so a variable change reshapes the polygon. Emits a closed
+ * polyline entity at evaluation time. Inscribed in a circle of `radius`,
+ * with the first vertex at angle `startAngle` (radians) measured from +X
+ * around `center`. Subsequent vertices are placed by rotating
+ * `2π / sides` around the centre.
+ */
+export type PolygonFeature   = FeatureBase & {
+  kind: 'polygon';
+  center: PointRef;
+  radius: Expr;
+  /** Number of sides as an Expr — allows variables to change side count
+   *  parametrically. Floored to integer ≥ 3 at evaluation. */
+  sides: Expr;
+  /** First vertex angle in radians around centre. 0 = +X. Stored as Expr
+   *  so the polygon can be parametrically rotated by changing a variable. */
+  startAngle: Expr;
+};
 export type RectFeature      = FeatureBase & {
   kind: 'rect';
   p1: PointRef;
@@ -749,7 +768,7 @@ export type ChamferFeature = FeatureBase & {
 export type Feature =
   | LineFeature | PolylineFeature | RectFeature | CircleFeature | ArcFeature
   | EllipseFeature | SplineFeature | XLineFeature | ParallelXLineFeature
-  | AxisParallelXLineFeature
+  | AxisParallelXLineFeature | PolygonFeature
   | TextFeature | DimFeature | HatchFeature
   | MirrorFeature | ArrayFeature | RotateFeature | CrossMirrorFeature
   | ClipFeature | FilletFeature | ChamferFeature;

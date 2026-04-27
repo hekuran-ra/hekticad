@@ -3256,30 +3256,6 @@ export function finishPolyline(closed: boolean): void {
   render();
 }
 
-/**
- * Break a polyline into N (or N+1 if closed) independent line features so
- * each segment is individually selectable/editable AND every vertex behaves
- * as a first-class line endpoint — the snap engine already knows how to find
- * those, so a fresh line drawn between two ex-polyline vertices "just works".
- * Used by both the polyline tool and the polygon tool.
- */
-function commitPolylineAsLines(refs: PointRef[], closed: boolean, layer: number): void {
-  if (refs.length < 2) return;
-  const n = refs.length;
-  const segCount = closed ? n : n - 1;
-  for (let i = 0; i < segCount; i++) {
-    const a = refs[i];
-    const b = refs[(i + 1) % n];
-    state.features.push({
-      id: newFeatureId(),
-      kind: 'line',
-      layer,
-      p1: a,
-      p2: b,
-    });
-  }
-}
-
 function handleRectClick(p: Pt): void {
   const tc = runtime.toolCtx;
   if (!tc || tc.step === 'p1') {
@@ -3950,7 +3926,10 @@ function polygonPoints(cx: number, cy: number, r: number, n: number, startAng: n
 function handlePolygonClick(p: Pt): void {
   const tc = runtime.toolCtx;
   if (!tc || tc.step === 'center') {
-    runtime.toolCtx = { step: 'radius', cx: p.x, cy: p.y };
+    // Capture the snap-on-centre PointRef so the polygon's center tracks
+    // any feature it was anchored to. Mirrors the circle-tool flow.
+    const centerRef = snapToPointRef(runtime.lastSnap, p);
+    runtime.toolCtx = { step: 'radius', cx: p.x, cy: p.y, centerRef };
     setPrompt(`Radius eingeben oder Eckpunkt klicken (n=${lastPolygonSides})`);
     updatePreview();
     render();
@@ -3960,12 +3939,23 @@ function handlePolygonClick(p: Pt): void {
     const r = dist(p, { x: tc.cx, y: tc.cy });
     if (r < 1e-6) return;
     const startAng = Math.atan2(p.y - tc.cy, p.x - tc.cx);
-    const pts = polygonPoints(tc.cx, tc.cy, r, lastPolygonSides, startAng);
-    const refs: PointRef[] = pts.map((pt): PointRef => ({
-      kind: 'abs', x: numE(pt.x), y: numE(pt.y),
-    }));
     pushUndo();
-    commitPolylineAsLines(refs, true, state.activeLayer);
+    // Emit a real PolygonFeature so side count, radius, start angle and
+    // centre stay parametric. The feature evaluates to a closed polyline
+    // entity, same render the legacy line-fan produced. Variables in the
+    // cmdbar (n / radius / start angle) flow through as Exprs in a future
+    // cmdbar wiring; today the click path bakes literals.
+    const center: PointRef = tc.centerRef
+      ?? { kind: 'abs', x: numE(tc.cx), y: numE(tc.cy) };
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'polygon',
+      layer: state.activeLayer,
+      center,
+      radius: numE(r),
+      sides: numE(lastPolygonSides),
+      startAngle: numE(startAng),
+    });
     evaluateTimeline();
     updateStats();
     runtime.toolCtx = { step: 'center' };
@@ -4077,7 +4067,18 @@ function handleArc3Click(p: Pt): void {
       toast('Bogenhöhe zu klein — Seite wählen');
       return;
     }
-    addEntity({ type: 'arc', cx: arc.cx, cy: arc.cy, r: arc.r, a1: arc.a1, a2: arc.a2, layer: state.activeLayer });
+    pushUndo();
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'arc',
+      layer: state.activeLayer,
+      center: { kind: 'abs', x: numE(arc.cx), y: numE(arc.cy) },
+      radius: numE(arc.r),
+      a1: numE(arc.a1),
+      a2: numE(arc.a2),
+    });
+    evaluateTimeline();
+    updateStats();
     runtime.toolCtx = { step: 'p1', pts: [] };
     setPrompt('Startpunkt des Bogens');
   }
@@ -4129,7 +4130,18 @@ export function commitArcBulge(tc: ToolCtx, h: number): void {
   const signedH = h * side;
   const arc = arcFromChordBulge(a, b, signedH);
   if (!arc) { toast('Bogen ungültig'); return; }
-  addEntity({ type: 'arc', cx: arc.cx, cy: arc.cy, r: arc.r, a1: arc.a1, a2: arc.a2, layer: state.activeLayer });
+  pushUndo();
+  state.features.push({
+    id: newFeatureId(),
+    kind: 'arc',
+    layer: state.activeLayer,
+    center: { kind: 'abs', x: numE(arc.cx), y: numE(arc.cy) },
+    radius: numE(arc.r),
+    a1: numE(arc.a1),
+    a2: numE(arc.a2),
+  });
+  evaluateTimeline();
+  updateStats();
   runtime.toolCtx = { step: 'p1', pts: [] };
   setPrompt('Startpunkt des Bogens');
   render();
@@ -4140,7 +4152,11 @@ export function commitArcBulge(tc: ToolCtx, h: number): void {
 function handleEllipseClick(p: Pt): void {
   const tc = runtime.toolCtx;
   if (!tc || tc.step === 'center') {
-    runtime.toolCtx = { step: 'axis1', centerPt: p };
+    // Capture the snap-on-centre PointRef so the ellipse follows the
+    // anchored feature when the user later moves a parameter that drives
+    // it. Mirrors the circle / polygon flow.
+    const centerRef = snapToPointRef(runtime.lastSnap, p);
+    runtime.toolCtx = { step: 'axis1', centerPt: p, centerRef };
     setPrompt('Ende der ersten Halbachse');
     render();
     return;
@@ -4169,7 +4185,8 @@ function handleEllipseClick(p: Pt): void {
       if (rx < 1e-6) return;
       rot = Math.atan2(dy, dx);
     }
-    runtime.toolCtx = { step: 'axis2', centerPt: c, a1: endPt, angleDeg: rot, radius: rx };
+    runtime.toolCtx = { step: 'axis2', centerPt: c, a1: endPt, angleDeg: rot, radius: rx,
+                        centerRef: tc.centerRef };
     setPrompt('Länge der zweiten Halbachse');
     render();
     return;
@@ -4181,7 +4198,24 @@ function handleEllipseClick(p: Pt): void {
     const nx = -Math.sin(rot), ny = Math.cos(rot);
     const ry = Math.abs((p.x - c.x) * nx + (p.y - c.y) * ny);
     if (ry < 1e-6) return;
-    addEntity({ type: 'ellipse', cx: c.x, cy: c.y, rx: tc.radius, ry, rot, layer: state.activeLayer });
+    // Build EllipseFeature directly so the centre stays parametric. rx/ry/rot
+    // are baked as literal Exprs at commit time — cmdbar parametric path
+    // (commitEllipse... below) supersedes those when the user types
+    // expressions, identical to the circle flow.
+    pushUndo();
+    const center: PointRef = tc.centerRef
+      ?? { kind: 'abs', x: numE(c.x), y: numE(c.y) };
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'ellipse',
+      layer: state.activeLayer,
+      center,
+      rx: numE(tc.radius),
+      ry: numE(ry),
+      rot: numE(rot),
+    });
+    evaluateTimeline();
+    updateStats();
     runtime.toolCtx = { step: 'center' };
     setPrompt('Mittelpunkt der Ellipse');
     render();
@@ -4193,8 +4227,14 @@ function handleEllipseClick(p: Pt): void {
 function handleSplineClick(p: Pt): void {
   const tc = runtime.toolCtx;
   if (!tc) return;
-  if (!tc.pts) tc.pts = [];
+  if (!tc.pts)    tc.pts    = [];
+  if (!tc.ptRefs) tc.ptRefs = [];
+  // Capture the parametric ref alongside the abs world point so the spline
+  // can later emit a SplineFeature whose vertices are PointRefs — when the
+  // referenced feature moves, the spline knot follows. Mirror the polyline
+  // tool's pattern so behaviour stays consistent across the curve tools.
   tc.pts.push(p);
+  tc.ptRefs.push(snapToPointRef(runtime.lastSnap, p));
   setPrompt(tc.pts.length === 1 ? 'Nächster Stützpunkt' : 'Nächster Stützpunkt (Enter beendet)');
   render();
 }
@@ -4202,14 +4242,25 @@ function handleSplineClick(p: Pt): void {
 export function finishSpline(closed: boolean): void {
   const tc = runtime.toolCtx;
   if (tc && tc.pts && tc.pts.length >= 2) {
-    addEntity({
-      type: 'spline',
-      pts: [...tc.pts],
-      closed: !!closed,
+    // Build a SplineFeature directly so each vertex keeps its parametric
+    // ref. addEntity → featureFromEntityInit would flatten everything to
+    // abs PointRefs, which is exactly the un-parametric behaviour the
+    // user complained about for splines.
+    const refs: PointRef[] = (tc.ptRefs && tc.ptRefs.length === tc.pts.length)
+      ? tc.pts.map((pt, i) => tc.ptRefs![i] ?? ({ kind: 'abs', x: numE(pt.x), y: numE(pt.y) } as PointRef))
+      : tc.pts.map((pt): PointRef => ({ kind: 'abs', x: numE(pt.x), y: numE(pt.y) }));
+    pushUndo();
+    state.features.push({
+      id: newFeatureId(),
+      kind: 'spline',
       layer: state.activeLayer,
+      pts: refs,
+      closed: !!closed,
     });
+    evaluateTimeline();
+    updateStats();
   }
-  runtime.toolCtx = { step: 'p1', pts: [] };
+  runtime.toolCtx = { step: 'p1', pts: [], ptRefs: [] };
   setPrompt('Erster Punkt der Spline');
   render();
 }
@@ -4552,21 +4603,31 @@ function applyDivideXLine(l: LineEntity, n: number): void {
 }
 
 /**
- * Emit N radial xlines around a full circle at equal angular intervals. The
- * xlines pass through the circle centre and a division point on the circle
- * (so each one marks a pie-slice boundary). Unlike the line case there's no
- * "internal" vs "endpoint" distinction on a closed curve — all N points
- * contribute an xline. Note that diametrically opposite points produce the
- * same xline (an xline extends both ways), so for even N the user gets N/2
- * distinct lines; we still emit N entries because the duplicates are cheap
- * and deleting half would surprise on odd N where they're all distinct.
+ * Emit N **tangent** xlines around a full circle at equal angular intervals.
+ *
+ * Each xline is anchored at one of the N division points on the circumference
+ * and runs PERPENDICULAR to the radius at that point — i.e. tangent to the
+ * circle. With this, "teilen 5" produces 5 tangent helper lines marking 5
+ * distinct division points around the circle. Earlier the tool emitted xlines
+ * THROUGH THE CENTRE, but each such xline crosses the circle twice, so 5
+ * xlines produced 10 division points — the user reported "es wird 10 mal
+ * geteilt und nicht nur 5". Tangents touch the circle at exactly one point,
+ * so the visible count matches what the user typed.
+ *
+ * Anchor (centre + cos/sin × r in local frame) is encoded as a `polar`
+ * PointRef from the parametric centre, with angle and distance baked at
+ * commit time. When the centre moves, the anchor follows; when the variable
+ * driving the radius later changes, the literal-distance anchor stays put
+ * (the tangent ends up off the circle until re-divided). Same trade-off the
+ * original implementation accepted, kept for consistency.
  */
 function applyDivideCircleXLines(c: CircleEntity, n: number): void {
   if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
   lastDivideCount = n;
   if (c.r < 1e-9) { toast('Kreis zu klein'); return; }
 
-  // Build a parametric center ref so the xlines track the circle when it moves.
+  // Build a parametric centre ref so the tangent xlines track the circle
+  // when it moves. The actual anchor is `polar(centre, angle, r)`.
   const circleFid = featureForEntity(c.id)?.id ?? null;
   const centerRef: PointRef = (circleFid && runtime.parametricMode)
     ? { kind: 'center', feature: circleFid }
@@ -4575,17 +4636,24 @@ function applyDivideCircleXLines(c: CircleEntity, n: number): void {
   const layer = hilfslinieLayer();
   pushUndo();
   for (let i = 0; i < n; i++) {
-    const a = (i / n) * Math.PI * 2;
-    const dx = Math.cos(a), dy = Math.sin(a);
+    const angDeg = (i / n) * 360;
+    const ang = (angDeg * Math.PI) / 180;
+    // Tangent direction at angle θ (CCW from +X) is (-sin θ, cos θ).
+    const tx = -Math.sin(ang);
+    const ty =  Math.cos(ang);
+    const anchor: PointRef = {
+      kind: 'polar',
+      from: centerRef,
+      angle: numE(angDeg),
+      distance: numE(c.r),
+    };
     state.features.push({
       id: newFeatureId(),
       kind: 'xline',
       layer,
-      // Anchor at the centre — the xline then points through the i-th division
-      // point on the circumference along (dx, dy).
-      p: centerRef,
-      dx: numE(dx),
-      dy: numE(dy),
+      p: anchor,
+      dx: numE(tx),
+      dy: numE(ty),
     });
   }
   evaluateTimeline();
@@ -4594,11 +4662,11 @@ function applyDivideCircleXLines(c: CircleEntity, n: number): void {
 }
 
 /**
- * Emit N-1 radial xlines that divide an arc into N equal-angle segments.
- * Arcs have endpoints (a1, a2), so like the line case we emit only the
- * internal division points — the endpoints are already on screen. Direction
- * respects the arc's sweep (a1 → a2 in its stored order; handled by
- * normalising the sweep to [0, 2π)).
+ * Emit N-1 **tangent** xlines that mark the internal division points of an
+ * arc. Same rationale as `applyDivideCircleXLines` — using tangents avoids
+ * the "double the user-typed count" surprise the through-centre approach
+ * created. Endpoints aren't included (they're already on screen via the arc
+ * itself), so the user gets exactly N-1 division markers between them.
  */
 function applyDivideArcXLines(a: ArcEntity, n: number): void {
   if (!Number.isInteger(n) || n < 2 || n > 200) { toast('Anzahl 2-200'); return; }
@@ -4610,7 +4678,7 @@ function applyDivideArcXLines(a: ArcEntity, n: number): void {
   while (sweep <= 0) sweep += Math.PI * 2;
   if (sweep > Math.PI * 2) sweep -= Math.PI * 2;
 
-  // Build a parametric center ref so the xlines track the arc when it moves.
+  // Parametric centre.
   const arcFid = featureForEntity(a.id)?.id ?? null;
   const centerRef: PointRef = (arcFid && runtime.parametricMode)
     ? { kind: 'center', feature: arcFid }
@@ -4621,14 +4689,22 @@ function applyDivideArcXLines(a: ArcEntity, n: number): void {
   for (let i = 1; i < n; i++) {
     const t = i / n;
     const ang = a.a1 + sweep * t;
-    const dx = Math.cos(ang), dy = Math.sin(ang);
+    const angDeg = (ang * 180) / Math.PI;
+    const tx = -Math.sin(ang);
+    const ty =  Math.cos(ang);
+    const anchor: PointRef = {
+      kind: 'polar',
+      from: centerRef,
+      angle: numE(angDeg),
+      distance: numE(a.r),
+    };
     state.features.push({
       id: newFeatureId(),
       kind: 'xline',
       layer,
-      p: centerRef,
-      dx: numE(dx),
-      dy: numE(dy),
+      p: anchor,
+      dx: numE(tx),
+      dy: numE(ty),
     });
   }
   evaluateTimeline();
@@ -4649,7 +4725,7 @@ function applyDivideEllipseXLines(e: EllipseEntity, n: number): void {
   if (e.rx < 1e-9 || e.ry < 1e-9) { toast('Ellipse zu klein'); return; }
   const cos = Math.cos(e.rot), sin = Math.sin(e.rot);
 
-  // Build a parametric center ref so the xlines track the ellipse when it moves.
+  // Parametric centre — same as circle/arc.
   const ellipseFid = featureForEntity(e.id)?.id ?? null;
   const centerRef: PointRef = (ellipseFid && runtime.parametricMode)
     ? { kind: 'center', feature: ellipseFid }
@@ -4659,21 +4735,36 @@ function applyDivideEllipseXLines(e: EllipseEntity, n: number): void {
   pushUndo();
   for (let i = 0; i < n; i++) {
     const t = (i / n) * Math.PI * 2;
-    // Local ellipse point, then rotate into world frame. Anchor on centre so
-    // the xline direction is from centre toward the division point.
+    // Local ellipse point. Distance from centre is √((rx·cos t)²+(ry·sin t)²).
     const lx = Math.cos(t) * e.rx;
     const ly = Math.sin(t) * e.ry;
-    const dx = lx * cos - ly * sin;
-    const dy = lx * sin + ly * cos;
-    const L = Math.hypot(dx, dy);
-    if (L < 1e-9) continue;
+    const dxLocal = lx * cos - ly * sin;
+    const dyLocal = lx * sin + ly * cos;
+    const dist = Math.hypot(dxLocal, dyLocal);
+    if (dist < 1e-9) continue;
+    // Tangent direction at parametric `t` is (−rx·sin t, ry·cos t) in local
+    // frame, then rotated into world. Same approach as circle/arc: emit a
+    // tangent xline at each division point so 5 typed = 5 visible markers.
+    const tlx = -Math.sin(t) * e.rx;
+    const tly =  Math.cos(t) * e.ry;
+    const tdx = tlx * cos - tly * sin;
+    const tdy = tlx * sin + tly * cos;
+    const tlen = Math.hypot(tdx, tdy);
+    if (tlen < 1e-9) continue;
+    const angDeg = (Math.atan2(dyLocal, dxLocal) * 180) / Math.PI;
+    const anchor: PointRef = {
+      kind: 'polar',
+      from: centerRef,
+      angle: numE(angDeg),
+      distance: numE(dist),
+    };
     state.features.push({
       id: newFeatureId(),
       kind: 'xline',
       layer,
-      p: centerRef,
-      dx: numE(dx / L),
-      dy: numE(dy / L),
+      p: anchor,
+      dx: numE(tdx / tlen),
+      dy: numE(tdy / tlen),
     });
   }
   evaluateTimeline();

@@ -154,6 +154,7 @@ export function featureDependencies(f: Feature): Set<string> {
     case 'circle':
     case 'arc':
     case 'ellipse':
+    case 'polygon':
       collectRefTargets(f.center, out);
       break;
     case 'xline':
@@ -1308,6 +1309,26 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
       const pts = f.pts.map(r => resolvePt(r, ctx));
       return { id, type: 'spline', layer: f.layer, pts, closed: f.closed };
     }
+    case 'polygon': {
+      const c = resolvePt(f.center, ctx);
+      const r = Math.max(1e-9, evalExpr(f.radius));
+      // Side count is an Expr but must be an integer ≥ 3 for the polygon to
+      // make sense. Floor + clamp; below 3 we degrade to a triangle so the
+      // user sees something rather than nothing while typing a formula.
+      const nRaw = evalExpr(f.sides);
+      const n = Math.max(3, Math.min(2048, Math.floor(Number.isFinite(nRaw) ? nRaw : 3)));
+      const startAng = evalExpr(f.startAngle) || 0;
+      const step = (2 * Math.PI) / n;
+      const pts: Pt[] = [];
+      for (let i = 0; i < n; i++) {
+        const a = startAng + i * step;
+        pts.push({ x: c.x + Math.cos(a) * r, y: c.y + Math.sin(a) * r });
+      }
+      // Emit as a closed polyline entity — same renderable shape the previous
+      // line-by-line polygon flow produced. Keeping the entity type stable
+      // means hit-test, snap, fillet/chamfer, mirror etc. all work unchanged.
+      return { id, type: 'polyline', layer: f.layer, pts, closed: true };
+    }
     case 'xline': {
       const p = resolvePt(f.p, ctx);
       return {
@@ -1554,6 +1575,7 @@ function featureReferencesAnyParam(f: Feature, changed: Set<string>): boolean {
     case 'circle':   return pRefs(f.center) || eRefs(f.radius);
     case 'arc':      return pRefs(f.center) || eRefs(f.radius) || eRefs(f.a1) || eRefs(f.a2);
     case 'ellipse':  return pRefs(f.center) || eRefs(f.rx) || eRefs(f.ry) || eRefs(f.rot);
+    case 'polygon':  return pRefs(f.center) || eRefs(f.radius) || eRefs(f.sides) || eRefs(f.startAngle);
     case 'spline':   for (const p of f.pts) if (pRefs(p)) return true; return false;
     case 'xline':    return pRefs(f.p) || eRefs(f.dx) || eRefs(f.dy);
     case 'parallelXLine':     return eRefs(f.distance);
@@ -2154,6 +2176,7 @@ function collectFeatureRefs(f: Feature): string[] {
     case 'circle':   out.push(...collectRefs(f.center)); break;
     case 'arc':      out.push(...collectRefs(f.center)); break;
     case 'ellipse':  out.push(...collectRefs(f.center)); break;
+    case 'polygon':  out.push(...collectRefs(f.center)); break;
     case 'spline':   for (const p of f.pts) out.push(...collectRefs(p)); break;
     case 'xline':    out.push(...collectRefs(f.p)); break;
     case 'parallelXLine': out.push(f.refFeature); break;
@@ -2229,6 +2252,7 @@ export function featureLabel(f: Feature): string {
     case 'circle':   return 'Kreis';
     case 'arc':      return 'Bogen';
     case 'ellipse':  return 'Ellipse';
+    case 'polygon':  return 'Polygon';
     case 'spline':   return 'Spline';
     case 'xline':    return 'Hilfslinie';
     case 'parallelXLine': return 'Parallel';
@@ -2255,6 +2279,7 @@ export function featureDetail(f: Feature): string {
     case 'circle':   return `r = ${exprLabel(f.radius)}`;
     case 'arc':      return `r = ${exprLabel(f.radius)}`;
     case 'ellipse':  return `${exprLabel(f.rx)} × ${exprLabel(f.ry)}`;
+    case 'polygon':  return `n = ${exprLabel(f.sides)} · r = ${exprLabel(f.radius)}`;
     case 'spline':   return `${f.pts.length} Stützpunkte`;
     case 'xline':    return `(${exprLabel(f.dx)}, ${exprLabel(f.dy)})`;
     case 'parallelXLine':
