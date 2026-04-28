@@ -256,8 +256,11 @@ function collectRefs(n: FormulaNode, out: string[]): void {
 // Evaluation + formatting
 // ============================================================================
 
-/** Evaluate an Expr against current state.parameters. */
-export function evalExpr(e: Expr): number {
+/** Evaluate an Expr against current state.parameters. Tolerates a bare number
+ *  for legacy compatibility — fillet/chamfer used to store radius/distance as
+ *  plain `number`, and old `.hcad` saves still come in with that shape. */
+export function evalExpr(e: Expr | number): number {
+  if (typeof e === 'number') return e;
   if (e.kind === 'num') return e.value;
   if (e.kind === 'param') {
     const p = state.parameters.find(x => x.id === e.id);
@@ -547,10 +550,14 @@ export function isParameterReferenced(id: string): boolean {
       case 'arc':
         if (inPtRef(f.center)) return true;
         if (inExpr(f.radius) || inExpr(f.a1) || inExpr(f.a2)) return true;
+        if (f.p1 && inPtRef(f.p1)) return true;
+        if (f.p2 && inPtRef(f.p2)) return true;
+        if (f.bulgeHeight && inExpr(f.bulgeHeight)) return true;
         break;
       case 'ellipse':
         if (inPtRef(f.center)) return true;
         if (inExpr(f.rx) || inExpr(f.ry) || inExpr(f.rot)) return true;
+        if (f.axisEnd && inPtRef(f.axisEnd)) return true;
         break;
       case 'spline':
         for (const pt of f.pts) if (inPtRef(pt)) return true;

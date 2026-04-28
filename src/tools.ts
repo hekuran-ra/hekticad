@@ -4106,13 +4106,16 @@ function handleArc3Click(p: Pt): void {
   const tc = runtime.toolCtx;
   if (!tc) return;
   if (!tc.pts) tc.pts = [];
+  if (!tc.ptRefs) tc.ptRefs = [];
 
   if (tc.pts.length === 0) {
     tc.pts.push(p);
+    tc.ptRefs.push(snapToPointRef(runtime.lastSnap, p));
     tc.step = 'p2';
     setPrompt('Endpunkt des Bogens');
   } else if (tc.pts.length === 1) {
     tc.pts.push(p);
+    tc.ptRefs.push(snapToPointRef(runtime.lastSnap, p));
     tc.step = 'bulge';
     setPrompt('Bogen auf eine Seite ziehen · oder Höhe eingeben');
   } else {
@@ -4123,19 +4126,34 @@ function handleArc3Click(p: Pt): void {
       toast('Bogenhöhe zu klein — Seite wählen');
       return;
     }
+    // Compute signed bulge height (perpendicular to chord) so we can store
+    // it as Expr. The evaluator re-derives center+radius+angles from p1/p2
+    // + bulgeHeight on every timeline tick — variables live!
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const L = Math.hypot(dx, dy);
+    const nx = -dy / L, ny = dx / L;
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const h = (p.x - mx) * nx + (p.y - my) * ny;
     pushUndo();
+    const p1Ref = tc.ptRefs[0] ?? { kind: 'abs' as const, x: numE(a.x), y: numE(a.y) };
+    const p2Ref = tc.ptRefs[1] ?? { kind: 'abs' as const, x: numE(b.x), y: numE(b.y) };
     state.features.push({
       id: newFeatureId(),
       kind: 'arc',
       layer: state.activeLayer,
+      // Legacy fields kept as fallback for evaluation when p1/p2 aren't
+      // resolvable (e.g. referenced feature deleted).
       center: { kind: 'abs', x: numE(arc.cx), y: numE(arc.cy) },
       radius: numE(arc.r),
       a1: numE(arc.a1),
       a2: numE(arc.a2),
+      p1: p1Ref,
+      p2: p2Ref,
+      bulgeHeight: numE(h),
     });
     evaluateTimeline();
     updateStats();
-    runtime.toolCtx = { step: 'p1', pts: [] };
+    runtime.toolCtx = { step: 'p1', pts: [], ptRefs: [] };
     setPrompt('Startpunkt des Bogens');
   }
   render();
@@ -4187,6 +4205,8 @@ export function commitArcBulge(tc: ToolCtx, h: number): void {
   const arc = arcFromChordBulge(a, b, signedH);
   if (!arc) { toast('Bogen ungültig'); return; }
   pushUndo();
+  const p1Ref = tc.ptRefs?.[0] ?? { kind: 'abs' as const, x: numE(a.x), y: numE(a.y) };
+  const p2Ref = tc.ptRefs?.[1] ?? { kind: 'abs' as const, x: numE(b.x), y: numE(b.y) };
   state.features.push({
     id: newFeatureId(),
     kind: 'arc',
@@ -4195,6 +4215,9 @@ export function commitArcBulge(tc: ToolCtx, h: number): void {
     radius: numE(arc.r),
     a1: numE(arc.a1),
     a2: numE(arc.a2),
+    p1: p1Ref,
+    p2: p2Ref,
+    bulgeHeight: numE(signedH),
   });
   evaluateTimeline();
   updateStats();
@@ -4229,8 +4252,6 @@ function handleEllipseClick(p: Pt): void {
       const v = sub(p, c);
       const d = dot(v, tc.lockedDir);
       if (Math.abs(d) < 1e-6) return;
-      // Vorzeichen der Projektion erhalten, damit der Nutzer auch "rückwärts"
-      // an der Achse entlang klicken könnte; Länge ist der Betrag.
       const signedDir = d >= 0 ? tc.lockedDir : { x: -tc.lockedDir.x, y: -tc.lockedDir.y };
       rx = Math.abs(d);
       endPt = add(c, scale(signedDir, rx));
@@ -4241,23 +4262,22 @@ function handleEllipseClick(p: Pt): void {
       if (rx < 1e-6) return;
       rot = Math.atan2(dy, dx);
     }
+    // Capture axis1 endpoint snap (analogous to centerRef) so the ellipse's
+    // first axis can track an anchored feature — its length and rotation
+    // become derived from center → axisEnd at evaluation time.
+    const axisRef = snapToPointRef(runtime.lastSnap, p);
     runtime.toolCtx = { step: 'axis2', centerPt: c, a1: endPt, angleDeg: rot, radius: rx,
-                        centerRef: tc.centerRef };
+                        centerRef: tc.centerRef, p1Ref: axisRef };
     setPrompt('Länge der zweiten Halbachse');
     render();
     return;
   }
   if (tc.step === 'axis2' && tc.centerPt && tc.a1 && tc.radius != null && tc.angleDeg != null) {
     const c = tc.centerPt;
-    // Perpendicular distance from cursor to first axis = ry
     const rot = tc.angleDeg;
     const nx = -Math.sin(rot), ny = Math.cos(rot);
     const ry = Math.abs((p.x - c.x) * nx + (p.y - c.y) * ny);
     if (ry < 1e-6) return;
-    // Build EllipseFeature directly so the centre stays parametric. rx/ry/rot
-    // are baked as literal Exprs at commit time — cmdbar parametric path
-    // (commitEllipse... below) supersedes those when the user types
-    // expressions, identical to the circle flow.
     pushUndo();
     const center: PointRef = tc.centerRef
       ?? { kind: 'abs', x: numE(c.x), y: numE(c.y) };
@@ -4269,6 +4289,9 @@ function handleEllipseClick(p: Pt): void {
       rx: numE(tc.radius),
       ry: numE(ry),
       rot: numE(rot),
+      // When the user snapped axis1's tip onto a feature, store it so the
+      // ellipse follows. tc.p1Ref carries that snap (set in step 'axis1').
+      ...(tc.p1Ref ? { axisEnd: tc.p1Ref } : {}),
     });
     evaluateTimeline();
     updateStats();
@@ -6878,8 +6901,12 @@ export function updatePreview(): void {
   // as the (shared) offset. This gives the "nach jedem Klick bereits eine
   // Bemaßung" feel — every click adds one more ghost dim, the offset floats
   // with the cursor until the user clicks on empty canvas to commit.
-  else if (state.tool === 'dim' && (runtime.dimMode === 'chain' || runtime.dimMode === 'auto')
+  else if ((state.tool === 'dim' || state.tool === 'dim_h' || state.tool === 'dim_v')
+           && (runtime.dimMode === 'chain' || runtime.dimMode === 'auto')
            && tc.step === 'collect' && tc.pts && tc.pts.length >= 2) {
+    const previewAxis = state.tool === 'dim_h' ? 'horizontal'
+                      : state.tool === 'dim_v' ? 'vertical'
+                      : undefined;
     const dims: EntityShape[] = [];
     for (let i = 1; i < tc.pts.length; i++) {
       dims.push({
@@ -6888,6 +6915,7 @@ export function updatePreview(): void {
         p2: { x: tc.pts[i].x,     y: tc.pts[i].y     },
         offset: { x: p.x, y: p.y },
         textHeight: lastTextHeight,
+        ...(previewAxis ? { linearAxis: previewAxis } : {}),
       });
     }
     tc.preview = { type: 'group', entities: dims };
@@ -7122,9 +7150,23 @@ function pickLineCutEnd(line: LineEntity, clickPt: Pt, P: Pt): 1 | 2 {
 }
 
 let lastFilletRadius = 10;
+/** Sticky fillet radius as an Expr — preserves a typed variable / formula so
+ *  the resulting FilletFeature stays parametric. Falls back to a num literal
+ *  built from `lastFilletRadius` when nothing has been parsed yet. */
+let lastFilletRadiusExpr: Expr = { kind: 'num', value: 10 };
 
-export function setFilletRadius(r: number): void { lastFilletRadius = r; }
+export function setFilletRadius(r: number): void {
+  lastFilletRadius = r;
+  lastFilletRadiusExpr = { kind: 'num', value: r };
+}
+/** Variable-aware setter — preserves the user's typed expression. */
+export function setFilletRadiusExpr(expr: Expr): void {
+  lastFilletRadiusExpr = expr;
+  const v = evalExpr(expr);
+  if (Number.isFinite(v)) lastFilletRadius = v;
+}
 export function getFilletRadius(): number { return lastFilletRadius; }
+export function getFilletRadiusExpr(): Expr { return lastFilletRadiusExpr; }
 
 // Sticky default for the Linie-teilen tool. Activation preloads this into
 // toolCtx so the user can immediately click a line without re-entering N
@@ -7204,7 +7246,8 @@ function computeFillet(l1: LineEntity, click1: Pt, l2: LineEntity, click2: Pt, r
   return { newL1, newL2, arc, t1: T1, t2: T2 };
 }
 
-/** Rect → 4 line EntityInits (caller is responsible for feature wiring). */
+/** Rect → 4 line EntityInits (caller is responsible for feature wiring).
+ *  Used when no parametric RectFeature is available (orphan rect entity). */
 function explodeRect(r: RectEntity): EntityInit[] {
   const xl = Math.min(r.x1, r.x2), xr = Math.max(r.x1, r.x2);
   const yb = Math.min(r.y1, r.y2), yt = Math.max(r.y1, r.y2);
@@ -7219,6 +7262,54 @@ function explodeRect(r: RectEntity): EntityInit[] {
   ];
 }
 
+/**
+ * Parametric rect explosion: convert a RectFeature into 4 chained LineFeatures
+ * that preserve every variable binding. The bottom edge anchors at rect.p1 and
+ * extends by rect.width via polar; the right edge starts at the bottom edge's
+ * end and extends by rect.height; etc. Adjacent corners are linked via
+ * `endpoint` refs so a Stretch on one corner pulls the next line along too.
+ *
+ * Drives the fillet/chamfer-on-rect path: filleting a rect corner used to
+ * flatten W/H to literals, breaking every downstream variable. Now W/H stay
+ * live, and the resulting fillet stays parametric end-to-end.
+ */
+function explodeRectToFeatures(rectFeat: { id: string; layer: number; kind: 'rect'; p1: PointRef; width: Expr; height: Expr; signX: 1 | -1; signY: 1 | -1 }): LineFeature[] {
+  const layer = rectFeat.layer;
+  const { p1, width, height, signX, signY } = rectFeat;
+  const angX = numE(signX === 1 ? 0 : 180);     // along +X or −X
+  const angY = numE(signY === 1 ? 90 : -90);    // along +Y or −Y
+  const angXBack = numE(signX === 1 ? 180 : 0); // back along the X edge
+  // L0 (bottom): p1 → p1 + width·X
+  const id0 = newFeatureId();
+  const id1 = newFeatureId();
+  const id2 = newFeatureId();
+  const id3 = newFeatureId();
+  const L0: LineFeature = {
+    id: id0, kind: 'line', layer,
+    p1,
+    p2: { kind: 'polar', from: p1, angle: angX, distance: width },
+  };
+  // L1 (right): bottom-right corner → bottom-right + height·Y
+  const L1: LineFeature = {
+    id: id1, kind: 'line', layer,
+    p1: { kind: 'endpoint', feature: id0, end: 1 },
+    p2: { kind: 'polar', from: { kind: 'endpoint', feature: id0, end: 1 }, angle: angY, distance: height },
+  };
+  // L2 (top): top-right → top-right − width·X (back the way we came)
+  const L2: LineFeature = {
+    id: id2, kind: 'line', layer,
+    p1: { kind: 'endpoint', feature: id1, end: 1 },
+    p2: { kind: 'polar', from: { kind: 'endpoint', feature: id1, end: 1 }, angle: angXBack, distance: width },
+  };
+  // L3 (left): close the rectangle by linking back to L0's start.
+  const L3: LineFeature = {
+    id: id3, kind: 'line', layer,
+    p1: { kind: 'endpoint', feature: id2, end: 1 },
+    p2: { kind: 'endpoint', feature: id0, end: 0 },
+  };
+  return [L0, L1, L2, L3];
+}
+
 /** Resolve a click into a LineEntity — either a line hit directly, or a rect
  *  whose edge was clicked (the rect is exploded into 4 line features). */
 function pickFilletLine(worldPt: Pt): LineEntity | null {
@@ -7227,22 +7318,28 @@ function pickFilletLine(worldPt: Pt): LineEntity | null {
   if (hit.type === 'line') return hit;
   if (hit.type === 'rect') {
     pushUndo();
-    const rectFid = featureForEntity(hit.id)?.id;
-    const lineInits = explodeRect(hit);
-    if (rectFid) {
-      // Route through deleteFeatures so dependents (dims on the rect's corners,
-      // points snapped to its edges, mirrors using it as source) survive: the
-      // rect becomes hidden if anyone references it, and its ctx entry keeps
-      // their PointRefs resolvable. A plain orphan rect is removed outright.
-      // Without this, filleting a rect edge silently breaks every parametric
-      // link that pointed at the rect.
-      deleteFeatures([rectFid]);
-    }
+    const rectFeat = featureForEntity(hit.id);
     const newFids: string[] = [];
-    for (const init of lineInits) {
-      const f = featureFromEntityInit(init);
-      state.features.push(f);
-      newFids.push(f.id);
+    if (rectFeat && rectFeat.kind === 'rect') {
+      // Parametric path: explode into 4 chained LineFeatures that share the
+      // rect's p1 / width / height Exprs. Variable bindings (W, H, etc.) stay
+      // live across the fillet operation.
+      const lines = explodeRectToFeatures(rectFeat);
+      // Hide the source rect so PointRefs that pointed at it (dims, mirrors,
+      // …) keep resolving via ctx. deleteFeatures handles this for us.
+      deleteFeatures([rectFeat.id]);
+      for (const f of lines) {
+        state.features.push(f);
+        newFids.push(f.id);
+      }
+    } else {
+      // Orphan rect entity (no feature) — fall back to abs explode.
+      const lineInits = explodeRect(hit);
+      for (const init of lineInits) {
+        const f = featureFromEntityInit(init);
+        state.features.push(f);
+        newFids.push(f.id);
+      }
     }
     evaluateTimeline();
     let best: LineEntity | null = null;
@@ -7332,13 +7429,18 @@ function handleFilletClick(worldPt: Pt): void {
     // Sticky radius: apply immediately with the last-entered value. The user
     // can change it any time via the command bar — the next fillet uses the
     // new value. No "click-to-size" step here.
-    applyFillet(lastFilletRadius);
+    // Pass the sticky Expr (not just the number) so a variable-driven radius
+    // survives into the FilletFeature.
+    applyFillet(lastFilletRadiusExpr);
     return;
   }
 }
 
-/** Invoked by the command line — `handleCommand` forwards a bare number here. */
-export function applyFillet(radius: number): void {
+/** Invoked by the command line — `handleCommand` forwards a bare number here.
+ *  Accepts an Expr too so a user-typed variable / formula is preserved on the
+ *  resulting FilletFeature. The pure-number path is kept for the auto-commit
+ *  flow (handleFilletClick) which only knows the sticky last value. */
+export function applyFillet(radius: number | Expr): void {
   const tc = runtime.toolCtx;
   if (!tc || state.tool !== 'fillet') return;
   const l1 = tc.entity1, c1 = tc.click1, l2 = tc.entity2, c2 = tc.click2;
@@ -7346,7 +7448,11 @@ export function applyFillet(radius: number): void {
     toast('Erst zwei Linien wählen');
     return;
   }
-  if (radius <= 0) { toast('Radius muss > 0 sein'); return; }
+  // Resolve the numeric value for geometry checks; keep the original Expr
+  // around for storage so the variable binding survives.
+  const rNum = typeof radius === 'number' ? radius : evalExpr(radius);
+  const rExpr: Expr = typeof radius === 'number' ? numE(radius) : radius;
+  if (!Number.isFinite(rNum) || rNum <= 0) { toast('Radius muss > 0 sein'); return; }
 
   const f1 = featureForEntity(l1.id);
   const f2 = featureForEntity(l2.id);
@@ -7361,8 +7467,8 @@ export function applyFillet(radius: number): void {
   // ── Case A: both entities belong to the SAME FilletFeature → update radius ─
   if (f1 && f2 && f1.id === f2.id && f1.kind === 'fillet') {
     pushUndo();
-    f1.radius = radius;
-    lastFilletRadius = radius;
+    f1.radius = rExpr;
+    lastFilletRadius = rNum;
     evaluateTimeline({ changedFeatures: [f1.id] });
     updateStats();
     resetPick();
@@ -7385,7 +7491,7 @@ export function applyFillet(radius: number): void {
   // The arc is registered as a first-class entity (featureEntityIds + ctx), so
   // users can snap to its endpoints, midpoint, and center.
   if (f1 && f1.kind === 'line' && f2 && f2.kind === 'line') {
-    const result = computeFillet(l1, c1, l2, c2, radius);
+    const result = computeFillet(l1, c1, l2, c2, rNum);
     if ('error' in result) { toast(result.error); keepPick(); return; }
 
     const P = lineIntersectionInfinite(l1, l2);
@@ -7394,7 +7500,7 @@ export function applyFillet(radius: number): void {
     const cut2End = pickLineCutEnd(l2, c2, P);
 
     pushUndo();
-    lastFilletRadius = radius;
+    lastFilletRadius = rNum;
     const srcF1 = state.features.find(f => f.id === f1.id);
     const srcF2 = state.features.find(f => f.id === f2.id);
     if (srcF1) srcF1.hidden = true;
@@ -7407,7 +7513,7 @@ export function applyFillet(radius: number): void {
       line2Id: f2.id,
       cut1End,
       cut2End,
-      radius,
+      radius: rExpr,
     } as Feature);
     evaluateTimeline();
     updateStats();
@@ -7426,7 +7532,7 @@ export function applyFillet(radius: number): void {
   {
     const needsExpand = (f: Feature | null): boolean => !f || f.kind !== 'line';
     if (needsExpand(f1) || needsExpand(f2)) {
-      const result = computeFillet(l1, c1, l2, c2, radius);
+      const result = computeFillet(l1, c1, l2, c2, rNum);
       if ('error' in result) { toast(result.error); keepPick(); return; }
       const P = lineIntersectionInfinite(l1, l2);
       if (!P) { toast('Linien sind parallel'); resetPick(); return; }
@@ -7485,7 +7591,7 @@ export function applyFillet(radius: number): void {
       };
 
       pushUndo();
-      lastFilletRadius = radius;
+      lastFilletRadius = rNum;
       const line1Id = expandModifier(l1, f1);
       const line2Id = expandModifier(l2, f2);
       const srcF1 = state.features.find(f => f.id === line1Id);
@@ -7500,7 +7606,7 @@ export function applyFillet(radius: number): void {
         line2Id,
         cut1End,
         cut2End,
-        radius,
+        radius: rExpr,
       } as Feature);
       evaluateTimeline();
       updateStats();
@@ -7517,9 +7623,19 @@ export function applyFillet(radius: number): void {
 // ---------------- Chamfer ----------------
 
 let lastChamferDist = 10;
+let lastChamferDistExpr: Expr = { kind: 'num', value: 10 };
 
-export function setChamferDist(d: number): void { lastChamferDist = d; }
+export function setChamferDist(d: number): void {
+  lastChamferDist = d;
+  lastChamferDistExpr = { kind: 'num', value: d };
+}
+export function setChamferDistExpr(expr: Expr): void {
+  lastChamferDistExpr = expr;
+  const v = evalExpr(expr);
+  if (Number.isFinite(v)) lastChamferDist = v;
+}
 export function getChamferDist(): number { return lastChamferDist; }
+export function getChamferDistExpr(): Expr { return lastChamferDistExpr; }
 
 function computeChamfer(l1: LineEntity, click1: Pt, l2: LineEntity, click2: Pt, d: number):
   | { newL1: LineEntity; newL2: LineEntity; cut: LineEntity; t1: Pt; t2: Pt }
@@ -7576,13 +7692,15 @@ function handleChamferClick(worldPt: Pt): void {
     // panel (lastChamferDist). Matches the fillet tool's "no click-to-size"
     // semantics — the top panel is the single source of truth for the
     // chamfer amount, clicking a line never overrides it.
-    applyChamfer(lastChamferDist);
+    applyChamfer(lastChamferDistExpr);
     return;
   }
 }
 
-/** Invoked by the command line — `handleCommand` forwards a bare number here. */
-export function applyChamfer(distance: number): void {
+/** Invoked by the command line — `handleCommand` forwards a bare number here.
+ *  Accepts an Expr too so a typed variable / formula is preserved on the
+ *  resulting ChamferFeature. */
+export function applyChamfer(distance: number | Expr): void {
   const tc = runtime.toolCtx;
   if (!tc || state.tool !== 'chamfer') return;
   const l1 = tc.entity1, c1 = tc.click1, l2 = tc.entity2, c2 = tc.click2;
@@ -7590,7 +7708,9 @@ export function applyChamfer(distance: number): void {
     toast('Erst zwei Linien wählen');
     return;
   }
-  if (distance <= 0) { toast('Abstand muss > 0 sein'); return; }
+  const dNum = typeof distance === 'number' ? distance : evalExpr(distance);
+  const dExpr: Expr = typeof distance === 'number' ? numE(distance) : distance;
+  if (!Number.isFinite(dNum) || dNum <= 0) { toast('Abstand muss > 0 sein'); return; }
 
   const f1 = featureForEntity(l1.id);
   const f2 = featureForEntity(l2.id);
@@ -7609,8 +7729,8 @@ export function applyChamfer(distance: number): void {
   // ── Case A: both entities belong to the SAME ChamferFeature → update dist ─
   if (f1 && f2 && f1.id === f2.id && f1.kind === 'chamfer') {
     pushUndo();
-    f1.distance = distance;
-    lastChamferDist = distance;
+    f1.distance = dExpr;
+    lastChamferDist = dNum;
     evaluateTimeline({ changedFeatures: [f1.id] });
     updateStats();
     resetPick();
@@ -7619,7 +7739,7 @@ export function applyChamfer(distance: number): void {
 
   // ── Case B: plain line features → non-destructive ChamferFeature ──────────
   if (f1 && f1.kind === 'line' && f2 && f2.kind === 'line') {
-    const result = computeChamfer(l1, c1, l2, c2, distance);
+    const result = computeChamfer(l1, c1, l2, c2, dNum);
     if ('error' in result) { toast(result.error); resetPick(); return; }
 
     const P = lineIntersectionInfinite(l1, l2);
@@ -7628,7 +7748,7 @@ export function applyChamfer(distance: number): void {
     const cut2End = pickLineCutEnd(l2, c2, P);
 
     pushUndo();
-    lastChamferDist = distance;
+    lastChamferDist = dNum;
     const srcF1 = state.features.find(f => f.id === f1.id);
     const srcF2 = state.features.find(f => f.id === f2.id);
     if (srcF1) srcF1.hidden = true;
@@ -7641,7 +7761,7 @@ export function applyChamfer(distance: number): void {
       line2Id: f2.id,
       cut1End,
       cut2End,
-      distance,
+      distance: dExpr,
     } as Feature);
     evaluateTimeline();
     updateStats();
@@ -7655,7 +7775,7 @@ export function applyChamfer(distance: number): void {
   {
     const needsExpand = (f: Feature | null): boolean => !f || f.kind !== 'line';
     if (needsExpand(f1) || needsExpand(f2)) {
-      const result = computeChamfer(l1, c1, l2, c2, distance);
+      const result = computeChamfer(l1, c1, l2, c2, dNum);
       if ('error' in result) { toast(result.error); keepPick(); return; }
       const P = lineIntersectionInfinite(l1, l2);
       if (!P) { toast('Linien sind parallel'); resetPick(); return; }
@@ -7705,7 +7825,7 @@ export function applyChamfer(distance: number): void {
       };
 
       pushUndo();
-      lastChamferDist = distance;
+      lastChamferDist = dNum;
       const line1Id = expandModifier(l1, f1);
       const line2Id = expandModifier(l2, f2);
       const srcF1 = state.features.find(f => f.id === line1Id);
@@ -7720,7 +7840,7 @@ export function applyChamfer(distance: number): void {
         line2Id,
         cut1End,
         cut2End,
-        distance,
+        distance: dExpr,
       } as Feature);
       evaluateTimeline();
       updateStats();
@@ -8518,7 +8638,8 @@ function handleTrimClick(worldPt: Pt): void {
   if (!hit) { toast('Nichts getroffen'); return; }
   if (hit.type === 'circle') { handleTrimCircleClick(hit, worldPt); return; }
   if (hit.type === 'arc')    { handleTrimArcClick(hit, worldPt); return; }
-  if (hit.type !== 'line') { toast('Nur Linien, Kreise und Bögen können gestutzt werden'); return; }
+  if (hit.type === 'ellipse') { handleTrimEllipseClick(hit); return; }
+  if (hit.type !== 'line') { toast('Nur Linien, Kreise, Bögen und Ellipsen können gestutzt werden'); return; }
 
   const fid = featureForEntity(hit.id)?.id;
   if (!fid) return;
@@ -8968,6 +9089,55 @@ function handleTrimArcClick(hit: ArcEntity, worldPt: Pt): void {
     }
   }
   evaluateTimeline();
+  updateStats();
+  updateSelStatus();
+  render();
+}
+
+/**
+ * Ellipse trim — pragmatic MVP: turn the ellipse into a 64-segment closed
+ * polyline approximation so the ellipse "responds" to the trim tool. The
+ * polyline can then itself be edited with normal polyline-aware tools, or
+ * the user can hand-pick the surviving segments.
+ *
+ * A proper elliptical-arc primitive (preserving exact mathematical shape +
+ * variable bindings under trim) is a much bigger refactor — needs a new
+ * Entity type, render path, snap support, and offset/dim integration. The
+ * polyline route loses the parametric link to `axisEnd` / `rx` / `ry`, but
+ * users couldn't trim the ellipse at all before, so this is strictly an
+ * improvement and matches "explode-then-edit" semantics already used for
+ * rect-fillet.
+ */
+function handleTrimEllipseClick(hit: import('./types').EllipseEntity): void {
+  const fid = featureForEntity(hit.id)?.id;
+  if (!fid) { toast('Ellipse-Feature nicht gefunden'); return; }
+  pushUndo();
+  // Sample the ellipse with N segments. 64 strikes a balance between visual
+  // smoothness at typical zoom levels and feature-list noise on save.
+  const N = 64;
+  const cos = Math.cos(hit.rot), sin = Math.sin(hit.rot);
+  const pts: Pt[] = [];
+  for (let i = 0; i < N; i++) {
+    const t = (i / N) * 2 * Math.PI;
+    const lx = hit.rx * Math.cos(t);
+    const ly = hit.ry * Math.sin(t);
+    pts.push({ x: hit.cx + lx * cos - ly * sin, y: hit.cy + lx * sin + ly * cos });
+  }
+  // Replace the ellipse feature with a closed polyline. PointRefs become abs;
+  // the polyline can be trimmed and edited with the normal toolset afterwards.
+  deleteFeatures([fid]);
+  const newFeat = featureFromEntityInit({
+    type: 'polyline',
+    layer: hit.layer,
+    pts,
+    closed: true,
+  });
+  state.features.push(newFeat);
+  evaluateTimeline();
+  toast('Ellipse zu Polylinie umgewandelt — jetzt ein Segment klicken zum Stutzen');
+  state.selection.clear();
+  const eid = entityIdForFeature(newFeat.id);
+  if (eid !== null) state.selection.add(eid);
   updateStats();
   updateSelStatus();
   render();

@@ -20,8 +20,8 @@ import { showConfirm, showPrompt } from './modal';
 import { bindSetPrompt, rebuildCmdBar } from './cmdbar';
 import { getDraftInfo } from './draftinfo';
 import {
-  applyChamfer, commitDivideXLine, getChamferDist, getDivideCount, getFilletRadius,
-  setChamferDist, setFilletRadius, syncToolAvailability,
+  applyChamfer, applyFillet, commitDivideXLine, getChamferDist, getDivideCount, getFilletRadius,
+  setChamferDistExpr, setFilletRadiusExpr, syncToolAvailability,
 } from './tools';
 
 let toastTimer: number | null = null;
@@ -221,7 +221,10 @@ const chamferDistance = document.getElementById('chamfer-distance') as HTMLInput
 
 export function syncDimPicker(): void {
   if (dimPicker) {
-    const show = state.tool === 'dim';
+    // Show the chain / auto mode picker for ALL three linear dim tools so
+    // the user can pick a row of rect edges in horizontal/vertical mode the
+    // same way they can in the free-form dim tool.
+    const show = state.tool === 'dim' || state.tool === 'dim_h' || state.tool === 'dim_v';
     dimPicker.toggleAttribute('hidden', !show);
     if (show) {
       dimPicker.querySelectorAll<HTMLButtonElement>('.dim-mode-btn').forEach(btn => {
@@ -523,25 +526,33 @@ if (divideCount) {
 // the numeric result so subsequent operations reuse it without re-entering.
 // The fields are bound by the same tryCommit pattern as the cmdbar's expr
 // fields, just wired to a top-panel input instead of the bottom bar.
-function parseExprValue(raw: string): number | null {
+/** Parse the input AND retain the original expression so a typed variable /
+ *  formula survives into the FilletFeature/ChamferFeature instead of being
+ *  flattened to a literal. Numeric input still comes back as { kind: 'num' }. */
+function parseExprAndValue(raw: string): { expr: Expr; value: number } | null {
   const r = parseExprInput(raw);
   if (!r || r.kind !== 'expr') return null;
   const v = evalExpr(r.expr);
   if (!Number.isFinite(v) || v <= 0) return null;
-  return v;
+  return { expr: r.expr, value: v };
 }
 
 if (filletRadius) {
   const tryCommit = (): void => {
-    const v = parseExprValue(filletRadius.value);
-    if (v == null) {
-      // Restore last-valid value so the field never sits on an invalid string.
+    const r = parseExprAndValue(filletRadius.value);
+    if (r == null) {
       filletRadius.value = String(getFilletRadius());
       toast('Radius ungültig');
       return;
     }
-    setFilletRadius(v);
-    toast('Radius = ' + v);
+    // Store the original Expr so a typed variable / formula survives into
+    // the next fillet operation.
+    setFilletRadiusExpr(r.expr);
+    toast('Radius = ' + r.value);
+    // If the user has already picked two lines, commit the fillet now using
+    // the new Expr so the fillet feature stores it parametrically.
+    const tc = runtime.toolCtx;
+    if (tc && tc.entity1 && tc.entity2) applyFillet(r.expr);
   };
   filletRadius.addEventListener('change', tryCommit);
   filletRadius.addEventListener('keydown', (ev) => {
@@ -560,21 +571,18 @@ if (filletRadius) {
 
 if (chamferDistance) {
   const tryCommit = (): void => {
-    const v = parseExprValue(chamferDistance.value);
-    if (v == null) {
+    const r = parseExprAndValue(chamferDistance.value);
+    if (r == null) {
       chamferDistance.value = String(getChamferDist());
       toast('Abstand ungültig');
       return;
     }
-    // If the user has already picked two lines, commit the chamfer right away
-    // — matches the old cmdbar semantics where Enter at that point acted on
-    // the current selection. Otherwise just update the sticky default.
     const tc = runtime.toolCtx;
     if (tc && tc.step === 'distance' && tc.entity1 && tc.entity2) {
-      applyChamfer(v);
+      applyChamfer(r.expr);
     } else {
-      setChamferDist(v);
-      toast('Abstand = ' + v);
+      setChamferDistExpr(r.expr);
+      toast('Abstand = ' + r.value);
     }
   };
   chamferDistance.addEventListener('change', tryCommit);

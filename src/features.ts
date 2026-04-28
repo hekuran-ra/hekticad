@@ -162,9 +162,16 @@ export function featureDependencies(f: Feature): Set<string> {
     case 'rect':
       collectRefTargets(f.p1, out);
       break;
-    case 'circle':
     case 'arc':
+      collectRefTargets(f.center, out);
+      if (f.p1) collectRefTargets(f.p1, out);
+      if (f.p2) collectRefTargets(f.p2, out);
+      break;
     case 'ellipse':
+      collectRefTargets(f.center, out);
+      if (f.axisEnd) collectRefTargets(f.axisEnd, out);
+      break;
+    case 'circle':
     case 'polygon':
       collectRefTargets(f.center, out);
       break;
@@ -1199,7 +1206,11 @@ function buildFilletEntities(f: FilletFeature, ctx: EvalCtx): Entity[] {
   if (!src1 || src1.type !== 'line') return [];
   if (!src2 || src2.type !== 'line') return [];
 
-  const geom = computeFilletGeometry(src1, f.cut1End, src2, f.cut2End, f.radius);
+  // Resolve radius from Expr (may be variable-driven) on every eval — keeps
+  // the fillet's curvature live when a parameter changes.
+  const r = evalExpr(f.radius);
+  if (!Number.isFinite(r) || r <= 0) return [];
+  const geom = computeFilletGeometry(src1, f.cut1End, src2, f.cut2End, r);
   if (!geom) return [];
 
   const idL1  = allocSubEntityId(f.id, 'l1');
@@ -1279,7 +1290,9 @@ function buildChamferEntities(f: ChamferFeature, ctx: EvalCtx): Entity[] {
   if (!src1 || src1.type !== 'line') return [];
   if (!src2 || src2.type !== 'line') return [];
 
-  const geom = computeChamferGeometry(src1, f.cut1End, src2, f.cut2End, f.distance);
+  const d = evalExpr(f.distance);
+  if (!Number.isFinite(d) || d <= 0) return [];
+  const geom = computeChamferGeometry(src1, f.cut1End, src2, f.cut2End, d);
   if (!geom) return [];
 
   const idL1  = allocSubEntityId(f.id, 'l1');
@@ -1305,6 +1318,38 @@ function buildChamferEntities(f: ChamferFeature, ctx: EvalCtx): Entity[] {
     x2: geom.newL2End.x, y2: geom.newL2End.y,
   };
   return [l1, l2, cut];
+}
+
+/**
+ * Circumscribed-circle arc through three points (start, through, end). Returns
+ * the centre/radius plus the CCW sweep angles a1→a2 such that the `through`
+ * point lies on the arc. Returns null for collinear inputs. Used by the arc3
+ * three-point evaluation path so an arc anchored to two PointRefs + a bulge
+ * height re-derives its centre on every timeline tick.
+ */
+function circumcircleArc(a: Pt, mid: Pt, c: Pt):
+  { cx: number; cy: number; r: number; a1: number; a2: number } | null {
+  const ax = a.x, ay = a.y, bx = mid.x, by = mid.y, cx = c.x, cy = c.y;
+  const d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+  if (Math.abs(d) < 1e-9) return null;
+  const ux = ((ax * ax + ay * ay) * (by - cy) +
+              (bx * bx + by * by) * (cy - ay) +
+              (cx * cx + cy * cy) * (ay - by)) / d;
+  const uy = ((ax * ax + ay * ay) * (cx - bx) +
+              (bx * bx + by * by) * (ax - cx) +
+              (cx * cx + cy * cy) * (bx - ax)) / d;
+  const r = Math.hypot(ax - ux, ay - uy);
+  const angA = Math.atan2(ay - uy, ax - ux);
+  const angM = Math.atan2(by - uy, bx - ux);
+  const angC = Math.atan2(cy - uy, cx - ux);
+  let a1 = angA, a2 = angC;
+  while (a2 < a1) a2 += 2 * Math.PI;
+  const TAU = 2 * Math.PI;
+  const mCcw = ((angM - a1) % TAU + TAU) % TAU;
+  if (mCcw < a2 - a1) return { cx: ux, cy: uy, r, a1, a2 };
+  a1 = angC; a2 = angA;
+  while (a2 < a1) a2 += 2 * Math.PI;
+  return { cx: ux, cy: uy, r, a1, a2 };
 }
 
 /**
@@ -1337,6 +1382,36 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
       return { id, type: 'circle', layer: f.layer, cx: c.x, cy: c.y, r };
     }
     case 'arc': {
+      // Three-point mode: derive center/radius/angles from p1, p2, and the
+      // perpendicular bulge height. Used by the arc3 drawing tool so the arc
+      // tracks endpoint snaps when upstream features change.
+      if (f.p1 && f.p2 && f.bulgeHeight) {
+        const a = resolvePt(f.p1, ctx);
+        const b = resolvePt(f.p2, ctx);
+        const h = evalExpr(f.bulgeHeight);
+        if (Number.isFinite(a.x) && Number.isFinite(a.y) &&
+            Number.isFinite(b.x) && Number.isFinite(b.y) &&
+            Number.isFinite(h) && Math.abs(h) > 1e-9) {
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const L = Math.hypot(dx, dy);
+          if (L > 1e-9) {
+            // Apex point = chord midpoint shifted perpendicular by h.
+            const nx = -dy / L, ny = dx / L;
+            const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+            const apex = { x: mx + nx * h, y: my + ny * h };
+            const arc = circumcircleArc(a, apex, b);
+            if (arc) {
+              return {
+                id, type: 'arc', layer: f.layer,
+                cx: arc.cx, cy: arc.cy, r: arc.r,
+                a1: arc.a1, a2: arc.a2,
+              };
+            }
+          }
+        }
+        // Degenerate three-point input → fall through to legacy center mode
+        // so the user still sees the arc rather than an invisible feature.
+      }
       const c = resolvePt(f.center, ctx);
       const r = Math.max(1e-9, evalExpr(f.radius));
       return {
@@ -1347,12 +1422,27 @@ function buildEntity(f: Feature, ctx: EvalCtx): Entity | null {
     }
     case 'ellipse': {
       const c = resolvePt(f.center, ctx);
+      let rx = Math.max(1e-9, evalExpr(f.rx));
+      let rot = evalExpr(f.rot);
+      // When axisEnd is present and resolves cleanly, derive rx + rot from
+      // it so the ellipse's first axis tracks the anchored feature.
+      if (f.axisEnd) {
+        const tip = resolvePt(f.axisEnd, ctx);
+        if (Number.isFinite(tip.x) && Number.isFinite(tip.y)) {
+          const dx = tip.x - c.x, dy = tip.y - c.y;
+          const d = Math.hypot(dx, dy);
+          if (d > 1e-9) {
+            rx = d;
+            rot = Math.atan2(dy, dx);
+          }
+        }
+      }
       return {
         id, type: 'ellipse', layer: f.layer,
         cx: c.x, cy: c.y,
-        rx: Math.max(1e-9, evalExpr(f.rx)),
+        rx,
         ry: Math.max(1e-9, evalExpr(f.ry)),
-        rot: evalExpr(f.rot),
+        rot,
       };
     }
     case 'spline': {
@@ -1623,8 +1713,10 @@ function featureReferencesAnyParam(f: Feature, changed: Set<string>): boolean {
     case 'polyline': for (const p of f.pts) if (pRefs(p)) return true; return false;
     case 'rect':     return pRefs(f.p1) || eRefs(f.width) || eRefs(f.height);
     case 'circle':   return pRefs(f.center) || eRefs(f.radius);
-    case 'arc':      return pRefs(f.center) || eRefs(f.radius) || eRefs(f.a1) || eRefs(f.a2);
-    case 'ellipse':  return pRefs(f.center) || eRefs(f.rx) || eRefs(f.ry) || eRefs(f.rot);
+    case 'arc':      return pRefs(f.center) || eRefs(f.radius) || eRefs(f.a1) || eRefs(f.a2)
+      || (!!f.p1 && pRefs(f.p1)) || (!!f.p2 && pRefs(f.p2)) || (!!f.bulgeHeight && eRefs(f.bulgeHeight));
+    case 'ellipse':  return pRefs(f.center) || eRefs(f.rx) || eRefs(f.ry) || eRefs(f.rot)
+      || (!!f.axisEnd && pRefs(f.axisEnd));
     case 'polygon':  return pRefs(f.center) || eRefs(f.radius) || eRefs(f.sides) || eRefs(f.startAngle);
     case 'spline':   for (const p of f.pts) if (pRefs(p)) return true; return false;
     case 'xline':    return pRefs(f.p) || eRefs(f.dx) || eRefs(f.dy);
@@ -2116,8 +2208,17 @@ export function translateFeature(f: Feature, dx: number, dy: number): Feature {
     case 'polyline':   return { ...f, pts: f.pts.map(t) };
     case 'rect':       return { ...f, p1: t(f.p1) };
     case 'circle':     return { ...f, center: t(f.center) };
-    case 'arc':        return { ...f, center: t(f.center) };
-    case 'ellipse':    return { ...f, center: t(f.center) };
+    case 'arc':        return {
+      ...f,
+      center: t(f.center),
+      ...(f.p1 ? { p1: t(f.p1) } : {}),
+      ...(f.p2 ? { p2: t(f.p2) } : {}),
+    };
+    case 'ellipse':    return {
+      ...f,
+      center: t(f.center),
+      ...(f.axisEnd ? { axisEnd: t(f.axisEnd) } : {}),
+    };
     case 'spline':     return { ...f, pts: f.pts.map(t) };
     case 'xline':      return { ...f, p: t(f.p) };
     case 'parallelXLine':     return f;
@@ -2179,8 +2280,17 @@ export function stretchFeature(
     case 'polyline':   return { ...f, pts: f.pts.map(s) };
     case 'rect':       return { ...f, p1: s(f.p1) };
     case 'circle':     return { ...f, center: s(f.center) };
-    case 'arc':        return { ...f, center: s(f.center) };
-    case 'ellipse':    return { ...f, center: s(f.center) };
+    case 'arc':        return {
+      ...f,
+      center: s(f.center),
+      ...(f.p1 ? { p1: s(f.p1) } : {}),
+      ...(f.p2 ? { p2: s(f.p2) } : {}),
+    };
+    case 'ellipse':    return {
+      ...f,
+      center: s(f.center),
+      ...(f.axisEnd ? { axisEnd: s(f.axisEnd) } : {}),
+    };
     case 'spline':     return { ...f, pts: f.pts.map(s) };
     case 'xline':      return { ...f, p: s(f.p) };
     case 'parallelXLine':     return f;
@@ -2279,8 +2389,15 @@ export function collectFeaturePoints(f: Feature, ctx: Map<string, Entity>): Arra
     case 'polyline': for (const p of f.pts) add(p); break;
     case 'rect':     add(f.p1); break;
     case 'circle':   add(f.center); break;
-    case 'arc':      add(f.center); break;
-    case 'ellipse':  add(f.center); break;
+    case 'arc':
+      add(f.center);
+      if (f.p1) add(f.p1);
+      if (f.p2) add(f.p2);
+      break;
+    case 'ellipse':
+      add(f.center);
+      if (f.axisEnd) add(f.axisEnd);
+      break;
     case 'spline':   for (const p of f.pts) add(p); break;
     case 'xline':    add(f.p); break;
     case 'polygon':  add(f.center); break;
@@ -2696,9 +2813,9 @@ export function featureDetail(f: Feature): string {
     case 'clip':
       return `${f.segments.length} Seg. ← ${f.sourceId.slice(0, 4)}`;
     case 'fillet':
-      return `r = ${f.radius.toFixed(2)} · ${f.line1Id.slice(0, 4)} × ${f.line2Id.slice(0, 4)}`;
+      return `r = ${exprLabel(f.radius)} · ${f.line1Id.slice(0, 4)} × ${f.line2Id.slice(0, 4)}`;
     case 'chamfer':
-      return `d = ${f.distance.toFixed(2)} · ${f.line1Id.slice(0, 4)} × ${f.line2Id.slice(0, 4)}`;
+      return `d = ${exprLabel(f.distance)} · ${f.line1Id.slice(0, 4)} × ${f.line2Id.slice(0, 4)}`;
   }
 }
 

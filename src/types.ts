@@ -546,8 +546,65 @@ export type RectFeature      = FeatureBase & {
   signY: 1 | -1;
 };
 export type CircleFeature    = FeatureBase & { kind: 'circle';   center: PointRef; radius: Expr };
-export type ArcFeature       = FeatureBase & { kind: 'arc';      center: PointRef; radius: Expr; a1: Expr; a2: Expr };
-export type EllipseFeature   = FeatureBase & { kind: 'ellipse';  center: PointRef; rx: Expr; ry: Expr; rot: Expr };
+/**
+ * Arc feature — two creation modes:
+ *
+ *   1. **Center mode** (legacy, also produced by fillet/divide tools): the
+ *      fields `center`, `radius`, `a1`, `a2` fully define the arc. PointRef
+ *      `center` plus Expr radius/angles keep variables live.
+ *
+ *   2. **Three-point mode** (the arc3 drawing tool): `p1` and `p2` are
+ *      PointRefs to the start / end of the arc, and `bulgeHeight` is the
+ *      perpendicular sagitta from the chord midpoint. The evaluator derives
+ *      `center` + `radius` + `a1` + `a2` from these on every timeline tick,
+ *      so when p1 / p2 snap to other features (line endpoints, intersections,
+ *      …) the arc tracks them as those features change.
+ *
+ * Both modes coexist on the same feature kind to keep existing files loadable
+ * without migration; `buildEntity` prefers three-point mode when `p1`/`p2`
+ * are present and falls back to center mode otherwise.
+ */
+export type ArcFeature       = FeatureBase & {
+  kind: 'arc';
+  center: PointRef;
+  radius: Expr;
+  a1: Expr;
+  a2: Expr;
+  /** Optional three-point start. When set with `p2` + `bulgeHeight`, the
+   *  evaluator derives center/radius/a1/a2 from these and ignores the legacy
+   *  fields above. */
+  p1?: PointRef;
+  /** Optional three-point end. Pair with `p1` and `bulgeHeight`. */
+  p2?: PointRef;
+  /** Signed perpendicular height of the arc apex from the p1→p2 chord
+   *  (positive = left of p1→p2 direction, negative = right). Stored as Expr
+   *  so a variable can drive the bulge magnitude. */
+  bulgeHeight?: Expr;
+};
+/**
+ * Ellipse feature — center + half-axes + rotation. Optional `axisEnd` is the
+ * tip of the FIRST half-axis (the one defined by `rx` + `rot`); when present,
+ * the evaluator derives `rx` (distance from centre) and `rot` (direction
+ * angle) from `center` and `axisEnd` directly. The fields `rx` / `rot` then
+ * act as a fallback (used when `axisEnd` fails to resolve, e.g. its target
+ * feature was deleted). `ry` always remains an explicit Expr — capturing the
+ * second axis parametrically would need a perpendicular snap, which is out of
+ * scope for now.
+ *
+ * This lets the ellipse track its first-axis anchor (an endpoint of another
+ * line, an intersection, …) when upstream variables move — same idea as the
+ * three-point arc.
+ */
+export type EllipseFeature   = FeatureBase & {
+  kind: 'ellipse';
+  center: PointRef;
+  rx: Expr;
+  ry: Expr;
+  rot: Expr;
+  /** Optional first-axis tip — when set, `rx` and `rot` are derived from
+   *  `center` → `axisEnd` on every timeline tick. */
+  axisEnd?: PointRef;
+};
 export type SplineFeature    = FeatureBase & { kind: 'spline';   pts: PointRef[]; closed: boolean };
 export type XLineFeature     = FeatureBase & { kind: 'xline';    p: PointRef; dx: Expr; dy: Expr };
 export type ParallelXLineFeature = FeatureBase & {
@@ -772,9 +829,11 @@ export type FilletFeature = FeatureBase & {
   cut1End: 1 | 2;
   /** Which endpoint of line2 is the corner end (1 = p1, 2 = p2). */
   cut2End: 1 | 2;
-  /** Fillet radius in world units. Stored as a plain number so future
-   *  variable-driven radius can be added without breaking old files. */
-  radius: number;
+  /** Fillet radius in world units. `Expr` so the user can drive it from a
+   *  variable or formula (`R/2`, `2*pi*r`, …) — the evaluator calls
+   *  `evalExpr(radius)` on every timeline tick. Legacy files that stored
+   *  `radius` as a plain `number` are migrated on load. */
+  radius: Expr;
 };
 
 /**
@@ -788,8 +847,9 @@ export type ChamferFeature = FeatureBase & {
   line2Id: string;
   cut1End: 1 | 2;
   cut2End: 1 | 2;
-  /** Equal chamfer distance along each line from the intersection. */
-  distance: number;
+  /** Equal chamfer distance along each line from the intersection. `Expr` so
+   *  the user can drive it from a variable; legacy `number` files migrate. */
+  distance: Expr;
 };
 
 export type Feature =
