@@ -1862,15 +1862,121 @@ body.sidebar-collapsed .sidebar-collapse-chev { transform: rotate(180deg); }
 }
 #grid-size:focus { outline: none; border-color: var(--accent); }
 
+/* ─── Variable panel toolbar ────────────────────────────────────── */
+.param-toolbar {
+  display: flex; gap: 6px;
+  padding: 6px 12px 4px 12px;
+  border-bottom: 1px solid var(--hair);
+}
+.param-toolbar-btn {
+  background: var(--panel-2);
+  color: var(--fg);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  padding: 3px 8px;
+  font: 500 10.5px var(--mono);
+  cursor: pointer;
+  letter-spacing: 0.3px;
+}
+.param-toolbar-btn:hover {
+  background: var(--panel-3);
+  border-color: var(--draw);
+  color: var(--draw);
+}
+
+/* ─── Variable groups (folders) ─────────────────────────────────── */
+.param-group {
+  border-bottom: 1px solid var(--hair);
+}
+.param-group.drop-target {
+  background: color-mix(in oklab, var(--draw) 8%, transparent);
+}
+
+.param-group-header {
+  display: grid;
+  grid-template-columns: 16px 1fr 24px 18px;
+  align-items: center; gap: 4px;
+  padding: 4px 12px;
+  background: var(--panel-2);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-mid);
+  letter-spacing: 0.3px;
+  cursor: grab;
+  user-select: none;
+}
+.param-group-header.synthetic {
+  background: transparent;
+  cursor: default;
+  font-weight: 500;
+  color: var(--fg-faint);
+  font-style: italic;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  grid-template-columns: 16px 1fr 24px;
+}
+.param-group-header.dragging { opacity: 0.4; }
+.param-group-header.reorder-above {
+  border-top: 2px solid var(--draw);
+  padding-top: 2px;
+}
+
+.param-group-arrow {
+  color: var(--fg-faint);
+  font-size: 10px;
+  width: 16px; text-align: center;
+  user-select: none;
+}
+.param-group-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.param-group-count {
+  text-align: right;
+  color: var(--fg-faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-feature-settings: var(--num-feat);
+}
+.param-group-del {
+  color: var(--fg-faint); cursor: pointer; font-size: 13px;
+  display: grid; place-items: center; border-radius: 2px;
+  width: 16px; height: 16px;
+}
+.param-group-del:hover {
+  color: var(--modify);
+  background: color-mix(in oklab, var(--modify) 12%, transparent);
+}
+
+.param-group-list {
+  display: flex; flex-direction: column;
+}
+.param-group.collapsed .param-group-list { display: none; }
+
 /* ─── Variable rows ─────────────────────────────────────────────── */
 .param-row {
   display: grid;
-  grid-template-columns: 44px 1fr 68px 22px;
+  grid-template-columns: 14px 44px 1fr 68px 22px;
   align-items: center; gap: 6px;
-  padding: 5px 12px;
+  padding: 5px 12px 5px 8px;
   font-size: 11.5px;
+  cursor: default;
 }
 .param-row:hover { background: var(--panel-2); }
+.param-row.dragging { opacity: 0.4; }
+.param-row.reorder-above {
+  border-top: 2px solid var(--draw);
+  padding-top: 3px;
+}
+
+.param-handle {
+  color: var(--fg-faint);
+  font-size: 9px;
+  cursor: grab;
+  user-select: none;
+  text-align: center;
+  letter-spacing: -1px;
+  line-height: 1;
+}
+.param-handle:active { cursor: grabbing; }
+.param-row:hover .param-handle { color: var(--fg-mid); }
 
 .param-name {
   color: var(--draw); font-family: var(--mono); font-weight: 700;
@@ -1961,6 +2067,16 @@ body.sidebar-collapsed .sidebar-collapse-chev { transform: rotate(180deg); }
 .feat-del:hover {
   color: var(--modify);
   background: color-mix(in oklab, var(--modify) 12%, transparent);
+}
+.feat-detach {
+  color: var(--fg-faint); cursor: pointer; font-size: 12px;
+  width: 20px; height: 20px; display: grid; place-items: center;
+  border-radius: 2px; flex-shrink: 0; opacity: 0;
+}
+.feat-row:hover .feat-detach { opacity: 1; }
+.feat-detach:hover {
+  color: var(--draw);
+  background: color-mix(in oklab, var(--draw) 12%, transparent);
 }
 
 /* ════════════════════════════════════════════════════════════════

@@ -478,6 +478,7 @@ export const state: AppState = {
   mouseScreen: { x: 0, y: 0 },
   nextId: 1,
   parameters: [],
+  parameterGroups: [],
   features: [],
   projectMeta: initialProjectMeta(),
 };

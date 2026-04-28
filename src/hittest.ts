@@ -339,6 +339,13 @@ function bboxReject(worldPt: Pt, e: Entity, t: number): boolean {
       maxX = Math.max(e.p1.x, e.p2.x, e.offset.x);
       minY = Math.min(e.p1.y, e.p2.y, e.offset.y);
       maxY = Math.max(e.p1.y, e.p2.y, e.offset.y);
+      // Inflate by the label hit-zone so the cheap reject doesn't kill
+      // valid clicks on the number when it sticks out past the dim line.
+      // hitDim's label band is `max(3·textHeight, L·0.25)` along × `1.5·textHeight`
+      // across — pad here by the larger of the two so all clicks reach hitDim.
+      const labelPad = Math.max(e.textHeight * 3, 4);
+      minX -= labelPad; maxX += labelPad;
+      minY -= labelPad; maxY += labelPad;
       // Diameter dims also extend to the far edge (centre − (anchor−centre)/r).
       // Be safe: include the whole radius-sized circle around the centre.
       if (e.dimKind === 'diameter' && e.vertex && e.ray1) {

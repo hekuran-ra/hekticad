@@ -4,12 +4,16 @@ import { state, runtime } from './state';
 import { render, requestRender } from './render';
 import { dom } from './dom';
 import {
-  deleteParameter, evalExpr, isParameterReferenced, parseExprInput, updateParameter,
+  createParameterGroup, deleteParameter, deleteParameterGroup, evalExpr,
+  getOrderedGroups, getParamsForGroup, isParameterReferenced,
+  moveParameter, parseExprInput, renameParameterGroup,
+  reorderParameterGroups, toggleParameterGroupCollapsed, updateParameter,
 } from './params';
 import {
   AXIS_X_ID, AXIS_Y_ID,
-  deleteFeatures, evaluateTimeline, featureDetail, featureForEntity, featureLabel,
-  moveEntityToLayer, unhideFeature,
+  deleteFeatures, detachModifierFeature, entityIdForFeature, evaluateTimeline,
+  featureDetail, featureForEntity, featureLabel, moveEntityToLayer,
+  unhideFeature,
 } from './features';
 import { pushUndo } from './undo';
 import { showConfirm, showPrompt } from './modal';
@@ -1219,6 +1223,15 @@ function formatParamValue(n: number): string {
   return n.toFixed(3).replace(/\.?0+$/, '');
 }
 
+/**
+ * In-flight drag-drop state for the variable panel. Lives at module scope so
+ * the dragstart handler on a row can publish what's being moved, and any
+ * row's dragover/drop handler can read it back without HTML5 dataTransfer
+ * round-tripping (which strips structured payloads in many browsers).
+ */
+type ParamDragKind = { kind: 'param'; id: string } | { kind: 'group'; id: string };
+let paramDrag: ParamDragKind | null = null;
+
 export function renderParameters(): void {
   dom.paramsEl.innerHTML = '';
 
@@ -1226,166 +1239,365 @@ export function renderParameters(): void {
   const badge = document.getElementById('side-count-vars');
   if (badge) badge.textContent = String(state.parameters.length);
 
-  if (!state.parameters.length) {
+  // Top toolbar: "+ Gruppe" — always visible, even on empty state, so the user
+  // can pre-build folders before naming any variables.
+  const toolbar = document.createElement('div');
+  toolbar.className = 'param-toolbar';
+  const addGroupBtn = document.createElement('button');
+  addGroupBtn.className = 'param-toolbar-btn';
+  addGroupBtn.textContent = '+ Gruppe';
+  addGroupBtn.title = 'Neue Variablen-Gruppe anlegen';
+  addGroupBtn.onclick = async () => {
+    const nm = await showPrompt({
+      title: 'Neue Variablen-Gruppe',
+      message: 'Name der Gruppe (z.B. Außenmaße, Innenmaße, Radien)',
+      placeholder: 'Gruppe',
+      validate: (v) => v.trim() ? null : 'Name darf nicht leer sein',
+    });
+    if (nm && nm.trim()) {
+      pushUndo();
+      createParameterGroup(nm.trim());
+      renderParameters();
+    }
+  };
+  toolbar.appendChild(addGroupBtn);
+  dom.paramsEl.appendChild(toolbar);
+
+  if (!state.parameters.length && !state.parameterGroups.length) {
     const empty = document.createElement('div');
     empty.className = 'panel-empty';
     empty.textContent = 'Keine Variablen. Tippe L, W, … in einem Maß-Prompt.';
     dom.paramsEl.appendChild(empty);
     return;
   }
-  for (const p of state.parameters) {
-    const row = document.createElement('div');
-    row.className = 'param-row';
 
-    const name = document.createElement('div');
-    name.className = 'param-name';
-    name.textContent = p.name;
-    name.title = 'Doppelklick: umbenennen';
-    name.ondblclick = async () => {
+  const groups = getOrderedGroups();
+  for (const g of groups) {
+    renderParameterGroup(g.id, g.name, !!g.collapsed);
+  }
+}
+
+function renderParameterGroup(groupId: string, groupName: string, collapsed: boolean): void {
+  const params = getParamsForGroup(groupId);
+
+  // Skip the synthetic "Allgemein" group when it's empty — only render real
+  // groups when they have no params (so the user can drop into them).
+  if (groupId === '' && params.length === 0) return;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'param-group' + (collapsed ? ' collapsed' : '');
+  wrap.dataset.groupId = groupId;
+
+  // Group accepts dropped parameters anywhere on its body. Visual feedback via
+  // the `drop-target` class, applied only when the dragged item is a param
+  // (groups can't nest into other groups).
+  wrap.addEventListener('dragover', (ev) => {
+    if (paramDrag?.kind !== 'param') return;
+    ev.preventDefault();
+    wrap.classList.add('drop-target');
+  });
+  wrap.addEventListener('dragleave', () => wrap.classList.remove('drop-target'));
+  wrap.addEventListener('drop', (ev) => {
+    wrap.classList.remove('drop-target');
+    if (paramDrag?.kind !== 'param') return;
+    ev.preventDefault();
+    pushUndo();
+    moveParameter(paramDrag.id, groupId, params.length);
+    paramDrag = null;
+    renderParameters();
+  });
+
+  // ─── Group header ────────────────────────────────────────────────
+  const header = document.createElement('div');
+  header.className = 'param-group-header';
+  // Synthetic "Allgemein" group: no rename / delete / drag handle, no
+  // collapse arrow when empty. Keeps the header visually distinct so the
+  // user understands real groups vs. the catch-all bucket.
+  if (groupId === '') header.classList.add('synthetic');
+  else {
+    header.draggable = true;
+    header.addEventListener('dragstart', (ev) => {
+      paramDrag = { kind: 'group', id: groupId };
+      ev.dataTransfer?.setData('text/plain', groupId);
+      header.classList.add('dragging');
+    });
+    header.addEventListener('dragend', () => {
+      header.classList.remove('dragging');
+      paramDrag = null;
+    });
+    // Drop a group ABOVE this header to reorder.
+    header.addEventListener('dragover', (ev) => {
+      if (paramDrag?.kind !== 'group' || paramDrag.id === groupId) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      header.classList.add('reorder-above');
+    });
+    header.addEventListener('dragleave', () => header.classList.remove('reorder-above'));
+    header.addEventListener('drop', (ev) => {
+      header.classList.remove('reorder-above');
+      if (paramDrag?.kind !== 'group' || paramDrag.id === groupId) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const order = state.parameterGroups
+        .slice()
+        .sort((a, b) => a.order - b.order)
+        .map(g => g.id);
+      const movingId = paramDrag.id;
+      const filtered = order.filter(x => x !== movingId);
+      const targetIdx = filtered.indexOf(groupId);
+      filtered.splice(targetIdx, 0, movingId);
+      pushUndo();
+      reorderParameterGroups(filtered);
+      paramDrag = null;
+      renderParameters();
+    });
+  }
+
+  const arrow = document.createElement('div');
+  arrow.className = 'param-group-arrow';
+  arrow.textContent = collapsed ? '▸' : '▾';
+  if (groupId !== '') {
+    arrow.style.cursor = 'pointer';
+    arrow.onclick = (ev) => {
+      ev.stopPropagation();
+      toggleParameterGroupCollapsed(groupId);
+      renderParameters();
+    };
+  } else {
+    arrow.style.visibility = 'hidden';
+  }
+
+  const title = document.createElement('div');
+  title.className = 'param-group-title';
+  title.textContent = groupName;
+  if (groupId !== '') {
+    title.title = 'Doppelklick: umbenennen';
+    title.ondblclick = async () => {
       const nm = await showPrompt({
-        title: 'Variable umbenennen',
-        defaultValue: p.name,
+        title: 'Gruppe umbenennen',
+        defaultValue: groupName,
         validate: (v) => v.trim() ? null : 'Name darf nicht leer sein',
       });
       if (nm && nm.trim()) {
-        updateParameter(p.id, { name: nm.trim() });
+        pushUndo();
+        renameParameterGroup(groupId, nm.trim());
         renderParameters();
       }
     };
-
-    const meaning = document.createElement('div');
-    meaning.className = 'param-meaning';
-    meaning.textContent = p.meaning ?? '';
-    meaning.title = 'Doppelklick: Bedeutung ändern';
-    meaning.ondblclick = async () => {
-      const m = await showPrompt({
-        title: `Bedeutung — ${p.name}`,
-        message: 'Kurzer Text, wofür diese Variable steht (z.B. „Länge").',
-        defaultValue: p.meaning ?? '',
-        placeholder: 'z.B. Länge',
-      });
-      if (m !== null) {
-        updateParameter(p.id, { meaning: m.trim() || undefined });
-        renderParameters();
-      }
-    };
-
-    const valueWrap = document.createElement('div');
-    valueWrap.className = 'param-value';
-    const inp = document.createElement('input');
-    inp.type = 'text';
-    // Display: formula source if present, else the cached value. Lets the
-    // user see and edit "W/4" rather than just the resulting number.
-    inp.value = p.formula
-      ? (p.formula.kind === 'formula' ? p.formula.src
-        : p.formula.kind === 'param'  ? (state.parameters.find(q => q.id === (p.formula as Extract<typeof p.formula, { kind: 'param' }>).id)?.name ?? '?')
-        : formatParamValue(p.value))
-      : formatParamValue(p.value);
-    inp.title = 'Zahl, andere Variable, oder Formel (z.B. W/2, 2*pi*R) — Enter zum Übernehmen';
-
-    // Commit the typed value. Three branches:
-    //   1. Plain number → store as constant, clear any existing formula.
-    //   2. Single param ref or formula referencing OTHER params → store as
-    //      formula, recompute cached value.
-    //   3. Self-referential formula (would create a cycle) → reject.
-    let committed = false;
-    const commit = (): void => {
-      if (committed) return;
-      const r = parseExprInput(inp.value);
-      if (!r || r.kind !== 'expr') {
-        inp.value = formatParamValue(p.value);
-        toast('Ungültige Eingabe');
-        return;
-      }
-      const expr = r.expr;
-      // Self-reference cycle check: a parameter's formula referencing itself
-      // (directly or transitively) creates an unsolvable cycle. Detect by
-      // seeing if `p.id` appears in this expression's refs OR transitively
-      // via other parameters' formulas.
-      const refsCycle = (e: Expr, seen: Set<string>): boolean => {
-        if (e.kind === 'param') {
-          if (e.id === p.id) return true;
-          if (seen.has(e.id)) return false;
-          seen.add(e.id);
-          const dep = state.parameters.find(q => q.id === e.id);
-          return !!(dep && dep.formula && refsCycle(dep.formula, seen));
-        }
-        if (e.kind === 'formula') {
-          for (const refId of e.refs) {
-            if (refId === p.id) return true;
-            if (seen.has(refId)) continue;
-            seen.add(refId);
-            const dep = state.parameters.find(q => q.id === refId);
-            if (dep && dep.formula && refsCycle(dep.formula, seen)) return true;
-          }
-        }
-        return false;
-      };
-      if (refsCycle(expr, new Set())) {
-        inp.value = formatParamValue(p.value);
-        toast('Zyklus erkannt — Variable kann sich nicht selbst referenzieren');
-        return;
-      }
-      const v = evalExpr(expr);
-      if (!Number.isFinite(v)) {
-        inp.value = formatParamValue(p.value);
-        toast('Formel ergibt keinen gültigen Wert');
-        return;
-      }
-      committed = true;
-      // Decide whether to store as formula or as plain constant.
-      const storeFormula = expr.kind !== 'num';
-      if (storeFormula) {
-        updateParameter(p.id, { value: v, formula: expr });
-      } else {
-        updateParameter(p.id, { value: v, formula: undefined });
-      }
-      // Fast-path: tell evaluateTimeline exactly which param changed.
-      // recomputeParameters runs first inside evaluateTimeline so any
-      // dependent parameters' values catch up before features evaluate.
-      evaluateTimeline({ changedParams: [p.id] });
-      render();
-      renderParameters();
-    };
-
-    // Enter in a plain <input type="text"> normally does NOT fire `change` —
-    // `change` only fires on blur. Without this handler the Enter keydown
-    // bubbles to the window-level Enter shortcut (which re-invokes the last
-    // tool) before the value is committed, forcing the user to press Enter a
-    // second time. Commit explicitly here and stop the bubble.
-    inp.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') {
-        ev.preventDefault();
-        ev.stopPropagation();
-        commit();
-        // commit() rebuilds the panel, so `inp` is already detached — no blur
-        // handling needed.
-      } else if (ev.key === 'Escape') {
-        ev.preventDefault();
-        ev.stopPropagation();
-        inp.value = formatParamValue(p.value);
-        inp.blur();
-      }
-    });
-    inp.onchange = commit; // still fires on blur for mouse users
-    valueWrap.appendChild(inp);
-
-    const del = document.createElement('div');
-    del.className = 'param-del';
-    del.textContent = '×';
-    del.title = 'Variable löschen';
-    del.onclick = () => {
-      if (isParameterReferenced(p.id)) {
-        toast('Variable wird verwendet — zuerst Referenzen entfernen');
-        return;
-      }
-      deleteParameter(p.id);
-      renderParameters();
-    };
-
-    row.append(name, meaning, valueWrap, del);
-    dom.paramsEl.appendChild(row);
   }
+
+  const count = document.createElement('div');
+  count.className = 'param-group-count';
+  count.textContent = String(params.length);
+
+  header.append(arrow, title, count);
+
+  if (groupId !== '') {
+    const groupDel = document.createElement('div');
+    groupDel.className = 'param-group-del';
+    groupDel.textContent = '×';
+    groupDel.title = 'Gruppe löschen (Variablen wandern in „Allgemein")';
+    groupDel.onclick = async (ev) => {
+      ev.stopPropagation();
+      const ok = await showConfirm({
+        title: `Gruppe „${groupName}" löschen?`,
+        message: 'Die enthaltenen Variablen bleiben erhalten und wandern in die Gruppe „Allgemein".',
+        okText: 'Löschen',
+        danger: true,
+      });
+      if (!ok) return;
+      pushUndo();
+      deleteParameterGroup(groupId);
+      renderParameters();
+    };
+    header.appendChild(groupDel);
+  }
+
+  wrap.appendChild(header);
+
+  // ─── Parameter rows ──────────────────────────────────────────────
+  if (!collapsed) {
+    const list = document.createElement('div');
+    list.className = 'param-group-list';
+    params.forEach((p, idx) => {
+      list.appendChild(buildParamRow(p, groupId, idx));
+    });
+    wrap.appendChild(list);
+  }
+
+  dom.paramsEl.appendChild(wrap);
+}
+
+function buildParamRow(p: import('./types').Parameter, groupId: string, indexInGroup: number): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'param-row';
+  row.draggable = true;
+  row.dataset.paramId = p.id;
+
+  row.addEventListener('dragstart', (ev) => {
+    paramDrag = { kind: 'param', id: p.id };
+    ev.dataTransfer?.setData('text/plain', p.id);
+    row.classList.add('dragging');
+  });
+  row.addEventListener('dragend', () => {
+    row.classList.remove('dragging');
+    paramDrag = null;
+  });
+  // Drop ABOVE this row to insert before it within the same group's list.
+  row.addEventListener('dragover', (ev) => {
+    if (paramDrag?.kind !== 'param' || paramDrag.id === p.id) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    row.classList.add('reorder-above');
+  });
+  row.addEventListener('dragleave', () => row.classList.remove('reorder-above'));
+  row.addEventListener('drop', (ev) => {
+    row.classList.remove('reorder-above');
+    if (paramDrag?.kind !== 'param' || paramDrag.id === p.id) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    pushUndo();
+    moveParameter(paramDrag.id, groupId, indexInGroup);
+    paramDrag = null;
+    renderParameters();
+  });
+
+  const handle = document.createElement('div');
+  handle.className = 'param-handle';
+  handle.textContent = '⋮⋮';
+  handle.title = 'Ziehen zum Verschieben';
+  row.appendChild(handle);
+
+  const name = document.createElement('div');
+  name.className = 'param-name';
+  name.textContent = p.name;
+  name.title = 'Doppelklick: umbenennen';
+  name.ondblclick = async () => {
+    const nm = await showPrompt({
+      title: 'Variable umbenennen',
+      defaultValue: p.name,
+      validate: (v) => v.trim() ? null : 'Name darf nicht leer sein',
+    });
+    if (nm && nm.trim()) {
+      pushUndo();
+      updateParameter(p.id, { name: nm.trim() });
+      renderParameters();
+    }
+  };
+
+  const meaning = document.createElement('div');
+  meaning.className = 'param-meaning';
+  meaning.textContent = p.meaning ?? '';
+  meaning.title = 'Doppelklick: Bedeutung ändern';
+  meaning.ondblclick = async () => {
+    const m = await showPrompt({
+      title: `Bedeutung — ${p.name}`,
+      message: 'Kurzer Text, wofür diese Variable steht (z.B. „Länge").',
+      defaultValue: p.meaning ?? '',
+      placeholder: 'z.B. Länge',
+    });
+    if (m !== null) {
+      pushUndo();
+      updateParameter(p.id, { meaning: m.trim() || undefined });
+      renderParameters();
+    }
+  };
+
+  const valueWrap = document.createElement('div');
+  valueWrap.className = 'param-value';
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.value = p.formula
+    ? (p.formula.kind === 'formula' ? p.formula.src
+      : p.formula.kind === 'param'  ? (state.parameters.find(q => q.id === (p.formula as Extract<typeof p.formula, { kind: 'param' }>).id)?.name ?? '?')
+      : formatParamValue(p.value))
+    : formatParamValue(p.value);
+  inp.title = 'Zahl, andere Variable, oder Formel (z.B. W/2, 2*pi*R) — Enter zum Übernehmen';
+
+  let committed = false;
+  const commit = (): void => {
+    if (committed) return;
+    const r = parseExprInput(inp.value);
+    if (!r || r.kind !== 'expr') {
+      inp.value = formatParamValue(p.value);
+      toast('Ungültige Eingabe');
+      return;
+    }
+    const expr = r.expr;
+    const refsCycle = (e: Expr, seen: Set<string>): boolean => {
+      if (e.kind === 'param') {
+        if (e.id === p.id) return true;
+        if (seen.has(e.id)) return false;
+        seen.add(e.id);
+        const dep = state.parameters.find(q => q.id === e.id);
+        return !!(dep && dep.formula && refsCycle(dep.formula, seen));
+      }
+      if (e.kind === 'formula') {
+        for (const refId of e.refs) {
+          if (refId === p.id) return true;
+          if (seen.has(refId)) continue;
+          seen.add(refId);
+          const dep = state.parameters.find(q => q.id === refId);
+          if (dep && dep.formula && refsCycle(dep.formula, seen)) return true;
+        }
+      }
+      return false;
+    };
+    if (refsCycle(expr, new Set())) {
+      inp.value = formatParamValue(p.value);
+      toast('Zyklus erkannt — Variable kann sich nicht selbst referenzieren');
+      return;
+    }
+    const v = evalExpr(expr);
+    if (!Number.isFinite(v)) {
+      inp.value = formatParamValue(p.value);
+      toast('Formel ergibt keinen gültigen Wert');
+      return;
+    }
+    committed = true;
+    pushUndo();
+    const storeFormula = expr.kind !== 'num';
+    if (storeFormula) {
+      updateParameter(p.id, { value: v, formula: expr });
+    } else {
+      updateParameter(p.id, { value: v, formula: undefined });
+    }
+    evaluateTimeline({ changedParams: [p.id] });
+    render();
+    renderParameters();
+  };
+
+  inp.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      commit();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      inp.value = formatParamValue(p.value);
+      inp.blur();
+    }
+  });
+  inp.onchange = commit;
+  valueWrap.appendChild(inp);
+
+  const del = document.createElement('div');
+  del.className = 'param-del';
+  del.textContent = '×';
+  del.title = 'Variable löschen';
+  del.onclick = () => {
+    if (isParameterReferenced(p.id)) {
+      toast('Variable wird verwendet — zuerst Referenzen entfernen');
+      return;
+    }
+    pushUndo();
+    deleteParameter(p.id);
+    renderParameters();
+  };
+
+  row.append(name, meaning, valueWrap, del);
+  return row;
 }
 
 const SYSTEM_FEATURE_IDS = new Set([AXIS_X_ID, AXIS_Y_ID]);
@@ -1445,6 +1657,30 @@ export function renderTimeline(): void {
     detail.className = 'feat-detail';
     detail.textContent = featureDetail(f);
 
+    // Detach button — modifier features only (Mirror, Array, Rotate,
+    // CrossMirror). Converts the derived copies into independent features so
+    // editing one no longer cascades through the link.
+    const isDetachable = f.kind === 'mirror' || f.kind === 'array' ||
+      f.kind === 'rotate' || f.kind === 'crossMirror';
+    let detachBtn: HTMLDivElement | null = null;
+    if (isDetachable) {
+      detachBtn = document.createElement('div');
+      detachBtn.className = 'feat-detach';
+      detachBtn.textContent = '⛓';
+      detachBtn.title = 'Bindung trennen — Kopien werden eigenständig';
+      detachBtn.onclick = (ev) => {
+        ev.stopPropagation();
+        pushUndo();
+        const n = detachModifierFeature(f.id);
+        evaluateTimeline();
+        updateStats();
+        render();
+        renderTimeline();
+        if (n > 0) toast(`${n} Objekt${n === 1 ? '' : 'e'} gelöst`);
+        else toast('Keine Kopien zum Lösen');
+      };
+    }
+
     // Delete button
     const del = document.createElement('div');
     del.className = 'feat-del';
@@ -1459,20 +1695,49 @@ export function renderTimeline(): void {
       if (hidden) toast('Ausgeblendet (noch als Bezug verwendet)');
     };
 
-    row.append(dot, cat, idx, kind, detail, del);
+    if (detachBtn) row.append(dot, cat, idx, kind, detail, detachBtn, del);
+    else row.append(dot, cat, idx, kind, detail, del);
 
-    // Click anywhere on a hidden row to unhide (except the × button)
-    if (f.hidden) {
-      row.addEventListener('click', (ev) => {
-        if ((ev.target as HTMLElement).closest('.feat-del')) return;
+    // Single click handler: select on visible features (so the properties
+    // panel pivots to that step's editor), unhide on hidden ones. Editing
+    // the panel mutates the feature; evaluateTimeline rebuilds the graph so
+    // downstream steps re-flow automatically — that's the "go back in
+    // history, tweak a step, watch follow-ups update" workflow.
+    row.style.cursor = 'pointer';
+    const fid = f.id;
+    const fHidden = f.hidden;
+    row.onclick = (ev) => {
+      const target = ev.target as HTMLElement;
+      if (target.closest('.feat-del')) return;
+      if (target.closest('.feat-detach')) return;
+      if (fHidden) {
         pushUndo();
-        if (unhideFeature(f.id)) {
+        if (unhideFeature(fid)) {
           render();
           renderTimeline();
           toast('Wieder eingeblendet');
         }
-      });
-    }
+        return;
+      }
+      // Resolve the entity for this feature. Use the canonical id-map first,
+      // then fall back to scanning state.entities — under HMR the id-map can
+      // be stale (cached in a previous module instance) but state.entities
+      // is always fresh.
+      let eid: number | null = entityIdForFeature(fid);
+      if (eid == null) {
+        for (const ent of state.entities) {
+          const ownerFid = featureForEntity(ent.id)?.id;
+          if (ownerFid === fid) { eid = ent.id; break; }
+        }
+      }
+      if (eid == null) return;
+      state.selection.clear();
+      state.selection.add(eid);
+      updateSelStatus();
+      renderProperties();
+      renderTimeline();
+      render();
+    };
 
     dom.timelineEl.appendChild(row);
   });

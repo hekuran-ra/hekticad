@@ -1,5 +1,5 @@
 import type { Entity, EntityInit, Expr, ExportOptions, Feature, ImportFormat,
-              ImportResult, Layer, Parameter, PointRef, Pt } from './types';
+              ImportResult, Layer, Parameter, ParameterGroup, PointRef, Pt } from './types';
 import { patternForLineStyle, resolveLineStyle } from './types';
 import { consumeNextDrawingNumber, saveProjectMeta, state } from './state';
 import { render } from './render';
@@ -79,6 +79,7 @@ type SaveFormat = {
   layers?: Layer[];
   nextId?: number;
   parameters?: Parameter[];
+  parameterGroups?: ParameterGroup[];
   features?: Feature[];
 };
 
@@ -167,6 +168,7 @@ function buildSaveBlob(): Blob {
     layers: state.layers,
     nextId: state.nextId,
     parameters: state.parameters,
+    parameterGroups: state.parameterGroups,
     features: state.features,
   };
   return new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -306,6 +308,7 @@ export function applyLoadedDrawing(jsonText: string): boolean {
     }
     state.nextId = data.nextId ?? 1;
     state.parameters = data.parameters ?? [];
+    state.parameterGroups = data.parameterGroups ?? [];
     state.features = data.features ?? [];
     state.selection.clear();
     // Guarantee locked origin axes are present (may be missing in old files).
@@ -1002,6 +1005,7 @@ export async function clearAll(): Promise<void> {
   if (!ok) return;
   pushUndo();
   state.parameters = [];
+  state.parameterGroups = [];
   state.features = [];
   state.selection.clear();
   ensureAxisFeatures();

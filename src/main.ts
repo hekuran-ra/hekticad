@@ -14,7 +14,7 @@ import { collectSnapPoints } from './snap';
 import { hitTest } from './hittest';
 import { render, requestRender, resize } from './render';
 import {
-  cancelTool, deleteSelection, handleClick, handleTextDrag,
+  applyDimOffsetGripDrag, cancelTool, deleteSelection, handleClick, handleTextDrag,
   renderToolsPanel, selectByBox, setStretchBox, setTool, TOOLS, toolRequiresSelection, updatePreview,
 } from './tools';
 import { saveJson } from './io';
@@ -221,6 +221,15 @@ function applyGripDrag(worldPt: Pt): void {
     x: newPoint.x - dg.grip.x,
     y: newPoint.y - dg.grip.y,
   };
+  // Dim offset grip is special: the offset can't be expressed as an entity
+  // edit (it's a single off-line point that drives the dim's perpendicular
+  // distance), so it bypasses the entity-init path and mutates the feature
+  // directly. Without this branch the grip is rendered but does nothing —
+  // the user couldn't drag a dim away from its line.
+  if (dg.grip.kind === 'dim-offset') {
+    applyDimOffsetGripDrag(dg.entityId, newPoint);
+    return;
+  }
   const init = computeGripDragInit(dg.startEntity, dg.grip, newPoint, deltaFromGripStart);
   if (!init) return;
   const feat = featureForEntity(dg.entityId);

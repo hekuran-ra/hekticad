@@ -1,4 +1,4 @@
-import type { Feature, Parameter } from './types';
+import type { Feature, Parameter, ParameterGroup } from './types';
 import { state } from './state';
 import { requestRender } from './render';
 import { evaluateTimeline } from './features';
@@ -9,6 +9,7 @@ type Snapshot = {
   selection: number[];
   nextId: number;
   parameters: Parameter[];
+  parameterGroups: ParameterGroup[];
   features: Feature[];
 };
 
@@ -22,6 +23,7 @@ function snapshot(): Snapshot {
     selection: [...state.selection],
     nextId: state.nextId,
     parameters: structuredClone(state.parameters),
+    parameterGroups: structuredClone(state.parameterGroups),
     features: structuredClone(state.features),
   };
 }
@@ -29,6 +31,7 @@ function snapshot(): Snapshot {
 function restore(s: Snapshot): void {
   state.nextId = s.nextId;
   state.parameters = s.parameters;
+  state.parameterGroups = s.parameterGroups ?? [];
   state.features = s.features;
   // Rebuild entities (and the stable id map) from the restored feature list.
   evaluateTimeline();

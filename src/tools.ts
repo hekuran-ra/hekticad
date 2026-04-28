@@ -12,10 +12,11 @@ import {
 import { pushUndo, undo as undoLast } from './undo';
 import { evalExpr } from './params';
 import {
-  addFeatureFromInit, AXIS_X_ID, AXIS_Y_ID, deleteFeatures, entityIdForFeature,
-  evaluateTimeline, featureDependsOn, featureForEntity, featureFromEntityInit,
-  lastTopoSortCycle, modifierOutputInfo, newFeatureId, replaceFeatureFromInit,
-  topoSortFeatures,
+  addFeatureFromInit, AXIS_X_ID, AXIS_Y_ID, collectFeaturePoints, deleteFeatures,
+  entityIdForFeature, evaluateTimeline, featureDependsOn, featureForEntity,
+  featureFromEntityInit, getLastCtx, lastTopoSortCycle, modifierOutputInfo,
+  newFeatureId, replaceFeatureFromInit, stretchFeature, topoSortFeatures,
+  translateFeature,
 } from './features';
 import { showConfirm } from './modal';
 import { layoutText } from './textlayout';
@@ -582,11 +583,14 @@ export const TOOLS: ToolDef[] = [
   { id: 'xline',      label: 'Hilfslinie',    key: 'H', group: 'guide',
     icon: '<line x1="1" y1="19" x2="21" y2="3" stroke-dasharray="3.5 2.5" stroke-linecap="round"/>' },
   { id: 'dim',        label: 'Bemaßung Punkt-zu-Punkt', key: 'D', group: 'guide',
-    icon: '<path d="M4 18 L18 4"/><path d="M2 16 L4 18 L6 14 M14 6 L18 4 L16 8" fill="currentColor" stroke="none"/>' },
+    // Two extension lines reaching down to a parallel measure line with
+    // arrowheads at both ends — reads as "diagonal aligned dim" without
+    // looking like a generic angled-stroke icon.
+    icon: '<path d="M4 4 L7 7 M14 14 L17 17" stroke-linecap="round" opacity="0.55"/><path d="M5.5 5.5 L18.5 18.5" stroke-linecap="round"/><path d="M6.5 8 L5.5 5.5 L8 6.5 M14 17 L18.5 18.5 L17 14" fill="currentColor" stroke="none"/><circle cx="3" cy="3" r="1" fill="currentColor" stroke="none"/><circle cx="13" cy="13" r="1" fill="currentColor" stroke="none"/>' },
   { id: 'dim_h',      label: 'Bemaßung horizontal', key: '5', group: 'guide',
-    icon: '<path d="M4 5 L4 11 M18 5 L18 11"/><path d="M4 8 L18 8"/><path d="M6 6 L4 8 L6 10 M16 6 L18 8 L16 10" fill="currentColor" stroke="none"/>' },
+    icon: '<path d="M4 4 L4 11 M18 4 L18 11" stroke-linecap="round"/><path d="M4 8 L18 8" stroke-linecap="round"/><path d="M6.5 6 L4 8 L6.5 10 M15.5 6 L18 8 L15.5 10" fill="currentColor" stroke="none"/>' },
   { id: 'dim_v',      label: 'Bemaßung vertikal',   key: '6', group: 'guide',
-    icon: '<path d="M5 4 L11 4 M5 18 L11 18"/><path d="M8 4 L8 18"/><path d="M6 6 L8 4 L10 6 M6 16 L8 18 L10 16" fill="currentColor" stroke="none"/>' },
+    icon: '<path d="M4 4 L11 4 M4 18 L11 18" stroke-linecap="round"/><path d="M8 4 L8 18" stroke-linecap="round"/><path d="M6 6.5 L8 4 L10 6.5 M6 15.5 L8 18 L10 15.5" fill="currentColor" stroke="none"/>' },
   { id: 'ref_circle', label: 'Hilfskreis',    key: 'K', group: 'guide',
     icon: '<circle cx="11" cy="11" r="7" stroke-dasharray="3 2"/><path d="M11 4.5 L11 17.5 M4.5 11 L17.5 11" stroke-width="0.8" opacity="0.45" stroke-dasharray="1 1.5"/><circle cx="11" cy="11" r="1" fill="currentColor" stroke="none"/>' },
   { id: 'angle',      label: 'Winkel bemaßen', key: 'W', group: 'guide',
@@ -651,9 +655,11 @@ export const TOOLS: ToolDef[] = [
   { id: 'extend_to', label: 'Bis Linie',  key: 'Y', group: 'modify',
     icon: '<path d="M3 14 L12 14"/><path d="M10 11 L13 14 L10 17" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 6 L17 6" opacity="0.75"/><path d="M17 2.5 L17 17" stroke-dasharray="2 1.8" opacity="0.55"/>' },
   { id: 'fillet', label: 'Abrunden',    key: 'G', group: 'modify',
-    icon: '<path d="M4 11 L4 18 L11 18" stroke-dasharray="2 1.8" opacity="0.35"/><path d="M4 4 L4 11 A 7 7 0 0 0 11 18 L18 18" stroke-linecap="round" fill="none"/>' },
+    // L-shaped corner with a clear quarter-circle replacing the inner angle
+    // — visually communicates "rounding" rather than "drawing an arc".
+    icon: '<path d="M4 4 L4 11 M11 18 L18 18" stroke-linecap="round" stroke-dasharray="1.5 1.6" opacity="0.45"/><path d="M4 4 L4 11" stroke-linecap="round"/><path d="M11 18 L18 18" stroke-linecap="round"/><path d="M4 11 A 7 7 0 0 0 11 18" stroke-linecap="round" fill="none"/>' },
   { id: 'chamfer', label: 'Fase',       key: 'F', group: 'modify',
-    icon: '<path d="M4 4 L4 18 L18 18" stroke-dasharray="2 2" opacity="0.35"/><path d="M4 4 L4 10 L12 18 L18 18"/>' },
+    icon: '<path d="M4 4 L4 11 M11 18 L18 18" stroke-linecap="round" stroke-dasharray="1.5 1.6" opacity="0.45"/><path d="M4 4 L4 11" stroke-linecap="round"/><path d="M11 18 L18 18" stroke-linecap="round"/><path d="M4 11 L11 18" stroke-linecap="round"/>' },
   { id: 'offset', label: 'Versatz',     key: 'U', group: 'modify',
     icon: '<rect x="2.5" y="2.5" width="15" height="15"/><rect x="6.5" y="6.5" width="7" height="7"/>' },
   { id: 'line_offset', label: 'Linie versetzen', key: 'I', group: 'modify',
@@ -2409,13 +2415,63 @@ function transformEntity(
 
 function transformSelection(
   fn: TransformFn,
-  { copy = false, pureTranslation = false }: { copy?: boolean; pureTranslation?: boolean } = {},
+  { copy = false, pureTranslation = false, translation = null }:
+    { copy?: boolean; pureTranslation?: boolean; translation?: Pt | null } = {},
 ): void {
   const ids = [...state.selection];
   if (!ids.length) return;
   pushUndo();
   const keepFids: string[] = [];
   const removedFids = new Set<string>();
+
+  // Pure-translation fast path: walk features (not entities) and shift every
+  // PointRef in place via translateFeature. Preserves parametric links — abs
+  // refs that were variable-driven keep their formulas (just bumped by the
+  // translation), endpoint/center/intersection refs to OTHER features stay
+  // pinned to those features so the moved geometry continues to track them.
+  // Falls through to entity-based transform for entity types not yet covered
+  // (e.g. selection contains a sub-entity from a modifier — its source
+  // feature isn't in selection but the user dragged the visible copy).
+  if (!copy && pureTranslation && translation) {
+    const dx = translation.x, dy = translation.y;
+    const handledFids = new Set<string>();
+    for (const id of ids) {
+      const ent = state.entities.find(x => x.id === id);
+      if (!ent) continue;
+      const srcFid = featureForEntity(id)?.id ?? null;
+      if (!srcFid || handledFids.has(srcFid)) continue;
+      const idx = state.features.findIndex(x => x.id === srcFid);
+      if (idx < 0) continue;
+      const f = state.features[idx];
+      // Modifier features: their sources translate independently if those
+      // sources are also in the selection. If not in selection, the modifier's
+      // anchor refs (mirror axis, rotate centre, …) translate so the output
+      // moves with the user-visible drag.
+      const isModifier = f.kind === 'mirror' || f.kind === 'array' ||
+        f.kind === 'rotate' || f.kind === 'crossMirror' ||
+        f.kind === 'fillet' || f.kind === 'chamfer' || f.kind === 'clip';
+      if (isModifier) {
+        // Skip — sources translate themselves; if any source was in the
+        // original selection it'll be processed in this loop.
+        handledFids.add(srcFid);
+        continue;
+      }
+      const moved = translateFeature(f, dx, dy);
+      state.features[idx] = moved;
+      keepFids.push(srcFid);
+      handledFids.add(srcFid);
+    }
+    evaluateTimeline();
+    state.selection.clear();
+    for (const fid of keepFids) {
+      const eid = entityIdForFeature(fid);
+      if (eid !== null) state.selection.add(eid);
+    }
+    updateStats();
+    updateSelStatus();
+    return;
+  }
+
   for (const id of ids) {
     const e = state.entities.find(x => x.id === id);
     if (!e) continue;
@@ -4404,8 +4460,19 @@ function handleStretchClick(p: Pt, _worldPt: Pt): void {
 }
 
 /**
- * Commit the stretch: move all endpoints inside the crossing box by
- * `target - basePt`. Shared by click-commit and cmdbar-typed-distance.
+ * Commit the stretch: move every PointRef whose resolved world position lies
+ * inside the crossing box by `target - basePt`. PointRefs OUTSIDE the box
+ * stay parametrically linked — only the moved anchors collapse to absolute
+ * (and even then `shiftExpr` keeps any variable-driven coords alive when the
+ * ref was already abs).
+ *
+ * Modifier features (mirror, array, rotate, fillet, …) are skipped: their
+ * geometry is derived from sources, so the source's stretch propagates
+ * automatically through `evaluateTimeline()`.
+ *
+ * Rect features fall back to the legacy entity-based stretch when only some
+ * of their corners sit in the box (rect→polyline conversion). Whole-rect
+ * stretches stay parametric. Same for xline (translate-only).
  */
 export function applyStretchTarget(tc: ToolCtx, target: Pt): void {
   if (!tc.click1 || !tc.click2 || !tc.basePt) return;
@@ -4413,17 +4480,64 @@ export function applyStretchTarget(tc: ToolCtx, target: Pt): void {
   if (len(delta) < 1e-9) { toast('Kein Versatz'); return; }
   pushUndo();
   const w1 = tc.click1, w2 = tc.click2;
-  const snapshot = [...state.entities];
-  for (const e of snapshot) {
-    const replaced = stretchEntity(e, w1, w2, delta);
-    if (!replaced || replaced === e) continue;
-    const fid = featureForEntity(e.id)?.id;
-    if (!fid) continue;
-    if (replaced.type === e.type) {
-      replaceFeatureFromInit(fid, entityInit(replaced));
-    } else {
-      state.features = state.features.filter(f => f.id !== fid);
-      state.features.push(featureFromEntityInit(entityInit(replaced)));
+  const xmin = Math.min(w1.x, w2.x), xmax = Math.max(w1.x, w2.x);
+  const ymin = Math.min(w1.y, w2.y), ymax = Math.max(w1.y, w2.y);
+  const inBox = (p: Pt) =>
+    Number.isFinite(p.x) && Number.isFinite(p.y) &&
+    p.x >= xmin && p.x <= xmax && p.y >= ymin && p.y <= ymax;
+
+  const ctx = getLastCtx();
+  const featureSnapshot = [...state.features];
+
+  for (const f of featureSnapshot) {
+    if (f.hidden) continue;
+    if (state.layers[f.layer]?.locked) continue;
+    // Modifier features: derived geometry, leave alone.
+    if (f.kind === 'mirror' || f.kind === 'array' || f.kind === 'rotate' ||
+        f.kind === 'crossMirror' || f.kind === 'fillet' || f.kind === 'chamfer' ||
+        f.kind === 'clip') continue;
+
+    // Rect with partial corners inside box → fall back to entity-based stretch
+    // (which promotes to polyline on partial selection). Whole-rect stretches
+    // are handled by stretchFeature parametrically.
+    if (f.kind === 'rect') {
+      const eid = entityIdForFeature(f.id);
+      const ent = eid != null ? state.entities.find(e => e.id === eid) : null;
+      if (ent && ent.type === 'rect') {
+        const c1 = { x: ent.x1, y: ent.y1 };
+        const c2 = { x: ent.x2, y: ent.y1 };
+        const c3 = { x: ent.x2, y: ent.y2 };
+        const c4 = { x: ent.x1, y: ent.y2 };
+        const movedCount = [c1, c2, c3, c4].filter(inBox).length;
+        if (movedCount > 0 && movedCount < 4) {
+          // Partial: legacy path (rect → polyline), parametric link is lost.
+          const replaced = stretchEntity(ent, w1, w2, delta);
+          if (replaced && replaced !== ent) {
+            const fid = f.id;
+            if (replaced.type === ent.type) {
+              replaceFeatureFromInit(fid, entityInit(replaced));
+            } else {
+              state.features = state.features.filter(x => x.id !== fid);
+              state.features.push(featureFromEntityInit(entityInit(replaced)));
+            }
+          }
+          continue;
+        }
+        // Full rect-translate falls through to stretchFeature below.
+      }
+    }
+
+    const pts = collectFeaturePoints(f, ctx);
+    if (pts.length === 0) continue;
+    if (!pts.some(({ pt }) => inBox(pt))) continue;
+
+    const resolvedMap = new Map<PointRef, Pt>();
+    for (const { ref, pt } of pts) resolvedMap.set(ref, pt);
+
+    const newFeat = stretchFeature(f, w1, w2, delta.x, delta.y, resolvedMap);
+    if (newFeat !== f) {
+      const idx = state.features.findIndex(x => x.id === f.id);
+      if (idx >= 0) state.features[idx] = newFeat;
     }
   }
   evaluateTimeline();
@@ -5235,7 +5349,7 @@ function handleMoveCopyClick(p: Pt, worldPt: Pt, isCopy: boolean, shiftKey = fal
     } else if (isCopy && (runtime.copyCols > 1 || runtime.copyRows > 1)) {
       applyMatrixCopy(delta, runtime.copyCols, runtime.copyRows);
     } else {
-      transformSelection(pt => add(pt, delta), { copy, pureTranslation: true });
+      transformSelection(pt => add(pt, delta), { copy, pureTranslation: true, translation: delta });
     }
     if (isCopy) {
       setPrompt('Zielpunkt (Rechtsklick beendet)');
@@ -7056,14 +7170,20 @@ function computeFillet(l1: LineEntity, click1: Pt, l2: LineEntity, click2: Pt, r
   const cDist = r / Math.sin(half);
   // Constraint: t ≤ dist(P, keptN) → r ≤ tan(half) * dist(P, keptN).
   // Report the binding limit so the user knows what value would still fit.
+  // Use a small relative epsilon (1e-9 times the line length) instead of a
+  // fixed 1e-6: with a fixed buffer, a user who types EXACTLY the displayed
+  // max (e.g. "2.0" when max is 2.000000) hits the buffer and gets rejected.
+  // A relative tolerance scales sanely with drawing units (mm vs m).
   const maxR1 = Math.tan(half) * dist(P, kept1);
   const maxR2 = Math.tan(half) * dist(P, kept2);
   const rMax = Math.min(maxR1, maxR2);
-  if (t > dist(P, kept1) - 1e-6) {
-    return { error: `Radius zu groß für Linie 1 (max ${rMax.toFixed(2)})` };
+  const eps1 = Math.max(1e-9, dist(P, kept1) * 1e-9);
+  const eps2 = Math.max(1e-9, dist(P, kept2) * 1e-9);
+  if (t > dist(P, kept1) + eps1) {
+    return { error: `Radius zu groß für Linie 1 (max ${rMax.toFixed(3)})` };
   }
-  if (t > dist(P, kept2) - 1e-6) {
-    return { error: `Radius zu groß für Linie 2 (max ${rMax.toFixed(2)})` };
+  if (t > dist(P, kept2) + eps2) {
+    return { error: `Radius zu groß für Linie 2 (max ${rMax.toFixed(3)})` };
   }
 
   const T1 = add(P, scale(u1, t));
@@ -7249,6 +7369,15 @@ export function applyFillet(radius: number): void {
     return;
   }
 
+  // Keep the tool ctx alive on radius-too-large errors so the user can just
+  // re-type a smaller radius without re-picking both lines from scratch. The
+  // pick stays in 'pick2' with both lines remembered; cmdbar's Radius input
+  // re-invokes applyFillet on the next typed value.
+  const keepPick = () => {
+    setPrompt(`Neuen Radius eingeben (max siehe Toast)`);
+    render();
+  };
+
   // ── Case B: plain line features → non-destructive FilletFeature ───────────
   // Source lines are hidden (they remain in ctx so PointRefs stay live) and
   // the FilletFeature evaluator produces the trimmed lines + arc on every
@@ -7257,7 +7386,7 @@ export function applyFillet(radius: number): void {
   // users can snap to its endpoints, midpoint, and center.
   if (f1 && f1.kind === 'line' && f2 && f2.kind === 'line') {
     const result = computeFillet(l1, c1, l2, c2, radius);
-    if ('error' in result) { toast(result.error); resetPick(); return; }
+    if ('error' in result) { toast(result.error); keepPick(); return; }
 
     const P = lineIntersectionInfinite(l1, l2);
     if (!P) { toast('Linien sind parallel'); resetPick(); return; }
@@ -7298,7 +7427,7 @@ export function applyFillet(radius: number): void {
     const needsExpand = (f: Feature | null): boolean => !f || f.kind !== 'line';
     if (needsExpand(f1) || needsExpand(f2)) {
       const result = computeFillet(l1, c1, l2, c2, radius);
-      if ('error' in result) { toast(result.error); resetPick(); return; }
+      if ('error' in result) { toast(result.error); keepPick(); return; }
       const P = lineIntersectionInfinite(l1, l2);
       if (!P) { toast('Linien sind parallel'); resetPick(); return; }
       const cut1End = pickLineCutEnd(l1, c1, P);
@@ -7472,6 +7601,10 @@ export function applyChamfer(distance: number): void {
     setPrompt('Erste Linie wählen');
     render();
   };
+  const keepPick = () => {
+    setPrompt('Neuen Abstand eingeben (max siehe Toast)');
+    render();
+  };
 
   // ── Case A: both entities belong to the SAME ChamferFeature → update dist ─
   if (f1 && f2 && f1.id === f2.id && f1.kind === 'chamfer') {
@@ -7523,7 +7656,7 @@ export function applyChamfer(distance: number): void {
     const needsExpand = (f: Feature | null): boolean => !f || f.kind !== 'line';
     if (needsExpand(f1) || needsExpand(f2)) {
       const result = computeChamfer(l1, c1, l2, c2, distance);
-      if ('error' in result) { toast(result.error); resetPick(); return; }
+      if ('error' in result) { toast(result.error); keepPick(); return; }
       const P = lineIntersectionInfinite(l1, l2);
       if (!P) { toast('Linien sind parallel'); resetPick(); return; }
       const cut1End = pickLineCutEnd(l1, c1, P);
@@ -8231,6 +8364,22 @@ function handleDimClick(p: Pt): void {
   }
 
   // ── Single mode (default) ───────────────────────────────────────────
+  // Helper: resolve the pick into (anchor point, parametric ref). Priority:
+  //   1. Active snap (endpoint / mid / center / intersection / …)
+  //   2. Edge-pick fallback: clicking on a line / rect-edge / polyline seg
+  //      WITHOUT a snap auto-latches to its NEAREST endpoint, so the user
+  //      doesn't have to aim precisely at the corner. Matches Auto-mode UX.
+  //   3. Raw click point (abs ref).
+  const resolvePick = (worldPt: Pt): { pt: Pt; ref: PointRef } => {
+    const snap = runtime.lastSnap;
+    if (snap) {
+      const ref = snapToPointRef(snap, worldPt);
+      return { pt: { x: snap.x, y: snap.y }, ref: ref ?? absPt(worldPt) };
+    }
+    const fromEdge = pickNearestRefFromEdge(worldPt);
+    if (fromEdge) return fromEdge;
+    return { pt: worldPt, ref: absPt(worldPt) };
+  };
   if (tc.step === 'pick1') {
     // dim_h / dim_v must be anchored to a real geometric entity (line, edge,
     // snap point) — clicking empty canvas is rejected so accidental dims don't
@@ -8239,26 +8388,24 @@ function handleDimClick(p: Pt): void {
       toast('Punkt auf einer Linie oder Kante klicken');
       return;
     }
-    tc.click1 = p;
-    // Capture the snap as a parametric PointRef so the dim tracks the
-    // underlying feature when variables change (same mechanism the line tool
-    // uses for its p1/p2).
-    tc.ptRefs = [snapToPointRef(runtime.lastSnap, p), null];
+    const r = resolvePick(p);
+    tc.click1 = r.pt;
+    tc.ptRefs = [r.ref, null];
     tc.step = 'pick2';
     setPrompt('Zweiter Messpunkt');
     render();
     return;
   }
   if (tc.step === 'pick2' && tc.click1) {
-    if (dist(tc.click1, p) < 1e-6) { toast('Punkte müssen unterschiedlich sein'); return; }
-    // Same entity-only guard for the second point.
     if ((state.tool === 'dim_h' || state.tool === 'dim_v') && !dimClickIsOnPoint(p)) {
       toast('Punkt auf einer Linie oder Kante klicken');
       return;
     }
-    tc.click2 = p;
+    const r = resolvePick(p);
+    if (dist(tc.click1, r.pt) < 1e-6) { toast('Punkte müssen unterschiedlich sein'); return; }
+    tc.click2 = r.pt;
     if (!tc.ptRefs) tc.ptRefs = [null, null];
-    tc.ptRefs[1] = snapToPointRef(runtime.lastSnap, p);
+    tc.ptRefs[1] = r.ref;
     tc.step = 'place';
     setPrompt('Bemaßungsposition klicken');
     render();

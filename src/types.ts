@@ -49,6 +49,33 @@ export type Parameter = {
    */
   formula?: Expr;
   meaning?: string;
+  /**
+   * Optional group id. Variables can be organised into named folders that the
+   * sidebar renders as collapsible sections. Empty / missing → renders in the
+   * "Allgemein" pseudo-group at the top. Group ids point at
+   * `state.parameterGroups[].id`.
+   */
+  groupId?: string;
+  /**
+   * Sort order within the parameter list. Lower values render first. When
+   * absent (legacy saves), the array index is used so existing files keep the
+   * same look. The drag-and-drop UI rewrites this on every reorder.
+   */
+  order?: number;
+};
+
+/**
+ * A named folder for organising parameters. Purely UI-side — has no semantic
+ * effect on Expr evaluation or feature resolution. Persisted with the
+ * drawing so collaborators see the same structure.
+ */
+export type ParameterGroup = {
+  id: string;
+  name: string;
+  /** Lower values render first. Same convention as Parameter.order. */
+  order: number;
+  /** Whether the group is rendered collapsed in the sidebar. UI-only state. */
+  collapsed?: boolean;
 };
 
 /** AST node produced by the formula parser (params.ts). */
@@ -907,6 +934,7 @@ export type AppState = {
   mouseScreen: Pt;
   nextId: number;
   parameters: Parameter[];
+  parameterGroups: ParameterGroup[];
   features: Feature[];
   /**
    * Persisted project metadata (title block fields, logo, last-used template).

@@ -1,4 +1,4 @@
-import type { Expr, FormulaNode, Parameter } from './types';
+import type { Expr, FormulaNode, Parameter, ParameterGroup } from './types';
 import { state } from './state';
 
 /** Generate a short, stable id for a new parameter. */
@@ -401,6 +401,105 @@ export function updateParameter(id: string, patch: Partial<Omit<Parameter, 'id'>
 
 export function deleteParameter(id: string): void {
   state.parameters = state.parameters.filter(p => p.id !== id);
+}
+
+// ============================================================================
+// Parameter groups (folders) — purely UI organisation, no eval semantics
+// ============================================================================
+
+export function newGroupId(): string {
+  return 'g' + Math.random().toString(36).slice(2, 8);
+}
+
+/**
+ * Returns parameter groups in display order. Adds the synthetic "Allgemein"
+ * group only when the panel actually needs it (any param with no groupId, or
+ * no groups at all). The synthetic group has id `''` so existing parameters
+ * with `groupId == null` map cleanly into it.
+ */
+export function getOrderedGroups(): ParameterGroup[] {
+  const groups = [...state.parameterGroups].sort((a, b) => a.order - b.order);
+  const hasUngrouped = state.parameters.some(p => !p.groupId);
+  if (hasUngrouped || groups.length === 0) {
+    return [{ id: '', name: 'Allgemein', order: -1 }, ...groups];
+  }
+  return groups;
+}
+
+/** Parameters that belong to a group, sorted by `order` (then array position). */
+export function getParamsForGroup(groupId: string): Parameter[] {
+  const params = state.parameters
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => (p.groupId ?? '') === groupId);
+  params.sort((a, b) => {
+    const oa = a.p.order ?? a.i;
+    const ob = b.p.order ?? b.i;
+    return oa - ob;
+  });
+  return params.map(({ p }) => p);
+}
+
+export function createParameterGroup(name: string): ParameterGroup {
+  const maxOrder = state.parameterGroups.reduce((m, g) => Math.max(m, g.order), -1);
+  const g: ParameterGroup = { id: newGroupId(), name, order: maxOrder + 1 };
+  state.parameterGroups.push(g);
+  return g;
+}
+
+export function renameParameterGroup(id: string, name: string): void {
+  const g = state.parameterGroups.find(x => x.id === id);
+  if (g) g.name = name;
+}
+
+export function toggleParameterGroupCollapsed(id: string): void {
+  const g = state.parameterGroups.find(x => x.id === id);
+  if (g) g.collapsed = !g.collapsed;
+}
+
+/**
+ * Delete a group. Parameters inside fall back into the synthetic "Allgemein"
+ * group (their `groupId` is cleared). Group order is renormalised so the
+ * remaining groups stay 0..n-1.
+ */
+export function deleteParameterGroup(id: string): void {
+  state.parameterGroups = state.parameterGroups.filter(g => g.id !== id);
+  for (const p of state.parameters) {
+    if (p.groupId === id) p.groupId = undefined;
+  }
+  state.parameterGroups.forEach((g, i) => { g.order = i; });
+}
+
+/**
+ * Reorder groups. `groupIds` is the desired sequence — any missing group keeps
+ * its existing relative order at the end.
+ */
+export function reorderParameterGroups(groupIds: string[]): void {
+  const seen = new Set<string>();
+  const ordered: ParameterGroup[] = [];
+  for (const gid of groupIds) {
+    const g = state.parameterGroups.find(x => x.id === gid);
+    if (g && !seen.has(gid)) { ordered.push(g); seen.add(gid); }
+  }
+  for (const g of state.parameterGroups) {
+    if (!seen.has(g.id)) ordered.push(g);
+  }
+  ordered.forEach((g, i) => { g.order = i; });
+  state.parameterGroups = ordered;
+}
+
+/**
+ * Move a parameter into a group at the given position (0-based within that
+ * group's parameter list). Sets groupId on the moved parameter and renormalises
+ * `order` on every parameter that ends up in the target group.
+ */
+export function moveParameter(paramId: string, targetGroupId: string, targetIndex: number): void {
+  const param = state.parameters.find(p => p.id === paramId);
+  if (!param) return;
+  param.groupId = targetGroupId === '' ? undefined : targetGroupId;
+  const inGroup = getParamsForGroup(targetGroupId).filter(p => p.id !== paramId);
+  const insertAt = Math.max(0, Math.min(targetIndex, inGroup.length));
+  inGroup.splice(insertAt, 0, param);
+  inGroup.forEach((p, i) => { p.order = i; });
 }
 
 /**

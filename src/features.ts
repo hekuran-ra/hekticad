@@ -71,6 +71,17 @@ type EvalCtx = Map<string, Entity>;
  */
 const featureEntityIds = new Map<string, number>();
 
+/**
+ * Cached evaluation context from the most recent `evaluateTimeline()` call.
+ * Lets external callers (Move/Stretch helpers) ask "where does this PointRef
+ * resolve right now?" without re-walking the whole timeline themselves. Reads
+ * are stale relative to in-flight mutations — the contract is "ctx is valid
+ * up to the last evaluateTimeline()". Anything that mutated the timeline
+ * after that should re-evaluate before consulting `getLastCtx`.
+ */
+let lastCtx: EvalCtx = new Map();
+export function getLastCtx(): EvalCtx { return lastCtx; }
+
 /** Inverse of `featureEntityIds` — rebuilt on every `evaluateTimeline()`. */
 const entityToFeature = new Map<number, string>();
 
@@ -1958,6 +1969,7 @@ export function evaluateTimeline(opts?: {
     if (!alive.has(fid)) cachedModifierOutputs.delete(fid);
   }
   state.entities = out;
+  lastCtx = ctx;
   entityToFeature.clear();
   entityToModifier.clear();
   for (const [fid, eid] of featureEntityIds) entityToFeature.set(eid, fid);
@@ -1974,6 +1986,318 @@ export function evaluateTimeline(opts?: {
 function numE(v: number): Expr { return { kind: 'num', value: v }; }
 function absPt(p: Pt): PointRef {
   return { kind: 'abs', x: numE(p.x), y: numE(p.y) };
+}
+
+/**
+ * Add a numeric offset to an `Expr` while preserving variable bindings as far
+ * as possible.
+ *
+ *   - Pure number → just bump the value (no AST creation).
+ *   - Param ref or formula → wrap into a new formula `<src> + <delta>` so the
+ *     variable stays linked. The `src` is reconstructed for parser round-trip
+ *     so the user can keep editing the formula.
+ *
+ * This is the primitive that lets Move/Stretch translate `abs` PointRefs
+ * without flattening their parametric Exprs to constants.
+ */
+export function shiftExpr(e: Expr, delta: number): Expr {
+  if (delta === 0) return e;
+  if (e.kind === 'num') {
+    return { kind: 'num', value: e.value + delta };
+  }
+  // Build a synthetic formula that wraps the existing expression with `+ delta`.
+  // We don't go back through the parser — we know the AST shape we need and the
+  // refs we need to copy through. Source text is reconstructed for legibility
+  // when the user opens the formula editor.
+  const baseSrc =
+    e.kind === 'param' ? `param_${e.id}` : e.src;
+  const baseAst: import('./types').FormulaNode =
+    e.kind === 'param' ? { t: 'param', id: e.id } : e.ast;
+  const baseRefs: string[] =
+    e.kind === 'param' ? [e.id] : [...e.refs];
+  const sign = delta >= 0 ? '+' : '-';
+  const absDelta = Math.abs(delta);
+  // Render the delta with German decimal comma to match the parser's locale.
+  const deltaStr = absDelta.toString().replace('.', ',');
+  return {
+    kind: 'formula',
+    src: `${baseSrc} ${sign} ${deltaStr}`,
+    ast: {
+      t: 'bin',
+      op: delta >= 0 ? '+' : '-',
+      a: baseAst,
+      b: { t: 'num', v: absDelta },
+    },
+    refs: baseRefs,
+  };
+}
+
+/**
+ * Translate a `PointRef` by `(dx, dy)` while keeping parametric links alive
+ * wherever possible. Behaviour:
+ *
+ *   - `abs` → shifts both Exprs via `shiftExpr` (preserves variables).
+ *   - `endpoint` / `center` / `mid` / `intersection` → returned UNCHANGED so
+ *     the moved feature stays anchored to the referenced geometry. Callers
+ *     who really want to "tear off" the link must convert to abs themselves.
+ *   - `polar` → recurse on `from` (the anchor moves), `angle`/`distance`
+ *     stay the same.
+ *   - `rayHit` → recurse on `from`, `angle` and `target` stay the same.
+ *   - `axisProject` → recurse on both sub-refs.
+ *   - `interpolate` → recurse on both endpoints; `t` stays.
+ */
+export function translatePointRef(ref: PointRef, dx: number, dy: number): PointRef {
+  switch (ref.kind) {
+    case 'abs':
+      return { kind: 'abs', x: shiftExpr(ref.x, dx), y: shiftExpr(ref.y, dy) };
+    case 'endpoint':
+    case 'center':
+    case 'mid':
+    case 'intersection':
+      return ref;
+    case 'polar':
+      return { kind: 'polar', from: translatePointRef(ref.from, dx, dy), angle: ref.angle, distance: ref.distance };
+    case 'rayHit':
+      return { kind: 'rayHit', from: translatePointRef(ref.from, dx, dy), angle: ref.angle, target: ref.target, edge: ref.edge };
+    case 'axisProject':
+      return { kind: 'axisProject', xFrom: translatePointRef(ref.xFrom, dx, dy), yFrom: translatePointRef(ref.yFrom, dx, dy) };
+    case 'interpolate':
+      return { kind: 'interpolate', from: translatePointRef(ref.from, dx, dy), to: translatePointRef(ref.to, dx, dy), t: ref.t };
+  }
+}
+
+/**
+ * Stretch-aware variant of `translatePointRef`. Parametric refs are kept
+ * unchanged: they follow their anchor automatically — if the anchor moves
+ * with the stretch, the ref's resolved point moves with it; if the anchor
+ * stays put, the ref stays put. Either way, no edit needed at this leaf.
+ *
+ * Only `abs` PointRefs are decided here:
+ *   - resolved point in box → shift via `shiftExpr` (preserves variable
+ *     bindings inside the abs Expr).
+ *   - resolved point outside box → return unchanged.
+ *
+ * `resolvedPt` lets the caller skip an `evalExpr` round-trip for abs refs
+ * when it has the value already; passing `null` is fine — the function will
+ * eval on demand. Parametric refs ignore `resolvedPt` since they aren't
+ * editing.
+ */
+export function stretchPointRef(
+  ref: PointRef,
+  resolvedPt: Pt | null,
+  w1: Pt, w2: Pt, dx: number, dy: number,
+): PointRef {
+  if (ref.kind !== 'abs') return ref;
+  const xmin = Math.min(w1.x, w2.x), xmax = Math.max(w1.x, w2.x);
+  const ymin = Math.min(w1.y, w2.y), ymax = Math.max(w1.y, w2.y);
+  const px = resolvedPt?.x ?? evalExpr(ref.x);
+  const py = resolvedPt?.y ?? evalExpr(ref.y);
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return ref;
+  const inBox = px >= xmin && px <= xmax && py >= ymin && py <= ymax;
+  if (!inBox) return ref;
+  return { kind: 'abs', x: shiftExpr(ref.x, dx), y: shiftExpr(ref.y, dy) };
+}
+
+/**
+ * Translate every PointRef-typed field of a feature in place by (dx, dy),
+ * preserving parametric bindings. Returns a new feature object — does NOT
+ * mutate the input. Modifier features that emit copies of other features
+ * (`mirror`, `array`, `rotate`, `crossMirror`) translate their anchor
+ * references; their `sourceIds` are left alone since the sources translate
+ * independently.
+ *
+ * Callers must replace the live feature with the returned one to commit the
+ * translation.
+ */
+export function translateFeature(f: Feature, dx: number, dy: number): Feature {
+  const t = (r: PointRef) => translatePointRef(r, dx, dy);
+  switch (f.kind) {
+    case 'line':       return { ...f, p1: t(f.p1), p2: t(f.p2) };
+    case 'polyline':   return { ...f, pts: f.pts.map(t) };
+    case 'rect':       return { ...f, p1: t(f.p1) };
+    case 'circle':     return { ...f, center: t(f.center) };
+    case 'arc':        return { ...f, center: t(f.center) };
+    case 'ellipse':    return { ...f, center: t(f.center) };
+    case 'spline':     return { ...f, pts: f.pts.map(t) };
+    case 'xline':      return { ...f, p: t(f.p) };
+    case 'parallelXLine':     return f;
+    case 'axisParallelXLine': return f;
+    case 'polygon':    return { ...f, center: t(f.center) };
+    case 'text':       return { ...f, p: t(f.p) };
+    case 'dim':        return {
+      ...f,
+      p1: t(f.p1), p2: t(f.p2), offset: t(f.offset),
+      ...(f.vertex ? { vertex: t(f.vertex) } : {}),
+      ...(f.ray1   ? { ray1:   t(f.ray1)   } : {}),
+      ...(f.ray2   ? { ray2:   t(f.ray2)   } : {}),
+    };
+    case 'hatch':      return {
+      ...f,
+      pts: f.pts.map(t),
+      ...(f.holes ? { holes: f.holes.map(h => h.map(t)) } : {}),
+    };
+    case 'mirror': {
+      if (f.axis.kind !== 'twoPoints') return f;
+      return { ...f, axis: { kind: 'twoPoints', p1: t(f.axis.p1), p2: t(f.axis.p2) } };
+    }
+    case 'array':      return {
+      ...f,
+      offset: { p1: t(f.offset.p1), p2: t(f.offset.p2) },
+      ...(f.rowOffset ? { rowOffset: { p1: t(f.rowOffset.p1), p2: t(f.rowOffset.p2) } } : {}),
+    };
+    case 'rotate':     return { ...f, center: t(f.center) };
+    case 'crossMirror':return { ...f, center: t(f.center) };
+    case 'clip':       return f;
+    case 'fillet':     return f;
+    case 'chamfer':    return f;
+  }
+}
+
+/**
+ * Stretch-rebuild a feature: walk every PointRef, decide per-anchor whether
+ * to shift it (if its resolved world position lies in the crossing box) or
+ * keep it (otherwise). Parametric refs whose anchors fall in the box collapse
+ * to abs (we have no way to "shift" a feature-bound endpoint without
+ * affecting the linked geometry). Refs whose anchors are outside the box
+ * stay as-is — including `endpoint(other)` etc., which is the whole point of
+ * keeping things parametric across stretch.
+ *
+ * `resolvedPts` maps the original PointRef objects (by reference identity) to
+ * their resolved world coords. This lets the caller evaluate the feature's
+ * points once via `evaluateTimeline` and hand them in here.
+ *
+ * Returns a new feature; does NOT mutate.
+ */
+export function stretchFeature(
+  f: Feature,
+  w1: Pt, w2: Pt, dx: number, dy: number,
+  resolved: Map<PointRef, Pt>,
+): Feature {
+  const s = (r: PointRef) => stretchPointRef(r, resolved.get(r) ?? null, w1, w2, dx, dy);
+  switch (f.kind) {
+    case 'line':       return { ...f, p1: s(f.p1), p2: s(f.p2) };
+    case 'polyline':   return { ...f, pts: f.pts.map(s) };
+    case 'rect':       return { ...f, p1: s(f.p1) };
+    case 'circle':     return { ...f, center: s(f.center) };
+    case 'arc':        return { ...f, center: s(f.center) };
+    case 'ellipse':    return { ...f, center: s(f.center) };
+    case 'spline':     return { ...f, pts: f.pts.map(s) };
+    case 'xline':      return { ...f, p: s(f.p) };
+    case 'parallelXLine':     return f;
+    case 'axisParallelXLine': return f;
+    case 'polygon':    return { ...f, center: s(f.center) };
+    case 'text':       return { ...f, p: s(f.p) };
+    case 'dim':        return {
+      ...f,
+      p1: s(f.p1), p2: s(f.p2), offset: s(f.offset),
+      ...(f.vertex ? { vertex: s(f.vertex) } : {}),
+      ...(f.ray1   ? { ray1:   s(f.ray1)   } : {}),
+      ...(f.ray2   ? { ray2:   s(f.ray2)   } : {}),
+    };
+    case 'hatch':      return {
+      ...f,
+      pts: f.pts.map(s),
+      ...(f.holes ? { holes: f.holes.map(h => h.map(s)) } : {}),
+    };
+    case 'mirror': {
+      if (f.axis.kind !== 'twoPoints') return f;
+      return { ...f, axis: { kind: 'twoPoints', p1: s(f.axis.p1), p2: s(f.axis.p2) } };
+    }
+    case 'array':      return {
+      ...f,
+      offset: { p1: s(f.offset.p1), p2: s(f.offset.p2) },
+      ...(f.rowOffset ? { rowOffset: { p1: s(f.rowOffset.p1), p2: s(f.rowOffset.p2) } } : {}),
+    };
+    case 'rotate':     return { ...f, center: s(f.center) };
+    case 'crossMirror':return { ...f, center: s(f.center) };
+    case 'clip':       return f;
+    case 'fillet':     return f;
+    case 'chamfer':    return f;
+  }
+}
+
+/**
+ * Detach a modifier feature (Mirror, Array, Rotate, CrossMirror) so its
+ * derived copies become independent feature entries. The originals stay; the
+ * modifier itself is removed and its sub-entities are re-emitted as
+ * standalone abs-coord features so editing one no longer cascades through the
+ * link.
+ *
+ * Returns the number of features created. Caller is responsible for calling
+ * `evaluateTimeline()` afterwards.
+ */
+export function detachModifierFeature(modifierId: string): number {
+  const mod = state.features.find(f => f.id === modifierId);
+  if (!mod) return 0;
+  if (mod.kind !== 'mirror' && mod.kind !== 'array' &&
+      mod.kind !== 'rotate' && mod.kind !== 'crossMirror') return 0;
+  // Pull the modifier's last-rendered output entities — these are the visible
+  // copies the user wants to make independent. We grab them from the cached
+  // outputs map populated during the previous evaluateTimeline().
+  const outputs = cachedModifierOutputs.get(modifierId) ?? [];
+  if (outputs.length === 0) {
+    // Modifier has no live outputs (sources gone, hidden, …) — just remove it.
+    state.features = state.features.filter(f => f.id !== modifierId);
+    return 0;
+  }
+  // Convert each output entity into a standalone Feature with abs PointRefs.
+  // The new features inherit the modifier's layer (so the copies stay on the
+  // layer the user expects). featureFromEntityInit synthesises a fresh id, so
+  // there's no collision with the original sources.
+  const created: Feature[] = [];
+  for (const e of outputs) {
+    const init = (() => {
+      const { id: _id, ...rest } = e;
+      return rest as EntityInit;
+    })();
+    const f = featureFromEntityInit(init);
+    f.layer = mod.layer;
+    created.push(f);
+  }
+  // Insert the new features just BEFORE the modifier in the timeline so the
+  // visual order is preserved. Then drop the modifier itself.
+  const idx = state.features.findIndex(f => f.id === modifierId);
+  if (idx >= 0) {
+    state.features.splice(idx, 1, ...created);
+  } else {
+    state.features.push(...created);
+  }
+  return created.length;
+}
+
+/**
+ * Collect every PointRef that drives the geometry of a feature, paired with
+ * its current resolved world position. Used by Stretch + future modifier
+ * features that need to know "where does this PointRef sit right now?" to
+ * decide whether to shift it.
+ */
+export function collectFeaturePoints(f: Feature, ctx: Map<string, Entity>): Array<{ ref: PointRef; pt: Pt }> {
+  const out: Array<{ ref: PointRef; pt: Pt }> = [];
+  const add = (r: PointRef) => out.push({ ref: r, pt: resolvePt(r, ctx) });
+  switch (f.kind) {
+    case 'line':     add(f.p1); add(f.p2); break;
+    case 'polyline': for (const p of f.pts) add(p); break;
+    case 'rect':     add(f.p1); break;
+    case 'circle':   add(f.center); break;
+    case 'arc':      add(f.center); break;
+    case 'ellipse':  add(f.center); break;
+    case 'spline':   for (const p of f.pts) add(p); break;
+    case 'xline':    add(f.p); break;
+    case 'polygon':  add(f.center); break;
+    case 'text':     add(f.p); break;
+    case 'dim':
+      add(f.p1); add(f.p2); add(f.offset);
+      if (f.vertex) add(f.vertex);
+      if (f.ray1)   add(f.ray1);
+      if (f.ray2)   add(f.ray2);
+      break;
+    case 'hatch':
+      for (const p of f.pts) add(p);
+      if (f.holes) for (const h of f.holes) for (const p of h) add(p);
+      break;
+    default: break;
+  }
+  return out;
 }
 
 /** Build a feature whose geometry matches `init` with all-abs, all-num values. */
